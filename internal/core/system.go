@@ -119,9 +119,14 @@ func (v *VehicleSystem) Start() error {
 
     v.logger.Printf("Registering input callbacks for %d channels", len(channels))
     for _, ch := range channels {
-        if ch == "handlebar_position" {
+        switch ch {
+        case "handlebar_position":
             v.io.RegisterInputCallback(ch, v.handleHandlebarPosition)
-        } else {
+        case "seatbox_lock_sensor":
+            v.io.RegisterInputCallback(ch, func(channel string, value bool) error {
+                return v.redis.SetSeatboxLockState(value)
+            })
+        default:
             v.io.RegisterInputCallback(ch, v.handleInputChange)
         }
         v.logger.Printf("Registered callback for channel: %s", ch)
@@ -629,11 +634,6 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 }
 
 func (v *VehicleSystem) openSeatboxLock() error {
-    // Set lock to open state
-    if err := v.redis.SetSeatboxLockState(false); err != nil {
-        return err
-    }
-
     if err := v.io.WriteDigitalOutput("seatbox_lock", true); err != nil {
         return err
     }
@@ -641,11 +641,6 @@ func (v *VehicleSystem) openSeatboxLock() error {
     time.Sleep(200 * time.Millisecond)
 
     if err := v.io.WriteDigitalOutput("seatbox_lock", false); err != nil {
-        return err
-    }
-
-    // Set lock back to closed state
-    if err := v.redis.SetSeatboxLockState(true); err != nil {
         return err
     }
 
