@@ -62,6 +62,7 @@ func (v *VehicleSystem) Start() error {
         HornCallback:      v.handleHornRequest,
         BlinkerCallback:   v.handleBlinkerRequest,
         PowerCallback:     v.handlePowerRequest,
+        StateCallback:     v.handleStateRequest,
     })
 
     if err := v.redis.Connect(); err != nil {
@@ -868,4 +869,34 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
     }
 
     return nil
+}
+
+func (v *VehicleSystem) handleStateRequest(state string) error {
+    v.logger.Printf("Handling state request: %s", state)
+    switch state {
+    case "unlock":
+        // Transition to READY_TO_DRIVE if conditions are met
+        if v.isReadyToDrive() {
+            return v.transitionTo(types.StateReadyToDrive)
+        }
+        return nil
+    case "lock":
+        // Transition to PARKED state
+        return v.transitionTo(types.StateParked)
+    case "lock-hibernate":
+        // Transition to PARKED state and schedule hibernate
+        if err := v.transitionTo(types.StateParked); err != nil {
+            return err
+        }
+        // Schedule hibernate after 30 seconds
+        go func() {
+            time.Sleep(30 * time.Second)
+            if err := v.handlePowerRequest("hibernate-manual"); err != nil {
+                v.logger.Printf("Failed to execute hibernate: %v", err)
+            }
+        }()
+        return nil
+    default:
+        return fmt.Errorf("invalid state request: %s", state)
+    }
 }

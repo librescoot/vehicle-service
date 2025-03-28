@@ -18,6 +18,7 @@ type Callbacks struct {
     HornCallback      func(bool) error    // true for "on", false for "off"
     BlinkerCallback   func(string) error  // "off", "left", "right", "both"
     PowerCallback     func(string) error  // "hibernate-manual", "reboot"
+    StateCallback     func(string) error  // "unlock", "lock", "lock-hibernate"
 }
 
 type RedisClient struct {
@@ -80,11 +81,12 @@ func (r *RedisClient) StartListening() error {
     go r.redisListener(pubsub)
 
     // Start list command listeners for LPUSH commands
-    r.wg.Add(4)
+    r.wg.Add(5)
     go r.listCommandListener("scooter:seatbox", r.handleSeatboxCommand)
     go r.listCommandListener("scooter:horn", r.handleHornCommand)
     go r.listCommandListener("scooter:blinker", r.handleBlinkerCommand)
     go r.listCommandListener("scooter:power", r.handlePowerCommand)
+    go r.listCommandListener("scooter:state", r.handleStateCommand)
 
     // Start hash field monitor for direct HSET commands
     r.wg.Add(1)
@@ -133,8 +135,8 @@ func (r *RedisClient) handleSeatboxCommand(value string) error {
         return nil
     }
     switch value {
-    case "on", "off":
-        return r.callbacks.SeatboxCallback(value == "on")
+    case "open":
+        return r.callbacks.SeatboxCallback(value == "open")
     default:
         r.logger.Printf("Invalid seatbox command value: %s", value)
         return fmt.Errorf("invalid seatbox command: %s", value)
@@ -177,6 +179,19 @@ func (r *RedisClient) handlePowerCommand(value string) error {
     default:
         r.logger.Printf("Invalid power command value: %s", value)
         return fmt.Errorf("invalid power command: %s", value)
+    }
+}
+
+func (r *RedisClient) handleStateCommand(value string) error {
+    if r.callbacks.StateCallback == nil {
+        return nil
+    }
+    switch value {
+    case "unlock", "lock", "lock-hibernate":
+        return r.callbacks.StateCallback(value)
+    default:
+        r.logger.Printf("Invalid state command value: %s", value)
+        return fmt.Errorf("invalid state command: %s", value)
     }
 }
 
