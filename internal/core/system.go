@@ -873,29 +873,48 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 
 func (v *VehicleSystem) handleStateRequest(state string) error {
     v.logger.Printf("Handling state request: %s", state)
+    v.mu.RLock()
+    currentState := v.state
+    v.mu.RUnlock()
+
     switch state {
     case "unlock":
-        // Transition to READY_TO_DRIVE if conditions are met
-        if v.isReadyToDrive() {
-            return v.transitionTo(types.StateReadyToDrive)
-        }
-        return nil
-    case "lock":
-        // Transition to PARKED state
-        return v.transitionTo(types.StateParked)
-    case "lock-hibernate":
-        // Transition to PARKED state and schedule hibernate
-        if err := v.transitionTo(types.StateParked); err != nil {
-            return err
-        }
-        // Schedule hibernate after 30 seconds
-        go func() {
-            time.Sleep(30 * time.Second)
-            if err := v.handlePowerRequest("hibernate-manual"); err != nil {
-                v.logger.Printf("Failed to execute hibernate: %v", err)
+        kickstandValue, err := v.io.ReadDigitalInput("kickstand")
+        if err != nil {
+            v.logger.Printf("Failed to read kickstand: %v", err)
+            if currentState == types.StateStandby {
+                return v.transitionTo(types.StateParked)
             }
-        }()
-        return nil
+        }
+        if v.isReadyToDrive() && !kickstandValue {
+            return v.transitionTo(types.StateReadyToDrive)
+        } else {
+            if currentState == types.StateStandby {
+                return v.transitionTo(types.StateParked)
+            }
+        }
+    case "lock":
+        if currentState == types.StateParked {
+            return v.transitionTo(types.StateStandby)
+        } else {
+            return fmt.Errorf("Vehicle must be parked to lock")
+        }
+    case "lock-hibernate":
+        if currentState == types.StateParked {
+            if err := v.transitionTo(types.StateStandby); err != nil {
+                return err
+            }
+
+            go func() {
+                time.Sleep(30 * time.Second)
+                if err := v.handlePowerRequest("hibernate-manual"); err != nil {
+                    v.logger.Printf("Failed to execute hibernate: %v", err)
+                }
+            }()
+            return nil
+        } else {
+            return fmt.Errorf("Vehicle must be parked to lock")
+        }
     default:
         return fmt.Errorf("invalid state request: %s", state)
     }
