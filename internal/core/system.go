@@ -884,13 +884,18 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
             v.logger.Printf("Failed to read kickstand: %v", err)
             if currentState == types.StateStandby {
                 return v.transitionTo(types.StateParked)
+            } else {
+                return nil
             }
+
         }
         if v.isReadyToDrive() && !kickstandValue {
             return v.transitionTo(types.StateReadyToDrive)
         } else {
             if currentState == types.StateStandby {
                 return v.transitionTo(types.StateParked)
+            } else {
+                return nil
             }
         }
     case "lock":
