@@ -63,6 +63,8 @@ func (v *VehicleSystem) Start() error {
 		BlinkerCallback:   v.handleBlinkerRequest,
 		PowerCallback:     v.handlePowerRequest,
 		StateCallback:     v.handleStateRequest,
+		LedCueCallback:    v.handleLedCueRequest,
+		LedFadeCallback:   v.handleLedFadeRequest,
 	})
 
 	if err := v.redis.Connect(); err != nil {
@@ -902,7 +904,7 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 		if currentState == types.StateParked {
 			return v.transitionTo(types.StateStandby)
 		} else {
-			return fmt.Errorf("Vehicle must be parked to lock")
+			return fmt.Errorf("vehicle must be parked to lock")
 		}
 	case "lock-hibernate":
 		if currentState == types.StateParked {
@@ -918,9 +920,19 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 			}()
 			return nil
 		} else {
-			return fmt.Errorf("Vehicle must be parked to lock")
+			return fmt.Errorf("vehicle must be parked to lock")
 		}
 	default:
 		return fmt.Errorf("invalid state request: %s", state)
 	}
+}
+
+func (v *VehicleSystem) handleLedCueRequest(cueIndex int) error {
+	v.logger.Printf("Handling LED cue request: %d", cueIndex)
+	return v.io.PlayPwmCue(cueIndex)
+}
+
+func (v *VehicleSystem) handleLedFadeRequest(ledChannel int, fadeIndex int) error {
+	v.logger.Printf("Handling LED fade request: channel=%d, index=%d", ledChannel, fadeIndex)
+	return v.io.PlayPwmFade(ledChannel, fadeIndex)
 }

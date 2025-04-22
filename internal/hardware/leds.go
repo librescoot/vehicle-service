@@ -3,18 +3,17 @@ package hardware
 import (
 	"encoding/binary"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"io"
 	"log"
 	"os"
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
-	pwmLedIocType = 'u'
-
 	pwmLedConfigure = 0x00007540 // _IO('u', 0x40)
 	pwmLedOpenFade  = 0x00007541 // _IO('u', 0x41)
 	pwmLedOpenCue   = 0x00007542 // _IO('u', 0x42)
@@ -52,12 +51,6 @@ type CueAction struct {
 	LED   uint8         // 5 bits
 	Type  CueActionType // 4 bits
 	Value uint16        // 16 bits
-}
-
-func encodeCueAction(action CueAction) uint32 {
-	return uint32(action.LED&0x1F) |
-		(uint32(action.Type&0x0F) << 8) |
-		(uint32(action.Value) << 16)
 }
 
 type LedDevice struct {
