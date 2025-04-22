@@ -61,7 +61,6 @@ func (v *VehicleSystem) Start() error {
 		SeatboxCallback:   v.handleSeatboxRequest,
 		HornCallback:      v.handleHornRequest,
 		BlinkerCallback:   v.handleBlinkerRequest,
-		PowerCallback:     v.handlePowerRequest,
 		StateCallback:     v.handleStateRequest,
 	})
 
@@ -664,7 +663,6 @@ func (v *VehicleSystem) Shutdown() {
 		v.blinkerStopChan = nil
 	}
 
-	v.transitionTo(types.StateShuttingDown)
 	if v.redis != nil {
 		v.redis.Close()
 	}
@@ -729,22 +727,6 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 	}
 
 	return v.redis.SetBlinkerState(state)
-}
-
-func (v *VehicleSystem) handlePowerRequest(action string) error {
-	v.logger.Printf("Handling power request: %s", action)
-	switch action {
-	case "hibernate-manual":
-		v.Shutdown()
-		// Execute system hibernate command
-		return exec.Command("systemctl", "hibernate").Run()
-	case "reboot":
-		v.Shutdown()
-		// Execute system reboot command
-		return exec.Command("systemctl", "reboot").Run()
-	default:
-		return fmt.Errorf("invalid power action: %s", action)
-	}
 }
 
 func (v *VehicleSystem) lockHandlebar() {
@@ -906,19 +888,18 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 		}
 	case "lock-hibernate":
 		if currentState == types.StateParked {
+			v.logger.Printf("Received lock-hibernate request, transitioning to STANDBY and requesting hibernate from pm-service")
 			if err := v.transitionTo(types.StateStandby); err != nil {
-				return err
+				return fmt.Errorf("failed to transition to STANDBY for lock-hibernate: %w", err)
 			}
-
-			go func() {
-				time.Sleep(30 * time.Second)
-				if err := v.handlePowerRequest("hibernate-manual"); err != nil {
-					v.logger.Printf("Failed to execute hibernate: %v", err)
-				}
-			}()
-			return nil
+			// Request hibernate from pm-service via Redis
+			if err := v.redis.PublishPowerCommand("hibernate-manual"); err != nil {
+				v.logger.Printf("Failed to publish hibernate-manual command to Redis: %v", err)
+				return fmt.Errorf("failed to publish hibernate-manual command to Redis: %w", err)
+			}
+			return nil // Return immediately after publishing the command
 		} else {
-			return fmt.Errorf("Vehicle must be parked to lock")
+			return fmt.Errorf("Vehicle must be parked to lock-hibernate")
 		}
 	default:
 		return fmt.Errorf("invalid state request: %s", state)
