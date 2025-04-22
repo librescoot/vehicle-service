@@ -7,8 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"vehicle-service/internal/types"
+
+	"github.com/redis/go-redis/v9"
 )
 
 type Callbacks struct {
@@ -563,6 +564,20 @@ func (r *RedisClient) SetHandlebarLockState(isLocked bool) error {
 		return err
 	}
 	r.logger.Printf("Successfully set handlebar lock state")
+	return nil
+}
+
+// PublishPowerCommand publishes a power command to the scooter:power channel
+func (r *RedisClient) PublishPowerCommand(command string) error {
+	r.logger.Printf("Publishing power command: %s", command)
+
+	// Publish the command to the scooter:power channel
+	err := r.client.Publish(r.ctx, "scooter:power", command).Err()
+	if err != nil {
+		r.logger.Printf("Failed to publish power command: %v", err)
+		return err
+	}
+	r.logger.Printf("Successfully published power command")
 	return nil
 }
 
