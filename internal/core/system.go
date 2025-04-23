@@ -37,6 +37,7 @@ type VehicleSystem struct {
 	initialized       bool
 	handlebarUnlocked bool        // Track if handlebar has been unlocked in this power cycle
 	handlebarTimer    *time.Timer // Timer for handlebar position window
+	hibernationTimer  *time.Timer // Timer for brake-triggered hibernation
 }
 
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
@@ -193,6 +194,40 @@ func (v *VehicleSystem) Start() error {
 	return nil
 }
 
+// triggerHibernation checks conditions and initiates hibernation if met.
+func (v *VehicleSystem) triggerHibernation() {
+	v.logger.Printf("Hibernation timer expired, checking conditions...")
+
+	brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+	if err != nil {
+		v.logger.Printf("Failed to read brake_left for hibernation trigger: %v", err)
+		return
+	}
+	brakeRight, err := v.io.ReadDigitalInput("brake_right")
+	if err != nil {
+		v.logger.Printf("Failed to read brake_right for hibernation trigger: %v", err)
+		return
+	}
+
+	v.mu.RLock()
+	currentState := v.state
+	v.mu.RUnlock()
+
+	if brakeLeft && brakeRight && currentState == types.StateParked {
+		v.logger.Printf("Conditions met, initiating hibernation.")
+		if err := v.handlePowerRequest("hibernate-manual"); err != nil {
+			v.logger.Printf("Failed to execute hibernate from timer: %v", err)
+		}
+	} else {
+		v.logger.Printf("Conditions not met for hibernation.")
+	}
+
+	// Reset the timer field after it has fired
+	v.mu.Lock()
+	v.hibernationTimer = nil
+	v.mu.Unlock()
+}
+
 func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 	v.logger.Printf("Handling dashboard ready state: %v", ready)
 
@@ -342,7 +377,40 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		if channel == "brake_left" {
 			side = "left"
 		}
-		return v.redis.SetBrakeState(side, value)
+		if err := v.redis.SetBrakeState(side, value); err != nil {
+			return fmt.Errorf("failed to set brake state in Redis: %w", err)
+		}
+
+		// Check for hibernation trigger condition
+		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+		if err != nil {
+			v.logger.Printf("Failed to read brake_left for hibernation check: %v", err)
+			// Continue without triggering hibernation
+		}
+		brakeRight, err := v.io.ReadDigitalInput("brake_right")
+		if err != nil {
+			v.logger.Printf("Failed to read brake_right for hibernation check: %v", err)
+			// Continue without triggering hibernation
+		}
+
+		v.mu.RLock()
+		currentState := v.state
+		v.mu.RUnlock()
+
+		if brakeLeft && brakeRight && currentState == types.StateParked {
+			if v.hibernationTimer == nil {
+				v.logger.Printf("Both brakes pressed in PARKED state, starting hibernation timer")
+				v.hibernationTimer = time.AfterFunc(10*time.Second, v.triggerHibernation)
+			}
+		} else {
+			if v.hibernationTimer != nil {
+				v.logger.Printf("Hibernation conditions not met, stopping timer")
+				v.hibernationTimer.Stop()
+				v.hibernationTimer = nil
+			}
+		}
+
+		return nil // Return nil as the brake state was set in Redis
 
 	case "blinker_right", "blinker_left":
 		if err := v.handleBlinkerChange(channel, value); err != nil {
