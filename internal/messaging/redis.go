@@ -7,8 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"vehicle-service/internal/types"
+
+	"github.com/redis/go-redis/v9"
 )
 
 type Callbacks struct {
@@ -19,6 +20,8 @@ type Callbacks struct {
 	BlinkerCallback   func(string) error // "off", "left", "right", "both"
 	PowerCallback     func(string) error // "hibernate-manual", "reboot"
 	StateCallback     func(string) error // "unlock", "lock", "lock-hibernate"
+	LedCueCallback    func(int) error
+	LedFadeCallback   func(int, int) error
 }
 
 type RedisClient struct {
@@ -81,12 +84,14 @@ func (r *RedisClient) StartListening() error {
 	go r.redisListener(pubsub)
 
 	// Start list command listeners for LPUSH commands
-	r.wg.Add(5)
+	r.wg.Add(7) // Added 2 for LED commands
 	go r.listCommandListener("scooter:seatbox", r.handleSeatboxCommand)
 	go r.listCommandListener("scooter:horn", r.handleHornCommand)
 	go r.listCommandListener("scooter:blinker", r.handleBlinkerCommand)
 	go r.listCommandListener("scooter:power", r.handlePowerCommand)
 	go r.listCommandListener("scooter:state", r.handleStateCommand)
+	go r.listCommandListener("scooter:led:cue", r.handleLedCueCommand)
+	go r.listCommandListener("scooter:led:fade", r.handleLedFadeCommand)
 
 	// Start hash field monitor for direct HSET commands
 	r.wg.Add(1)
@@ -193,6 +198,32 @@ func (r *RedisClient) handleStateCommand(value string) error {
 		r.logger.Printf("Invalid state command value: %s", value)
 		return fmt.Errorf("invalid state command: %s", value)
 	}
+}
+
+func (r *RedisClient) handleLedCueCommand(value string) error {
+	if r.callbacks.LedCueCallback == nil {
+		return nil
+	}
+	var cueIndex int
+	_, err := fmt.Sscanf(value, "%d", &cueIndex)
+	if err != nil {
+		r.logger.Printf("Invalid LED cue command value: %s, expected integer: %v", value, err)
+		return fmt.Errorf("invalid LED cue command: %s", value)
+	}
+	return r.callbacks.LedCueCallback(cueIndex)
+}
+
+func (r *RedisClient) handleLedFadeCommand(value string) error {
+	if r.callbacks.LedFadeCallback == nil {
+		return nil
+	}
+	var ledChannel, fadeIndex int
+	_, err := fmt.Sscanf(value, "%d:%d", &ledChannel, &fadeIndex)
+	if err != nil {
+		r.logger.Printf("Invalid LED fade command value: %s, expected 'channel:index': %v", value, err)
+		return fmt.Errorf("invalid LED fade command: %s", value)
+	}
+	return r.callbacks.LedFadeCallback(ledChannel, fadeIndex)
 }
 
 func (r *RedisClient) hashFieldMonitor() {

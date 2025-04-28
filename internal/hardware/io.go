@@ -381,6 +381,10 @@ func (io *LinuxHardwareIO) PlayPwmCue(idx int) error {
 	return io.pwmLed.PlayCue(idx)
 }
 
+func (io *LinuxHardwareIO) PlayPwmFade(ch int, idx int) error {
+	return io.pwmLed.PlayFade(ch, idx)
+}
+
 func (io *LinuxHardwareIO) Cleanup() {
 	close(io.stopChan)
 
