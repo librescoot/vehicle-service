@@ -806,8 +806,8 @@ func (v *VehicleSystem) handlePowerRequest(action string) error {
 	switch action {
 	case "hibernate-manual":
 		v.Shutdown()
-		// Execute system hibernate command
-		return exec.Command("systemctl", "hibernate").Run()
+		// Execute shutdown until we have a proper nRF communication
+		return exec.Command("systemctl", "poweroff").Run()
 	case "reboot":
 		v.Shutdown()
 		// Execute system reboot command
