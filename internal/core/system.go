@@ -106,12 +106,15 @@ func (v *VehicleSystem) Start() error {
 	}
 
 	// Check initial handlebar lock sensor state
-	handlebarLockSensor, err := v.io.ReadDigitalInput("handlebar_lock_sensor")
+	handlebarLockSensorRaw, err := v.io.ReadDigitalInput("handlebar_lock_sensor")
 	if err != nil {
 		v.logger.Printf("Warning: Failed to read initial handlebar lock sensor state: %v", err)
-	} else if handlebarLockSensor {
-		v.handlebarUnlocked = true
-		v.logger.Printf("Initial state: handlebar is already unlocked")
+	} else if !handlebarLockSensorRaw { // Invert the logic: true (pressed) means unlocked, false (released) means locked. We want to know if it's locked initially.
+		v.handlebarUnlocked = false // Sensor is released (false), meaning it's locked
+		v.logger.Printf("Initial state: handlebar is locked")
+	} else {
+		v.handlebarUnlocked = true // Sensor is pressed (true), meaning it's unlocked
+		v.logger.Printf("Initial state: handlebar is unlocked")
 	}
 
 	// Register input callbacks
@@ -425,7 +428,10 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		}
 
 	case "handlebar_lock_sensor":
-		if err := v.redis.SetHandlebarLockState(value); err != nil {
+		// Invert the value: true (pressed) means unlocked, false (released) means locked.
+		// Redis stores true for locked, false for unlocked.
+		isLocked := !value
+		if err := v.redis.SetHandlebarLockState(isLocked); err != nil {
 			return err
 		}
 	}

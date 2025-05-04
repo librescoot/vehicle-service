@@ -24,7 +24,7 @@ const (
 	KEY_E = 18 // kickstand
 	KEY_F = 33 // blinker_right
 	KEY_G = 34 // blinker_left
-	KEY_H = 35 // handlebar_lock_sensor
+	KEY_K = 37 // handlebar_lock_sensor
 	KEY_I = 38 // handlebar_position
 	KEY_J = 36 // seatbox_lock_sensor
 	KEY_Q = 16 // 48v_detect
@@ -151,7 +151,7 @@ func (io *LinuxHardwareIO) readInitialState() error {
 	// Check each key we care about
 	keycodes := []uint16{
 		KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G,
-		KEY_H, KEY_I, KEY_J, KEY_Q,
+		KEY_K, KEY_I, KEY_J, KEY_Q,
 	}
 
 	for _, code := range keycodes {
@@ -273,7 +273,7 @@ func (io *LinuxHardwareIO) mapKeycode(code uint16) string {
 		return "blinker_right"
 	case KEY_G:
 		return "blinker_left"
-	case KEY_H:
+	case KEY_K:
 		return "handlebar_lock_sensor"
 	case KEY_I:
 		return "handlebar_position"
@@ -336,7 +336,7 @@ func (io *LinuxHardwareIO) getKeycodeForChannel(channel string) uint16 {
 	case "blinker_left":
 		return KEY_G
 	case "handlebar_lock_sensor":
-		return KEY_H
+		return KEY_K
 	case "handlebar_position":
 		return KEY_I
 	case "seatbox_lock_sensor":
