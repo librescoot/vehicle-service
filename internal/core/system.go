@@ -190,6 +190,18 @@ func (v *VehicleSystem) Start() error {
 		return fmt.Errorf("failed to publish initial state: %w", err)
 	}
 
+	// If we are still in Init state after initialization, transition to Standby
+	v.mu.RLock()
+	currentState := v.state
+	v.mu.RUnlock()
+	if currentState == types.StateInit {
+		v.logger.Printf("Initial state is Init, transitioning to Standby")
+		if err := v.transitionTo(types.StateStandby); err != nil {
+			// Log the error but continue startup, as standby is a safe default
+			v.logger.Printf("Warning: failed to transition to Standby from Init: %v", err)
+		}
+	}
+
 	// Start Redis listeners now that everything is initialized
 	if err := v.redis.StartListening(); err != nil {
 		return fmt.Errorf("failed to start Redis listeners: %w", err)
