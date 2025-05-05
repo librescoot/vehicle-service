@@ -139,6 +139,43 @@ func (v *VehicleSystem) Start() error {
 		v.logger.Printf("Registered callback for channel: %s", ch)
 	}
 
+	// Publish initial sensor states to Redis
+	v.logger.Printf("Publishing initial sensor states to Redis")
+	initialSensors := []string{
+		"brake_right", "brake_left", "kickstand",
+		"handlebar_lock_sensor", "seatbox_lock_sensor", "handlebar_position",
+		// "48v_detect", // Add if a corresponding Redis key/method exists
+	}
+	for _, sensor := range initialSensors {
+		value, err := v.io.ReadDigitalInput(sensor)
+		if err != nil {
+			v.logger.Printf("Warning: Failed to read initial state for %s: %v", sensor, err)
+			continue
+		}
+		v.logger.Printf("Initial state %s: %v", sensor, value)
+
+		var redisErr error
+		switch sensor {
+		case "brake_right":
+			redisErr = v.redis.SetBrakeState("right", value)
+		case "brake_left":
+			redisErr = v.redis.SetBrakeState("left", value)
+		case "kickstand":
+			redisErr = v.redis.SetKickstandState(value)
+		case "handlebar_lock_sensor":
+			isLocked := !value // Invert logic: sensor true (pressed) = unlocked, Redis true = locked
+			redisErr = v.redis.SetHandlebarLockState(isLocked)
+		case "seatbox_lock_sensor":
+			redisErr = v.redis.SetSeatboxLockState(value)
+		case "handlebar_position":
+			redisErr = v.redis.SetHandlebarPosition(value)
+		}
+
+		if redisErr != nil {
+			v.logger.Printf("Warning: Failed to publish initial state for %s to Redis: %v", sensor, redisErr)
+		}
+	}
+
 	// Now that hardware is initialized, restore state and outputs
 	if savedState == types.StateReadyToDrive || savedState == types.StateParked {
 		// Read brake states to determine which LED cue to play
