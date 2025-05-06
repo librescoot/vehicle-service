@@ -18,7 +18,6 @@ type Callbacks struct {
 	SeatboxCallback   func(bool) error   // true for "on", false for "off"
 	HornCallback      func(bool) error   // true for "on", false for "off"
 	BlinkerCallback   func(string) error // "off", "left", "right", "both"
-	PowerCallback     func(string) error // "hibernate-manual", "reboot"
 	StateCallback     func(string) error // "unlock", "lock", "lock-hibernate"
 	ForceLockCallback func() error       // New callback for force-lock
 	LedCueCallback    func(int) error
@@ -86,11 +85,10 @@ func (r *RedisClient) StartListening() error {
 	go r.redisListener(pubsub)
 
 	// Start list command listeners for LPUSH commands
-	r.wg.Add(8) // Added 1 for update commands
+	r.wg.Add(7) // Added 2 for LED commands
 	go r.listCommandListener("scooter:seatbox", r.handleSeatboxCommand)
 	go r.listCommandListener("scooter:horn", r.handleHornCommand)
 	go r.listCommandListener("scooter:blinker", r.handleBlinkerCommand)
-	go r.listCommandListener("scooter:power", r.handlePowerCommand)
 	go r.listCommandListener("scooter:state", r.handleStateCommand)
 	go r.listCommandListener("scooter:led:cue", r.handleLedCueCommand)
 	go r.listCommandListener("scooter:led:fade", r.handleLedFadeCommand)
@@ -177,19 +175,6 @@ func (r *RedisClient) handleBlinkerCommand(value string) error {
 	}
 }
 
-func (r *RedisClient) handlePowerCommand(value string) error {
-	if r.callbacks.PowerCallback == nil {
-		return nil
-	}
-	switch value {
-	case "hibernate-manual", "reboot":
-		return r.callbacks.PowerCallback(value)
-	default:
-		r.logger.Printf("Invalid power command value: %s", value)
-		return fmt.Errorf("invalid power command: %s", value)
-	}
-}
-
 func (r *RedisClient) handleStateCommand(value string) error {
 	if r.callbacks.StateCallback == nil && r.callbacks.ForceLockCallback == nil {
 		return nil
@@ -268,7 +253,6 @@ func (r *RedisClient) hashFieldMonitor() {
 				"scooter:seatbox",
 				"scooter:horn",
 				"scooter:blinker",
-				"scooter:power",
 				"scooter:update",
 			}
 
@@ -291,8 +275,6 @@ func (r *RedisClient) hashFieldMonitor() {
 					handler = r.handleHornCommand
 				case "scooter:blinker":
 					handler = r.handleBlinkerCommand
-				case "scooter:power":
-					handler = r.handlePowerCommand
 				case "scooter:update":
 					handler = r.handleUpdateCommand
 				}
@@ -383,17 +365,6 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 					}
 				}
 
-			case "scooter:power":
-				if r.callbacks.PowerCallback != nil {
-					switch msg.Payload {
-					case "hibernate-manual", "reboot":
-						if err := r.callbacks.PowerCallback(msg.Payload); err != nil {
-							r.logger.Printf("Failed to handle power request: %v", err)
-						}
-					default:
-						r.logger.Printf("Invalid power request value: %s", msg.Payload)
-					}
-				}
 
 			case "scooter:update":
 				if r.callbacks.UpdateCallback != nil {

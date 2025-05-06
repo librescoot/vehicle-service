@@ -76,7 +76,6 @@ func (v *VehicleSystem) Start() error {
 		SeatboxCallback:   v.handleSeatboxRequest,
 		HornCallback:      v.handleHornRequest,
 		BlinkerCallback:   v.handleBlinkerRequest,
-		PowerCallback:     v.handlePowerRequest,
 		StateCallback:     v.handleStateRequest,
 		ForceLockCallback: v.handleForceLockRequest,
 		LedCueCallback:    v.handleLedCueRequest,
