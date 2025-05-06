@@ -23,6 +23,11 @@ const (
 	BlinkerBoth
 )
 
+const (
+	keycardForceStandbyTaps = 3
+	keycardTapMaxInterval   = 3 * time.Second // Max interval between taps to be part of a sequence
+)
+
 type VehicleSystem struct {
 	state             types.SystemState
 	dashboardReady    bool
@@ -38,6 +43,9 @@ type VehicleSystem struct {
 	handlebarUnlocked bool        // Track if handlebar has been unlocked in this power cycle
 	handlebarTimer    *time.Timer // Timer for handlebar position window
 	hibernationTimer  *time.Timer // Timer for brake-triggered hibernation
+	keycardTapCount     int
+	lastKeycardTapTime  time.Time
+	forceStandbyNoLock  bool
 }
 
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
@@ -49,6 +57,9 @@ func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
 		redisPort:    redisPort,
 		blinkerState: BlinkerOff,
 		initialized:  false,
+		keycardTapCount:    0,
+		forceStandbyNoLock: false,
+		// lastKeycardTapTime will be zero value (time.IsZero() will be true)
 	}
 }
 
@@ -562,12 +573,59 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}
 }
 
 func (v *VehicleSystem) keycardAuthPassed() error {
-	v.logger.Printf("Processing keycard authentication")
+	v.logger.Printf("Processing keycard authentication tap")
+
+	// --- Force Standby Check ---
+	brakeLeft, errL := v.io.ReadDigitalInput("brake_left")
+	if errL != nil {
+		v.logger.Printf("Warning: Failed to read brake_left for keycard auth, assuming not pressed: %v", errL)
+		brakeLeft = false
+	}
+	brakeRight, errR := v.io.ReadDigitalInput("brake_right")
+	if errR != nil {
+		v.logger.Printf("Warning: Failed to read brake_right for keycard auth, assuming not pressed: %v", errR)
+		brakeRight = false
+	}
+	brakePressed := brakeLeft || brakeRight
+
+	currentTime := time.Now()
+	performForcedStandby := false
+
+	v.mu.Lock()
+	if v.lastKeycardTapTime.IsZero() || currentTime.Sub(v.lastKeycardTapTime) > keycardTapMaxInterval {
+		v.keycardTapCount = 1
+		v.logger.Printf("Keycard tap sequence: Start/Reset. Count: 1")
+	} else {
+		v.keycardTapCount++
+		v.logger.Printf("Keycard tap sequence: Incremented. Count: %d", v.keycardTapCount)
+	}
+	v.lastKeycardTapTime = currentTime
+
+	if v.keycardTapCount >= keycardForceStandbyTaps {
+		if brakePressed {
+			v.logger.Printf("Force standby condition met: %d taps, brake pressed.", v.keycardTapCount)
+			v.forceStandbyNoLock = true
+			performForcedStandby = true
+		} else {
+			v.logger.Printf("Force standby condition NOT met: %d taps, but brake not pressed. Resetting count.", v.keycardTapCount)
+		}
+		v.keycardTapCount = 0 // Reset after 3 taps, regardless of brake, for the next sequence
+	}
+	v.mu.Unlock()
+
+	if performForcedStandby {
+		v.logger.Printf("Transitioning to STANDBY (forced, no lock).")
+		// The forceStandbyNoLock flag will be read and reset by transitionTo
+		return v.transitionTo(types.StateStandby)
+	}
+	// --- End Force Standby Check ---
+
+	// ----- Original keycardAuthPassed logic continues if not forced standby -----
 	v.mu.RLock()
 	currentState := v.state
 	v.mu.RUnlock()
 
-	v.logger.Printf("Current state during keycard auth: %s", currentState)
+	v.logger.Printf("Current state during keycard auth (normal flow): %s", currentState)
 
 	if currentState == types.StateStandby {
 		v.logger.Printf("Reading kickstand state")
@@ -716,43 +774,63 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 	case types.StateStandby:
-		if oldState == types.StateParked {
-			// Start handlebar lock attempt in background
-			v.lockHandlebar()
+		v.mu.Lock()
+		forcedStandby := v.forceStandbyNoLock
+		if forcedStandby {
+			v.forceStandbyNoLock = false // Reset the flag
+		}
+		v.mu.Unlock()
 
+		isFromParked := (oldState == types.StateParked)
+
+		if forcedStandby {
+			v.logger.Printf("Forced standby: skipping handlebar lock.")
+		} else if isFromParked {
+			// Normal standby transition from Parked: lock handlebar
+			v.lockHandlebar()
+		}
+		// If not forced and not from Parked (e.g. Init -> Standby), no specific handlebar lock action here.
+
+		// LED Cues specifically for Parked -> Standby transition.
+		// These are skipped if it's a forced standby that might originate from a different state.
+		if isFromParked {
 			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 			if err != nil {
-				v.logger.Printf("Failed to read brake_left: %v", err)
-				return err
+				v.logger.Printf("Failed to read brake_left for standby cue: %v", err)
+				// Continue without returning error, best effort for cues
 			}
 			brakeRight, err := v.io.ReadDigitalInput("brake_right")
 			if err != nil {
-				v.logger.Printf("Failed to read brake_right: %v", err)
-				return err
+				v.logger.Printf("Failed to read brake_right for standby cue: %v", err)
+				// Continue
 			}
 			brakesPressed := brakeLeft || brakeRight
 
 			if brakesPressed {
 				if err := v.io.PlayPwmCue(8); err != nil { // LED_PARKED_BRAKE_ON_TO_STANDBY
-					v.logger.Printf("Failed to play LED cue: %v", err)
+					v.logger.Printf("Failed to play LED cue (8): %v", err)
 				}
 			} else {
 				if err := v.io.PlayPwmCue(7); err != nil { // LED_PARKED_BRAKE_OFF_TO_STANDBY
-					v.logger.Printf("Failed to play LED cue: %v", err)
+					v.logger.Printf("Failed to play LED cue (7): %v", err)
 				}
 			}
 		}
 
-		// Must set dashboard power off after playing the LED cue
+		// Common actions for ALL transitions to Standby (forced or not)
+		// Must set dashboard power off.
 		if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
 			v.logger.Printf("Failed to disable dashboard power: %v", err)
-			return err
+			// Consider if this error should halt the transition or just be logged.
+			// For now, logging and continuing to ensure other shutdown steps occur.
+		}
+		v.logger.Printf("Dashboard power disabled")
+
+		// Final "all off" cue for standby.
+		if err := v.io.PlayPwmCue(0); err != nil { // ALL_OFF
+			v.logger.Printf("Failed to play LED cue ALL_OFF (0): %v", err)
 		}
 
-		v.logger.Printf("Dashboard power disabled")
-		if err := v.io.PlayPwmCue(0); err != nil { // ALL_OFF
-			v.logger.Printf("Failed to play LED cue: %v", err)
-		}
 	}
 
 	v.logger.Printf("State transition completed successfully")
