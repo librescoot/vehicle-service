@@ -46,6 +46,7 @@ type VehicleSystem struct {
 	keycardTapCount     int
 	lastKeycardTapTime  time.Time
 	forceStandbyNoLock  bool
+	pendingPowerCmd   string      // Queued power command during updates
 }
 
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
@@ -78,6 +79,7 @@ func (v *VehicleSystem) Start() error {
 		ForceLockCallback: v.handleForceLockRequest,
 		LedCueCallback:    v.handleLedCueRequest,
 		LedFadeCallback:   v.handleLedFadeRequest,
+		UpdateCallback:    v.handleUpdateRequest,
 	})
 
 	if err := v.redis.Connect(); err != nil {
@@ -320,9 +322,9 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 
 	// Only try to transition to READY_TO_DRIVE if dashboard is ready
 	if ready {
-		// Don't process kickstand state in STANDBY
-		if currentState == types.StateStandby {
-			v.logger.Printf("Skipping kickstand check in STANDBY state")
+		// Don't process kickstand state in STANDBY or UPDATING state
+		if currentState == types.StateStandby || currentState == types.StateUpdating {
+			v.logger.Printf("Skipping kickstand check in %s state", currentState)
 			return nil
 		}
 
@@ -378,8 +380,8 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 	case "kickstand":
 		v.logger.Printf("Kickstand changed: %v, current state: %s", value, currentState)
-		if currentState == types.StateStandby {
-			v.logger.Printf("Ignoring kickstand change in STANDBY state")
+		if currentState == types.StateStandby || currentState == types.StateUpdating {
+			v.logger.Printf("Ignoring kickstand change in %s state", currentState)
 			return nil
 		}
 		if err := v.redis.SetKickstandState(value); err != nil {
@@ -627,6 +629,12 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	v.mu.RUnlock()
 
 	v.logger.Printf("Current state during keycard auth (normal flow): %s", currentState)
+	
+	// Don't allow keycard auth to change state during updates
+	if currentState == types.StateUpdating {
+		v.logger.Printf("Ignoring keycard authentication during update")
+		return nil
+	}
 
 	if currentState == types.StateStandby {
 		v.logger.Printf("Reading kickstand state")
@@ -686,6 +694,19 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	v.logger.Printf("Applying state transition effects for %s", newState)
 	switch newState {
+	case types.StateUpdating:
+		// When entering updating state, ensure dashboard is powered on
+		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
+			v.logger.Printf("Failed to enable dashboard power: %v", err)
+			return err
+		}
+		v.logger.Printf("Dashboard power enabled for update")
+		
+		// Clear any pending power commands when entering update state
+		v.mu.Lock()
+		v.pendingPowerCmd = ""
+		v.mu.Unlock()
+		
 	case types.StateReadyToDrive:
 		// Check if handlebar needs to be unlocked
 		handlebarPos, err := v.io.ReadDigitalInput("handlebar_position")
@@ -937,6 +958,20 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 
 func (v *VehicleSystem) handlePowerRequest(action string) error {
 	v.logger.Printf("Handling power request: %s", action)
+	
+	// Check if we're in updating state
+	v.mu.RLock()
+	currentState := v.state
+	v.mu.RUnlock()
+	
+	if currentState == types.StateUpdating {
+		v.logger.Printf("System is in updating state, queueing power request: %s", action)
+		v.mu.Lock()
+		v.pendingPowerCmd = action
+		v.mu.Unlock()
+		return nil
+	}
+	
 	switch action {
 	case "hibernate-manual":
 		v.Shutdown()
@@ -1080,6 +1115,12 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 	v.mu.RLock()
 	currentState := v.state
 	v.mu.RUnlock()
+	
+	// Don't allow state changes during updates
+	if currentState == types.StateUpdating {
+		v.logger.Printf("Ignoring state request during update: %s", state)
+		return nil
+	}
 
 	switch state {
 	case "unlock":
@@ -1147,4 +1188,59 @@ func (v *VehicleSystem) handleForceLockRequest() error {
 	v.forceStandbyNoLock = true
 	v.mu.Unlock()
 	return v.transitionTo(types.StateStandby)
+}
+
+// handleUpdateRequest handles update requests from the update-service
+func (v *VehicleSystem) handleUpdateRequest(action string) error {
+	v.logger.Printf("Handling update request: %s", action)
+	
+	switch action {
+	case "start":
+		// Transition to updating state
+		v.logger.Printf("Starting update process")
+		return v.transitionTo(types.StateUpdating)
+		
+	case "complete":
+		// Update is complete, check if there's a pending power command
+		v.mu.RLock()
+		pendingCmd := v.pendingPowerCmd
+		v.mu.RUnlock()
+		
+		v.logger.Printf("Update process complete, pending power command: %s", pendingCmd)
+		
+		// Clear the pending command
+		v.mu.Lock()
+		v.pendingPowerCmd = ""
+		v.mu.Unlock()
+		
+		// Transition back to parked state
+		if err := v.transitionTo(types.StateParked); err != nil {
+			return err
+		}
+		
+		// Execute any pending power command
+		if pendingCmd != "" {
+			v.logger.Printf("Executing pending power command: %s", pendingCmd)
+			return v.handlePowerRequest(pendingCmd)
+		}
+		
+		return nil
+		
+	default:
+		return fmt.Errorf("invalid update action: %s", action)
+	}
+}
+
+// EnableDashboardForUpdate turns on the dashboard without entering ready-to-drive state
+func (v *VehicleSystem) EnableDashboardForUpdate() error {
+	v.logger.Printf("Enabling dashboard for update")
+	
+	// Turn on dashboard power
+	if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
+		v.logger.Printf("Failed to enable dashboard power: %v", err)
+		return err
+	}
+	
+	v.logger.Printf("Dashboard power enabled for update")
+	return nil
 }

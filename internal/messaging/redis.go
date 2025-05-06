@@ -23,6 +23,7 @@ type Callbacks struct {
 	ForceLockCallback func() error       // New callback for force-lock
 	LedCueCallback    func(int) error
 	LedFadeCallback   func(int, int) error
+	UpdateCallback    func(string) error // "start", "complete"
 }
 
 type RedisClient struct {
@@ -85,7 +86,7 @@ func (r *RedisClient) StartListening() error {
 	go r.redisListener(pubsub)
 
 	// Start list command listeners for LPUSH commands
-	r.wg.Add(7) // Added 2 for LED commands
+	r.wg.Add(8) // Added 1 for update commands
 	go r.listCommandListener("scooter:seatbox", r.handleSeatboxCommand)
 	go r.listCommandListener("scooter:horn", r.handleHornCommand)
 	go r.listCommandListener("scooter:blinker", r.handleBlinkerCommand)
@@ -93,6 +94,7 @@ func (r *RedisClient) StartListening() error {
 	go r.listCommandListener("scooter:state", r.handleStateCommand)
 	go r.listCommandListener("scooter:led:cue", r.handleLedCueCommand)
 	go r.listCommandListener("scooter:led:fade", r.handleLedFadeCommand)
+	go r.listCommandListener("scooter:update", r.handleUpdateCommand)
 
 	// Start hash field monitor for direct HSET commands
 	r.wg.Add(1)
@@ -234,6 +236,20 @@ func (r *RedisClient) handleLedFadeCommand(value string) error {
 	return r.callbacks.LedFadeCallback(ledChannel, fadeIndex)
 }
 
+func (r *RedisClient) handleUpdateCommand(value string) error {
+	if r.callbacks.UpdateCallback == nil {
+		return nil
+	}
+	
+	switch value {
+	case "start", "complete":
+		return r.callbacks.UpdateCallback(value)
+	default:
+		r.logger.Printf("Invalid update command value: %s", value)
+		return fmt.Errorf("invalid update command: %s", value)
+	}
+}
+
 func (r *RedisClient) hashFieldMonitor() {
 	defer r.wg.Done()
 	r.logger.Printf("Starting hash field monitor for scooter commands")
@@ -253,6 +269,7 @@ func (r *RedisClient) hashFieldMonitor() {
 				"scooter:horn",
 				"scooter:blinker",
 				"scooter:power",
+				"scooter:update",
 			}
 
 			for _, field := range fields {
@@ -276,6 +293,8 @@ func (r *RedisClient) hashFieldMonitor() {
 					handler = r.handleBlinkerCommand
 				case "scooter:power":
 					handler = r.handlePowerCommand
+				case "scooter:update":
+					handler = r.handleUpdateCommand
 				}
 
 				if handler != nil {
@@ -373,6 +392,18 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 						}
 					default:
 						r.logger.Printf("Invalid power request value: %s", msg.Payload)
+					}
+				}
+				
+			case "scooter:update":
+				if r.callbacks.UpdateCallback != nil {
+					switch msg.Payload {
+					case "start", "complete":
+						if err := r.callbacks.UpdateCallback(msg.Payload); err != nil {
+							r.logger.Printf("Failed to handle update request: %v", err)
+						}
+					default:
+						r.logger.Printf("Invalid update request value: %s", msg.Payload)
 					}
 				}
 			}
@@ -602,6 +633,23 @@ func (r *RedisClient) SetHandlebarLockState(isLocked bool) error {
 		return err
 	}
 	r.logger.Printf("Successfully set handlebar lock state")
+	return nil
+}
+
+// PublishUpdateStatus publishes the update status to Redis
+func (r *RedisClient) PublishUpdateStatus(status string) error {
+	r.logger.Printf("Publishing update status: %s", status)
+	pipe := r.client.Pipeline()
+
+	pipe.HSet(r.ctx, "vehicle", "update:status", status)
+	pipe.Publish(r.ctx, "vehicle", "update:status")
+
+	_, err := pipe.Exec(r.ctx)
+	if err != nil {
+		r.logger.Printf("Failed to publish update status: %v", err)
+		return err
+	}
+	r.logger.Printf("Successfully published update status")
 	return nil
 }
 
