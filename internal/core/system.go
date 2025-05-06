@@ -75,6 +75,7 @@ func (v *VehicleSystem) Start() error {
 		BlinkerCallback:   v.handleBlinkerRequest,
 		PowerCallback:     v.handlePowerRequest,
 		StateCallback:     v.handleStateRequest,
+		ForceLockCallback: v.handleForceLockRequest,
 		LedCueCallback:    v.handleLedCueRequest,
 		LedFadeCallback:   v.handleLedFadeRequest,
 	})
@@ -1136,4 +1137,14 @@ func (v *VehicleSystem) handleLedCueRequest(cueIndex int) error {
 func (v *VehicleSystem) handleLedFadeRequest(ledChannel int, fadeIndex int) error {
 	v.logger.Printf("Handling LED fade request: channel=%d, index=%d", ledChannel, fadeIndex)
 	return v.io.PlayPwmFade(ledChannel, fadeIndex)
+}
+
+// handleForceLockRequest is called when a "force-lock" command is received via Redis.
+// It initiates a forced transition to standby, skipping the handlebar lock.
+func (v *VehicleSystem) handleForceLockRequest() error {
+	v.logger.Printf("Handling force-lock request: transitioning to Standby (no lock).")
+	v.mu.Lock()
+	v.forceStandbyNoLock = true
+	v.mu.Unlock()
+	return v.transitionTo(types.StateStandby)
 }

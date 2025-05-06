@@ -20,6 +20,7 @@ type Callbacks struct {
 	BlinkerCallback   func(string) error // "off", "left", "right", "both"
 	PowerCallback     func(string) error // "hibernate-manual", "reboot"
 	StateCallback     func(string) error // "unlock", "lock", "lock-hibernate"
+	ForceLockCallback func() error       // New callback for force-lock
 	LedCueCallback    func(int) error
 	LedFadeCallback   func(int, int) error
 }
@@ -188,16 +189,23 @@ func (r *RedisClient) handlePowerCommand(value string) error {
 }
 
 func (r *RedisClient) handleStateCommand(value string) error {
-	if r.callbacks.StateCallback == nil {
+	if r.callbacks.StateCallback == nil && r.callbacks.ForceLockCallback == nil {
 		return nil
 	}
 	switch value {
 	case "unlock", "lock", "lock-hibernate":
-		return r.callbacks.StateCallback(value)
+		if r.callbacks.StateCallback != nil {
+			return r.callbacks.StateCallback(value)
+		}
+	case "force-lock":
+		if r.callbacks.ForceLockCallback != nil {
+			return r.callbacks.ForceLockCallback()
+		}
 	default:
 		r.logger.Printf("Invalid state command value: %s", value)
 		return fmt.Errorf("invalid state command: %s", value)
 	}
+	return nil // Should not be reached if callbacks are properly assigned or error is returned
 }
 
 func (r *RedisClient) handleLedCueCommand(value string) error {
