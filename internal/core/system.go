@@ -47,6 +47,8 @@ type VehicleSystem struct {
 	lastKeycardTapTime  time.Time
 	forceStandbyNoLock  bool
 	pendingPowerCmd   string      // Queued power command during updates
+	dbcUpdating       bool        // Track if DBC is currently updating
+	previousState     types.SystemState // Previous state before entering updating state
 }
 
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
@@ -683,6 +685,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	oldState := v.state
 	v.state = newState
+	
+	// Save previous state when entering updating state
+	if newState == types.StateUpdating {
+		v.previousState = oldState
+	}
+	
 	v.mu.Unlock()
 
 	v.logger.Printf("State transition: %s -> %s", oldState, newState)
@@ -798,6 +806,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 	case types.StateStandby:
 		v.mu.Lock()
 		forcedStandby := v.forceStandbyNoLock
+		dbcUpdating := v.dbcUpdating
 		if forcedStandby {
 			v.forceStandbyNoLock = false // Reset the flag
 		}
@@ -840,13 +849,17 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 		// Common actions for ALL transitions to Standby (forced or not)
-		// Must set dashboard power off.
-		if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-			v.logger.Printf("Failed to disable dashboard power: %v", err)
-			// Consider if this error should halt the transition or just be logged.
-			// For now, logging and continuing to ensure other shutdown steps occur.
+		// Keep dashboard power on if DBC is updating, otherwise turn it off
+		if !dbcUpdating {
+			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
+				v.logger.Printf("Failed to disable dashboard power: %v", err)
+				// Consider if this error should halt the transition or just be logged.
+				// For now, logging and continuing to ensure other shutdown steps occur.
+			}
+			v.logger.Printf("Dashboard power disabled")
+		} else {
+			v.logger.Printf("Keeping dashboard power on for DBC update")
 		}
-		v.logger.Printf("Dashboard power disabled")
 
 		// Final "all off" cue for standby.
 		if err := v.io.PlayPwmCue(0); err != nil { // ALL_OFF
@@ -1200,21 +1213,77 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.logger.Printf("Starting update process")
 		return v.transitionTo(types.StateUpdating)
 		
+	case "start-dbc":
+		// Mark DBC as updating and ensure dashboard is powered on
+		v.mu.Lock()
+		v.dbcUpdating = true
+		v.mu.Unlock()
+		
+		v.logger.Printf("Starting DBC update process")
+		
+		// Ensure dashboard is powered on
+		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
+			v.logger.Printf("Failed to enable dashboard power for DBC update: %v", err)
+			return err
+		}
+		
+		// If we're not already in updating state, transition to it
+		v.mu.RLock()
+		currentState := v.state
+		v.mu.RUnlock()
+		
+		if currentState != types.StateUpdating {
+			return v.transitionTo(types.StateUpdating)
+		}
+		
+		return nil
+		
+	case "complete-dbc":
+		// Mark DBC update as complete
+		v.mu.Lock()
+		v.dbcUpdating = false
+		v.mu.Unlock()
+		
+		v.logger.Printf("DBC update process complete")
+		
+		// If we're in standby state, we can now turn off the dashboard
+		v.mu.RLock()
+		currentState := v.state
+		v.mu.RUnlock()
+		
+		if currentState == types.StateStandby {
+			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
+				v.logger.Printf("Failed to disable dashboard power after DBC update: %v", err)
+				return err
+			}
+			v.logger.Printf("Dashboard power disabled after DBC update")
+		}
+		
+		return nil
+		
 	case "complete":
 		// Update is complete, check if there's a pending power command
 		v.mu.RLock()
 		pendingCmd := v.pendingPowerCmd
+		dbcUpdating := v.dbcUpdating
+		previousState := v.previousState
 		v.mu.RUnlock()
 		
-		v.logger.Printf("Update process complete, pending power command: %s", pendingCmd)
+		v.logger.Printf("Update process complete, pending power command: %s, DBC updating: %v", pendingCmd, dbcUpdating)
 		
 		// Clear the pending command
 		v.mu.Lock()
 		v.pendingPowerCmd = ""
 		v.mu.Unlock()
 		
-		// Transition back to parked state
-		if err := v.transitionTo(types.StateParked); err != nil {
+		// If DBC is still updating, don't transition back to previous state yet
+		if dbcUpdating {
+			v.logger.Printf("DBC is still updating, staying in updating state")
+			return nil
+		}
+		
+		// Transition back to previous state
+		if err := v.transitionTo(previousState); err != nil {
 			return err
 		}
 		

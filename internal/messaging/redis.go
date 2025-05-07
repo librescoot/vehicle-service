@@ -242,7 +242,7 @@ func (r *RedisClient) handleUpdateCommand(value string) error {
 	}
 	
 	switch value {
-	case "start", "complete":
+	case "start", "complete", "start-dbc", "complete-dbc":
 		return r.callbacks.UpdateCallback(value)
 	default:
 		r.logger.Printf("Invalid update command value: %s", value)
