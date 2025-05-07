@@ -29,37 +29,37 @@ const (
 )
 
 type VehicleSystem struct {
-	state             types.SystemState
-	dashboardReady    bool
-	logger            *log.Logger
-	io                *hardware.LinuxHardwareIO
-	redis             *messaging.RedisClient
-	mu                sync.RWMutex
-	redisHost         string
-	redisPort         int
-	blinkerState      BlinkerState
-	blinkerStopChan   chan struct{}
-	initialized       bool
-	handlebarUnlocked bool        // Track if handlebar has been unlocked in this power cycle
-	handlebarTimer    *time.Timer // Timer for handlebar position window
-	hibernationTimer  *time.Timer // Timer for brake-triggered hibernation
-	keycardTapCount     int
-	lastKeycardTapTime  time.Time
-	forceStandbyNoLock  bool
-	pendingPowerCmd   string      // Queued power command during updates
-	dbcUpdating       bool        // Track if DBC is currently updating
-	previousState     types.SystemState // Previous state before entering updating state
+	state              types.SystemState
+	dashboardReady     bool
+	logger             *log.Logger
+	io                 *hardware.LinuxHardwareIO
+	redis              *messaging.RedisClient
+	mu                 sync.RWMutex
+	redisHost          string
+	redisPort          int
+	blinkerState       BlinkerState
+	blinkerStopChan    chan struct{}
+	initialized        bool
+	handlebarUnlocked  bool        // Track if handlebar has been unlocked in this power cycle
+	handlebarTimer     *time.Timer // Timer for handlebar position window
+	hibernationTimer   *time.Timer // Timer for brake-triggered hibernation
+	keycardTapCount    int
+	lastKeycardTapTime time.Time
+	forceStandbyNoLock bool
+	pendingPowerCmd    string            // Queued power command during updates
+	dbcUpdating        bool              // Track if DBC is currently updating
+	previousState      types.SystemState // Previous state before entering updating state
 }
 
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
 	return &VehicleSystem{
-		state:        types.StateInit,
-		logger:       log.New(log.Writer(), "Vehicle: ", log.LstdFlags),
-		io:           hardware.NewLinuxHardwareIO(),
-		redisHost:    redisHost,
-		redisPort:    redisPort,
-		blinkerState: BlinkerOff,
-		initialized:  false,
+		state:              types.StateInit,
+		logger:             log.New(log.Writer(), "Vehicle: ", log.LstdFlags),
+		io:                 hardware.NewLinuxHardwareIO(),
+		redisHost:          redisHost,
+		redisPort:          redisPort,
+		blinkerState:       BlinkerOff,
+		initialized:        false,
 		keycardTapCount:    0,
 		forceStandbyNoLock: false,
 		// lastKeycardTapTime will be zero value (time.IsZero() will be true)
@@ -623,7 +623,7 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 		v.mu.RLock()
 		dbcUpdating := v.dbcUpdating
 		v.mu.RUnlock()
-		
+
 		// If DBC is updating, transition to UPDATING state instead of STANDBY
 		if dbcUpdating {
 			v.logger.Printf("Transitioning to UPDATING (forced, no lock) due to DBC update.")
@@ -643,17 +643,17 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	v.mu.RUnlock()
 
 	v.logger.Printf("Current state during keycard auth (normal flow): %s", currentState)
-	
+
 	// Special handling for keycard auth during updates
 	if currentState == types.StateUpdating {
 		v.mu.RLock()
 		dbcUpdating := v.dbcUpdating
 		v.mu.RUnlock()
-		
+
 		if dbcUpdating {
 			// If DBC is updating, allow keycard events but don't turn off dashboard power
 			v.logger.Printf("Allowing keycard authentication during DBC update, but keeping dashboard power on")
-			
+
 			// For updating state, handle like standby - transition to parked or ready-to-drive based on kickstand
 			v.logger.Printf("Reading kickstand state")
 			kickstandValue, err := v.io.ReadDigitalInput("kickstand")
@@ -691,7 +691,7 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	v.mu.RLock()
 	dbcUpdating := v.dbcUpdating
 	v.mu.RUnlock()
-	
+
 	// Check kickstand before going to STANDBY or UPDATING
 	kickstandValue, err := v.io.ReadDigitalInput("kickstand")
 	if err != nil {
@@ -729,12 +729,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	oldState := v.state
 	v.state = newState
-	
+
 	// Save previous state when entering updating state
 	if newState == types.StateUpdating {
 		v.previousState = oldState
 	}
-	
+
 	v.mu.Unlock()
 
 	v.logger.Printf("State transition: %s -> %s", oldState, newState)
@@ -753,12 +753,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			return err
 		}
 		v.logger.Printf("Dashboard power enabled for update")
-		
+
 		// Clear any pending power commands when entering update state
 		v.mu.Lock()
 		v.pendingPowerCmd = ""
 		v.mu.Unlock()
-		
+
 	case types.StateReadyToDrive:
 		// Check if handlebar needs to be unlocked
 		handlebarPos, err := v.io.ReadDigitalInput("handlebar_position")
@@ -1015,12 +1015,12 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 
 func (v *VehicleSystem) handlePowerRequest(action string) error {
 	v.logger.Printf("Handling power request: %s", action)
-	
+
 	// Check if we're in updating state
 	v.mu.RLock()
 	currentState := v.state
 	v.mu.RUnlock()
-	
+
 	if currentState == types.StateUpdating {
 		v.logger.Printf("System is in updating state, queueing power request: %s", action)
 		v.mu.Lock()
@@ -1028,7 +1028,7 @@ func (v *VehicleSystem) handlePowerRequest(action string) error {
 		v.mu.Unlock()
 		return nil
 	}
-	
+
 	switch action {
 	case "hibernate-manual":
 		v.Shutdown()
@@ -1172,7 +1172,7 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 	v.mu.RLock()
 	currentState := v.state
 	v.mu.RUnlock()
-	
+
 	// Don't allow state changes during updates
 	if currentState == types.StateUpdating {
 		v.logger.Printf("Ignoring state request during update: %s", state)
@@ -1206,7 +1206,7 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 			v.mu.RLock()
 			dbcUpdating := v.dbcUpdating
 			v.mu.RUnlock()
-			
+
 			// If DBC is updating, transition to UPDATING state instead of STANDBY
 			if dbcUpdating {
 				v.logger.Printf("DBC is updating, transitioning to UPDATING instead of STANDBY")
@@ -1223,7 +1223,7 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 			v.mu.RLock()
 			dbcUpdating := v.dbcUpdating
 			v.mu.RUnlock()
-			
+
 			// If DBC is updating, transition to UPDATING state instead of STANDBY
 			if dbcUpdating {
 				v.logger.Printf("DBC is updating, transitioning to UPDATING instead of STANDBY for lock-hibernate")
@@ -1271,11 +1271,11 @@ func (v *VehicleSystem) handleForceLockRequest() error {
 	v.mu.RLock()
 	dbcUpdating := v.dbcUpdating
 	v.mu.RUnlock()
-	
+
 	v.mu.Lock()
 	v.forceStandbyNoLock = true
 	v.mu.Unlock()
-	
+
 	// If DBC is updating, transition to UPDATING state instead of STANDBY
 	if dbcUpdating {
 		v.logger.Printf("Handling force-lock request: DBC is updating, transitioning to UPDATING (no lock).")
@@ -1289,51 +1289,51 @@ func (v *VehicleSystem) handleForceLockRequest() error {
 // handleUpdateRequest handles update requests from the update-service
 func (v *VehicleSystem) handleUpdateRequest(action string) error {
 	v.logger.Printf("Handling update request: %s", action)
-	
+
 	switch action {
 	case "start":
 		// Transition to updating state
 		v.logger.Printf("Starting update process")
 		return v.transitionTo(types.StateUpdating)
-		
+
 	case "start-dbc":
 		// Mark DBC as updating and ensure dashboard is powered on
 		v.mu.Lock()
 		v.dbcUpdating = true
 		v.mu.Unlock()
-		
+
 		v.logger.Printf("Starting DBC update process")
-		
+
 		// Ensure dashboard is powered on
 		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
 			v.logger.Printf("Failed to enable dashboard power for DBC update: %v", err)
 			return err
 		}
-		
+
 		// If we're not already in updating state, transition to it
 		v.mu.RLock()
 		currentState := v.state
 		v.mu.RUnlock()
-		
+
 		if currentState != types.StateUpdating {
 			return v.transitionTo(types.StateUpdating)
 		}
-		
+
 		return nil
-		
+
 	case "complete-dbc":
 		// Mark DBC update as complete
 		v.mu.Lock()
 		v.dbcUpdating = false
 		v.mu.Unlock()
-		
+
 		v.logger.Printf("DBC update process complete")
-		
+
 		// If we're in standby state, we can now turn off the dashboard
 		v.mu.RLock()
 		currentState := v.state
 		v.mu.RUnlock()
-		
+
 		if currentState == types.StateStandby {
 			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
 				v.logger.Printf("Failed to disable dashboard power after DBC update: %v", err)
@@ -1341,9 +1341,9 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 			}
 			v.logger.Printf("Dashboard power disabled after DBC update")
 		}
-		
+
 		return nil
-		
+
 	case "complete":
 		// Update is complete, check if there's a pending power command
 		v.mu.RLock()
@@ -1351,33 +1351,33 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		dbcUpdating := v.dbcUpdating
 		previousState := v.previousState
 		v.mu.RUnlock()
-		
+
 		v.logger.Printf("Update process complete, pending power command: %s, DBC updating: %v", pendingCmd, dbcUpdating)
-		
+
 		// Clear the pending command
 		v.mu.Lock()
 		v.pendingPowerCmd = ""
 		v.mu.Unlock()
-		
+
 		// If DBC is still updating, don't transition back to previous state yet
 		if dbcUpdating {
 			v.logger.Printf("DBC is still updating, staying in updating state")
 			return nil
 		}
-		
+
 		// Transition back to previous state
 		if err := v.transitionTo(previousState); err != nil {
 			return err
 		}
-		
+
 		// Execute any pending power command
 		if pendingCmd != "" {
 			v.logger.Printf("Executing pending power command: %s", pendingCmd)
 			return v.handlePowerRequest(pendingCmd)
 		}
-		
+
 		return nil
-		
+
 	default:
 		return fmt.Errorf("invalid update action: %s", action)
 	}
@@ -1386,13 +1386,13 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 // EnableDashboardForUpdate turns on the dashboard without entering ready-to-drive state
 func (v *VehicleSystem) EnableDashboardForUpdate() error {
 	v.logger.Printf("Enabling dashboard for update")
-	
+
 	// Turn on dashboard power
 	if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
 		v.logger.Printf("Failed to enable dashboard power: %v", err)
 		return err
 	}
-	
+
 	v.logger.Printf("Dashboard power enabled for update")
 	return nil
 }

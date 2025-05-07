@@ -240,7 +240,7 @@ func (r *RedisClient) handleUpdateCommand(value string) error {
 	if r.callbacks.UpdateCallback == nil {
 		return nil
 	}
-	
+
 	switch value {
 	case "start", "complete", "start-dbc", "complete-dbc":
 		return r.callbacks.UpdateCallback(value)
@@ -394,7 +394,7 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 						r.logger.Printf("Invalid power request value: %s", msg.Payload)
 					}
 				}
-				
+
 			case "scooter:update":
 				if r.callbacks.UpdateCallback != nil {
 					switch msg.Payload {
