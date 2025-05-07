@@ -373,6 +373,49 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		return nil
 	}
 
+	// Check for manual ready-to-drive activation when in parked state
+	if currentState == types.StateParked && channel == "seatbox_button" && value {
+		// Check if dashboard has not signaled readiness
+		v.mu.RLock()
+		dashboardReady := v.dashboardReady
+		v.mu.RUnlock()
+
+		if !dashboardReady {
+			// Check if kickstand is up
+			kickstandValue, err := v.io.ReadDigitalInput("kickstand")
+			if err != nil {
+				v.logger.Printf("Failed to read kickstand: %v", err)
+				return err
+			}
+
+			if !kickstandValue {
+				// Check if both brakes are held
+				brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+				if err != nil {
+					v.logger.Printf("Failed to read brake_left: %v", err)
+					return err
+				}
+				brakeRight, err := v.io.ReadDigitalInput("brake_right")
+				if err != nil {
+					v.logger.Printf("Failed to read brake_right: %v", err)
+					return err
+				}
+
+				if brakeLeft && brakeRight {
+					v.logger.Printf("Manual ready-to-drive activation: kickstand up, both brakes held, seatbox button pressed")
+					
+					// Blink the main light once for confirmation
+					if err := v.io.PlayPwmCue(3); err != nil { // LED_PARKED_TO_DRIVE
+						v.logger.Printf("Failed to play LED cue: %v", err)
+					}
+					
+					// Set the scooter to ready-to-drive
+					return v.transitionTo(types.StateReadyToDrive)
+				}
+			}
+		}
+	}
+
 	switch channel {
 	case "horn_button":
 		if err := v.io.WriteDigitalOutput("horn", value); err != nil {
