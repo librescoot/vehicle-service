@@ -1,4 +1,3 @@
-// File: internal/core/system.go
 package core
 
 import (
@@ -1419,6 +1418,24 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 			return v.handlePowerRequest(pendingCmd)
 		}
 
+		return nil
+
+	case "cycle-dashboard-power":
+		// Cycle dashboard power to reboot the DBC
+		v.logger.Printf("Cycling dashboard power to reboot DBC")
+		
+		// Turn off dashboard power
+		if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
+			v.logger.Printf("Failed to disable dashboard power: %v", err)
+			return err
+		}
+		time.Sleep(1 * time.Second)
+		// Turn dashboard power back on
+		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
+			v.logger.Printf("Failed to re-enable dashboard power: %v", err)
+			return err
+		}
+		v.logger.Printf("Dashboard power cycled successfully")
 		return nil
 
 	default:
