@@ -78,8 +78,8 @@ func (r *RedisClient) StartListening() error {
 	r.logger.Printf("Starting Redis listeners")
 
 	// Subscribe to pub/sub channels for system events
-	pubsub := r.client.Subscribe(r.ctx, "dashboard", "keycard", "ota", "power-manager")
-	r.logger.Printf("Subscribed to Redis channels: dashboard, keycard, ota, power-manager")
+	pubsub := r.client.Subscribe(r.ctx, "dashboard", "keycard", "ota", "power-manager", "vehicle")
+	r.logger.Printf("Subscribed to Redis channels: dashboard, keycard, ota, power-manager, vehicle")
 
 	// Start pub/sub listener
 	r.wg.Add(1)
@@ -96,9 +96,7 @@ func (r *RedisClient) StartListening() error {
 	go r.listCommandListener("scooter:led:fade", r.handleLedFadeCommand)
 	go r.listCommandListener("scooter:update", r.handleUpdateCommand)
 
-	// Start hash field monitor for direct HSET commands
-	r.wg.Add(1)
-	go r.hashFieldMonitor()
+	// Hash field monitor replaced with pub/sub trigger on "vehicle" channel (see redisListener)
 
 	return nil
 }
@@ -113,17 +111,18 @@ func (r *RedisClient) listCommandListener(key string, handler func(string) error
 			r.logger.Printf("Context cancelled, exiting %s listener", key)
 			return
 		default:
-			// Use BRPOP with a timeout to avoid blocking forever
-			result, err := r.client.BRPop(r.ctx, 1*time.Second, key).Result()
-			if err == redis.Nil {
-				// Timeout, continue polling
-				continue
-			}
+			// Use BRPOP with a short timeout to allow periodic context cancellation checks
+			result, err := r.client.BRPop(r.ctx, 5*time.Second, key).Result()
 			if err != nil {
-				if err != context.Canceled {
-					r.logger.Printf("Error reading from %s list: %v", key, err)
+				if err == redis.Nil {
+					// Timeout elapsed, loop back to check context
+					continue
 				}
-				time.Sleep(100 * time.Millisecond)
+				if err == context.Canceled {
+					r.logger.Printf("Context cancelled, exiting %s listener", key)
+					return
+				}
+				r.logger.Printf("Error reading from %s list: %v", key, err)
 				continue
 			}
 
@@ -250,67 +249,6 @@ func (r *RedisClient) handleUpdateCommand(value string) error {
 	}
 }
 
-func (r *RedisClient) hashFieldMonitor() {
-	defer r.wg.Done()
-	r.logger.Printf("Starting hash field monitor for scooter commands")
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-r.ctx.Done():
-			r.logger.Printf("Context cancelled, exiting hash field monitor")
-			return
-		case <-ticker.C:
-			// Check scooter command fields
-			fields := []string{
-				"scooter:seatbox",
-				"scooter:horn",
-				"scooter:blinker",
-				"scooter:power",
-				"scooter:update",
-			}
-
-			for _, field := range fields {
-				value, err := r.client.HGet(r.ctx, "vehicle", field).Result()
-				if err == redis.Nil {
-					continue
-				}
-				if err != nil {
-					r.logger.Printf("Error reading hash field %s: %v", field, err)
-					continue
-				}
-
-				// Process the command
-				var handler func(string) error
-				switch field {
-				case "scooter:seatbox":
-					handler = r.handleSeatboxCommand
-				case "scooter:horn":
-					handler = r.handleHornCommand
-				case "scooter:blinker":
-					handler = r.handleBlinkerCommand
-				case "scooter:power":
-					handler = r.handlePowerCommand
-				case "scooter:update":
-					handler = r.handleUpdateCommand
-				}
-
-				if handler != nil {
-					if err := handler(value); err != nil {
-						r.logger.Printf("Error handling hash field %s command: %v", field, err)
-					}
-					// Clear the field after processing
-					if err := r.client.HDel(r.ctx, "vehicle", field).Err(); err != nil {
-						r.logger.Printf("Error clearing hash field %s: %v", field, err)
-					}
-				}
-			}
-		}
-	}
-}
-
 func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 	defer r.wg.Done()
 	defer pubsub.Close()
@@ -406,12 +344,62 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 						r.logger.Printf("Invalid update request value: %s", msg.Payload)
 					}
 				}
+
+			case "vehicle":
+				// msg.Payload contains the hash field that changed
+				r.processVehicleMessage(msg.Payload)
 			}
 
 		case <-r.ctx.Done():
 			r.logger.Printf("Context cancelled, exiting listener")
 			return
 		}
+	}
+}
+
+func (r *RedisClient) processVehicleMessage(payload string) {
+	// Handles hash-based scooter commands signalled via the "vehicle" channel.
+	// The payload is expected to be the hash field that was modified (e.g. "scooter:seatbox").
+
+	// Only react to the set of commands we currently support.
+	var handler func(string) error
+	switch payload {
+	case "scooter:seatbox":
+		handler = r.handleSeatboxCommand
+	case "scooter:horn":
+		handler = r.handleHornCommand
+	case "scooter:blinker":
+		handler = r.handleBlinkerCommand
+	case "scooter:power":
+		handler = r.handlePowerCommand
+	case "scooter:update":
+		handler = r.handleUpdateCommand
+	default:
+		// Ignore unknown payloads to keep behaviour predictable
+		r.logger.Printf("Unhandled vehicle payload: %s", payload)
+		return
+	}
+
+	// Fetch the current value for the field
+	value, err := r.client.HGet(r.ctx, "vehicle", payload).Result()
+	if err == redis.Nil {
+		// Field not set – nothing to do.
+		return
+	}
+	if err != nil {
+		r.logger.Printf("Error reading hash field %s: %v", payload, err)
+		return
+	}
+
+	if handler != nil {
+		if err := handler(value); err != nil {
+			r.logger.Printf("Error handling %s command: %v", payload, err)
+		}
+	}
+
+	// Clear the field to acknowledge processing, mirroring previous behaviour
+	if err := r.client.HDel(r.ctx, "vehicle", payload).Err(); err != nil {
+		r.logger.Printf("Error clearing hash field %s: %v", payload, err)
 	}
 }
 

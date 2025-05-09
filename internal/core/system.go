@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -92,7 +93,7 @@ func (v *VehicleSystem) Start() error {
 	if err != nil {
 		v.logger.Printf("Failed to get saved state from Redis: %v", err)
 		// Continue with default state
-	} else if savedState != types.StateInit {
+	} else if savedState != types.StateInit && savedState != types.StateShuttingDown {
 		v.logger.Printf("Restoring saved state from Redis: %s", savedState)
 		v.mu.Lock()
 		v.state = savedState
@@ -107,12 +108,24 @@ func (v *VehicleSystem) Start() error {
 		}
 	}
 
-	// Reload PWM LED kernel module
+	// Reload PWM LED kernel module, log outcomes for diagnostics
+	v.logger.Printf("Reloading PWM LED kernel module (imx_pwm_led)")
 	if err := exec.Command("rmmod", "imx_pwm_led").Run(); err != nil {
 		v.logger.Printf("Warning: Failed to remove PWM LED module: %v", err)
+	} else {
+		v.logger.Printf("Successfully removed existing imx_pwm_led module (if present)")
 	}
 	if err := exec.Command("modprobe", "imx_pwm_led").Run(); err != nil {
 		return fmt.Errorf("failed to load PWM LED module: %w", err)
+	}
+	v.logger.Printf("Successfully inserted imx_pwm_led module, waiting for device nodes")
+
+	// Give udev some time to create /dev/pwm_led* nodes (up to 1s)
+	for i := 0; i < 10; i++ {
+		if _, err := os.Stat("/dev/pwm_led0"); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Initialize hardware
@@ -402,12 +415,12 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 				if brakeLeft && brakeRight {
 					v.logger.Printf("Manual ready-to-drive activation: kickstand up, both brakes held, seatbox button pressed")
-					
+
 					// Blink the main light once for confirmation
 					if err := v.io.PlayPwmCue(3); err != nil { // LED_PARKED_TO_DRIVE
 						v.logger.Printf("Failed to play LED cue: %v", err)
 					}
-					
+
 					// Set the scooter to ready-to-drive
 					return v.transitionTo(types.StateReadyToDrive)
 				}
@@ -1439,7 +1452,7 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 	case "cycle-dashboard-power":
 		// Cycle dashboard power to reboot the DBC
 		v.logger.Printf("Cycling dashboard power to reboot DBC")
-		
+
 		// Turn off dashboard power
 		if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
 			v.logger.Printf("Failed to disable dashboard power: %v", err)
