@@ -159,8 +159,8 @@ func (io *LinuxHardwareIO) readInitialState() error {
 		bitOffset := code % 8
 		if byteOffset < len(buffer) {
 			isPressed := (buffer[byteOffset] & (1 << bitOffset)) != 0
+			io.activeKeys[code] = isPressed
 			if isPressed {
-				io.activeKeys[code] = true
 				channel := io.mapKeycode(code)
 				io.logger.Printf("Initial state: %s (code %d) is pressed", channel, code)
 			}
@@ -287,36 +287,23 @@ func (io *LinuxHardwareIO) mapKeycode(code uint16) string {
 }
 
 func (io *LinuxHardwareIO) ReadDigitalInput(channel string) (bool, error) {
-	io.mu.RLock()
-	defer io.mu.RUnlock()
+	// After initialization, activeKeys is kept in sync by readInitialState and
+	// handleKeyEvent.  It is therefore the single source of truth for input
+	// state queries originating from application logic.  Rely exclusively on
+	// it here to avoid unnecessary and potentially expensive ioctl calls.
 
+	io.mu.RLock()
 	keycode := io.getKeycodeForChannel(channel)
 	if keycode == 0 {
+		io.mu.RUnlock()
 		return false, fmt.Errorf("unknown input channel: %s", channel)
 	}
 
-	// Get initial state from input device if available
-	if io.inputFile != nil {
-		buffer := make([]byte, 128)
-		_, _, errno := syscall.Syscall(
-			syscall.SYS_IOCTL,
-			uintptr(io.inputFile.Fd()),
-			uintptr(0x80804518), // EVIOCGKEY(len)
-			uintptr(unsafe.Pointer(&buffer[0])),
-		)
-		if errno == 0 {
-			byteOffset := int(keycode / 8)
-			bitOffset := keycode % 8
-			if byteOffset < len(buffer) {
-				isPressed := (buffer[byteOffset] & (1 << bitOffset)) != 0
-				io.logger.Printf("Reading digital input for channel %s (keycode %d)", channel, keycode)
-				return isPressed, nil
-			}
-		}
-	}
+	state := io.activeKeys[keycode]
+	io.mu.RUnlock()
 
-	io.logger.Printf("Reading digital input for channel %s (keycode %d) from cached state", channel, keycode)
-	return io.activeKeys[keycode], nil
+	io.logger.Printf("Reading digital input for channel %s (keycode %d) -> %v (cached)", channel, keycode, state)
+	return state, nil
 }
 
 func (io *LinuxHardwareIO) getKeycodeForChannel(channel string) uint16 {

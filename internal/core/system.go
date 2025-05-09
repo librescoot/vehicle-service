@@ -853,6 +853,33 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			if err := v.io.PlayPwmCue(3); err != nil { // LED_PARKED_TO_DRIVE
 				v.logger.Printf("Failed to play LED cue: %v", err)
 			}
+		} else if oldState == types.StateStandby {
+			// We came directly from Standby. The first brake press might have been ignored while
+			// in Standby, so synchronise the current brake lever states now to ensure the rear
+			// light reflects the actual situation and Redis observers get an accurate value.
+			brakeLeft, errL := v.io.ReadDigitalInput("brake_left")
+			if errL != nil {
+				v.logger.Printf("Failed to read brake_left after Standby->Ready transition: %v", errL)
+			}
+			brakeRight, errR := v.io.ReadDigitalInput("brake_right")
+			if errR != nil {
+				v.logger.Printf("Failed to read brake_right after Standby->Ready transition: %v", errR)
+			}
+
+			// Publish the actual states so that other services get the correct information
+			if err := v.redis.SetBrakeState("left", brakeLeft); err != nil {
+				v.logger.Printf("Warning: failed to publish brake_left state after Standby->Ready transition: %v", err)
+			}
+			if err := v.redis.SetBrakeState("right", brakeRight); err != nil {
+				v.logger.Printf("Warning: failed to publish brake_right state after Standby->Ready transition: %v", err)
+			}
+
+			// Update the rear-light if at least one lever is pressed
+			if brakeLeft || brakeRight {
+				if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
+					v.logger.Printf("Failed to play brake ON cue after Standby->Ready transition: %v", err)
+				}
+			}
 		}
 
 	case types.StateParked:
