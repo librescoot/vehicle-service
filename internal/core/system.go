@@ -779,6 +779,15 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	v.mu.Unlock()
 
+	// Set CPU governor when leaving standby
+	if oldState == types.StateStandby && newState != types.StateStandby {
+		v.logger.Printf("Leaving Standby: Setting CPU governor to ondemand")
+		if err := exec.Command("sh", "-c", "echo ondemand > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").Run(); err != nil {
+			v.logger.Printf("Warning: Failed to set CPU governor to ondemand: %v", err)
+			// Not returning an error here as it's not critical for state transition
+		}
+	}
+
 	v.logger.Printf("State transition: %s -> %s", oldState, newState)
 
 	if err := v.publishState(); err != nil {
@@ -897,6 +906,13 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			v.forceStandbyNoLock = false // Reset the flag
 		}
 		v.mu.Unlock()
+
+		// Set CPU governor to powersave
+		v.logger.Printf("Entering Standby: Setting CPU governor to powersave")
+		if err := exec.Command("sh", "-c", "echo powersave > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").Run(); err != nil {
+			v.logger.Printf("Warning: Failed to set CPU governor to powersave: %v", err)
+			// Not returning an error here as it's not critical for state transition
+		}
 
 		isFromParked := (oldState == types.StateParked)
 
