@@ -379,12 +379,6 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		}
 	}
 
-	// Ignore seatbox button in ready-to-drive mode
-	if currentState == types.StateReadyToDrive && channel == "seatbox_button" {
-		v.logger.Printf("Ignoring seatbox button in ready-to-drive state")
-		return nil
-	}
-
 	// Check for manual ready-to-drive activation when in parked state
 	if currentState == types.StateParked && channel == "seatbox_button" && value {
 		// Check if dashboard has not signaled readiness
@@ -437,7 +431,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 	case "kickstand":
 		v.logger.Printf("Kickstand changed: %v, current state: %s", value, currentState)
-		if currentState == types.StateStandby || currentState == types.StateUpdating {
+		if currentState == types.StateStandby {
 			v.logger.Printf("Ignoring kickstand change in %s state", currentState)
 			return nil
 		}
@@ -458,7 +452,8 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		if err := v.redis.SetSeatboxButton(value); err != nil {
 			return err
 		}
-		if value {
+		// Only open seatbox via button in parked mode
+		if value && currentState == types.StateParked {
 			return v.openSeatboxLock()
 		}
 
