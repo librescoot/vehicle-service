@@ -523,7 +523,12 @@ func (r *RedisClient) SetHornButton(isPressed bool) error {
 		state = "on"
 	}
 
-	_, err := r.client.HSet(r.ctx, "vehicle", "horn:button", state).Result()
+	pipe := r.client.Pipeline()
+	pipe.HSet(r.ctx, "vehicle", "horn:button", state)
+	// Also publish an immediate event via pubsub for button press
+	pipe.Publish(r.ctx, "buttons", fmt.Sprintf("horn:%s", state))
+
+	_, err := pipe.Exec(r.ctx)
 	if err != nil {
 		r.logger.Printf("Failed to set horn button state: %v", err)
 		return err
@@ -539,7 +544,12 @@ func (r *RedisClient) SetSeatboxButton(isPressed bool) error {
 		state = "on"
 	}
 
-	_, err := r.client.HSet(r.ctx, "vehicle", "seatbox:button", state).Result()
+	pipe := r.client.Pipeline()
+	pipe.HSet(r.ctx, "vehicle", "seatbox:button", state)
+	// Also publish an immediate event via pubsub for button press
+	pipe.Publish(r.ctx, "buttons", fmt.Sprintf("seatbox:%s", state))
+
+	_, err := pipe.Exec(r.ctx)
 	if err != nil {
 		r.logger.Printf("Failed to set seatbox button state: %v", err)
 		return err
@@ -638,6 +648,17 @@ func (r *RedisClient) PublishUpdateStatus(status string) error {
 		return err
 	}
 	r.logger.Printf("Successfully published update status")
+	return nil
+}
+
+// PublishButtonEvent publishes a button event to the "buttons" channel
+func (r *RedisClient) PublishButtonEvent(event string) error {
+	r.logger.Printf("Publishing button event: %s", event)
+	if err := r.client.Publish(r.ctx, "buttons", event).Err(); err != nil {
+		r.logger.Printf("Failed to publish button event: %v", err)
+		return err
+	}
+	r.logger.Printf("Successfully published button event")
 	return nil
 }
 

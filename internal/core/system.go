@@ -364,6 +364,40 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 	v.logger.Printf("Input %s => %v", channel, value)
 
+	// Publish button event via PUBSUB for immediate response in UI
+	// This happens regardless of vehicle state, letting the UI decide what to do with it
+	var buttonEvent string
+	var shouldPublish bool = true
+
+	// Set state string based on value
+	state := "off"
+	if value {
+		state = "on"
+	}
+
+	switch channel {
+	case "horn_button":
+		buttonEvent = fmt.Sprintf("horn:%s", state)
+	case "seatbox_button":
+		buttonEvent = fmt.Sprintf("seatbox:%s", state)
+	case "brake_right":
+		buttonEvent = fmt.Sprintf("brake:right:%s", state)
+	case "brake_left":
+		buttonEvent = fmt.Sprintf("brake:left:%s", state)
+	// Blinker buttons are handled separately in handleBlinkerChange
+	case "blinker_right", "blinker_left":
+		shouldPublish = false // Skip for blinkers as they're handled in handleBlinkerChange
+	default:
+		shouldPublish = false
+	}
+
+	if shouldPublish {
+		if err := v.redis.PublishButtonEvent(buttonEvent); err != nil {
+			v.logger.Printf("Warning: Failed to publish button event: %v", err)
+			// Continue with normal processing even if PUBSUB fails
+		}
+	}
+
 	// First check if we should handle this input in current state
 	v.mu.RLock()
 	currentState := v.state
@@ -574,6 +608,20 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		if err := v.redis.SetBlinkerSwitch(switchState); err != nil {
 			return err
 		}
+
+		// Also publish the button event directly via PUBSUB for immediate handling
+		if channel == "blinker_right" {
+			if err := v.redis.PublishButtonEvent("blinker:right:off"); err != nil {
+				v.logger.Printf("Failed to publish blinker right button event: %v", err)
+				// Continue with normal processing even if PUBSUB fails
+			}
+		} else {
+			if err := v.redis.PublishButtonEvent("blinker:left:off"); err != nil {
+				v.logger.Printf("Failed to publish blinker left button event: %v", err)
+				// Continue with normal processing even if PUBSUB fails
+			}
+		}
+
 		return v.redis.SetBlinkerState(switchState)
 	}
 
@@ -582,10 +630,22 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		switchState = "right"
 		cue = 11 // LED_BLINK_RIGHT
 		v.blinkerState = BlinkerRight
+
+		// Publish button press event via PUBSUB for immediate handling
+		if err := v.redis.PublishButtonEvent("blinker:right:on"); err != nil {
+			v.logger.Printf("Failed to publish blinker right button event: %v", err)
+			// Continue with normal processing even if PUBSUB fails
+		}
 	} else {
 		switchState = "left"
 		cue = 10 // LED_BLINK_LEFT
 		v.blinkerState = BlinkerLeft
+
+		// Publish button press event via PUBSUB for immediate handling
+		if err := v.redis.PublishButtonEvent("blinker:left:on"); err != nil {
+			v.logger.Printf("Failed to publish blinker left button event: %v", err)
+			// Continue with normal processing even if PUBSUB fails
+		}
 	}
 
 	// Set switch state when button is pressed
