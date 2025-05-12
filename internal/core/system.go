@@ -48,7 +48,6 @@ type VehicleSystem struct {
 	forceStandbyNoLock bool
 	pendingPowerCmd    string            // Queued power command during updates
 	dbcUpdating        bool              // Track if DBC is currently updating
-	previousState      types.SystemState // Previous state before entering updating state
 }
 
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
@@ -336,8 +335,8 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 
 	// Only try to transition to READY_TO_DRIVE if dashboard is ready
 	if ready {
-		// Don't process kickstand state in STANDBY or UPDATING state
-		if currentState == types.StateStandby || currentState == types.StateUpdating {
+		// Don't process kickstand state in STANDBY state
+		if currentState == types.StateStandby {
 			v.logger.Printf("Skipping kickstand check in %s state", currentState)
 			return nil
 		}
@@ -403,8 +402,8 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 	currentState := v.state
 	v.mu.RUnlock()
 
-	// Handle inputs that should only work when not in standby / updating
-	if currentState == types.StateStandby || currentState == types.StateUpdating {
+	// Handle inputs that should only work when not in standby
+	if currentState == types.StateStandby {
 		switch channel {
 		case "horn_button", "seatbox_button", "brake_right", "brake_left",
 			"blinker_right", "blinker_left":
@@ -731,19 +730,11 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	if performForcedStandby {
 		// Check if we're in the middle of a DBC update
 		v.mu.RLock()
-		dbcUpdating := v.dbcUpdating
 		v.mu.RUnlock()
 
-		// If DBC is updating, transition to UPDATING state instead of STANDBY
-		if dbcUpdating {
-			v.logger.Printf("Transitioning to UPDATING (forced, no lock) due to DBC update.")
-			// The forceStandbyNoLock flag will be read and reset by transitionTo
-			return v.transitionTo(types.StateUpdating)
-		} else {
-			v.logger.Printf("Transitioning to STANDBY (forced, no lock).")
-			// The forceStandbyNoLock flag will be read and reset by transitionTo
-			return v.transitionTo(types.StateStandby)
-		}
+		v.logger.Printf("Transitioning to STANDBY (forced, no lock).")
+		// The forceStandbyNoLock flag will be read and reset by transitionTo
+		return v.transitionTo(types.StateStandby)
 	}
 	// --- End Force Standby Check ---
 
@@ -753,33 +744,6 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	v.mu.RUnlock()
 
 	v.logger.Printf("Current state during keycard auth (normal flow): %s", currentState)
-
-	// Special handling for keycard auth during updates
-	if currentState == types.StateUpdating {
-		v.mu.RLock()
-		dbcUpdating := v.dbcUpdating
-		v.mu.RUnlock()
-
-		if dbcUpdating {
-			// If DBC is updating, allow keycard events but don't turn off dashboard power
-			v.logger.Printf("Allowing keycard authentication during DBC update, but keeping dashboard power on")
-
-			// For updating state, handle like standby - transition to parked or ready-to-drive based on kickstand
-			v.logger.Printf("Reading kickstand state")
-			kickstandValue, err := v.io.ReadDigitalInput("kickstand")
-			if err != nil {
-				v.logger.Printf("Failed to read kickstand: %v", err)
-				return fmt.Errorf("failed to read kickstand: %w", err)
-			}
-
-			newState := types.StateReadyToDrive
-			if kickstandValue {
-				newState = types.StateParked
-			}
-			v.logger.Printf("Transitioning from UPDATING to %s (kickstand=%v)", newState, kickstandValue)
-			return v.transitionTo(newState)
-		}
-	}
 
 	if currentState == types.StateStandby {
 		v.logger.Printf("Reading kickstand state")
@@ -797,30 +761,23 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 		return v.transitionTo(newState)
 	}
 
-	// Check if we're in the middle of a DBC update
-	v.mu.RLock()
-	dbcUpdating := v.dbcUpdating
-	v.mu.RUnlock()
-
-	// Check kickstand before going to STANDBY or UPDATING
+	// Check kickstand before going to STANDBY
 	kickstandValue, err := v.io.ReadDigitalInput("kickstand")
 	if err != nil {
 		v.logger.Printf("Failed to read kickstand: %v", err)
 		return fmt.Errorf("failed to read kickstand: %w", err)
 	}
 	if !kickstandValue {
-		v.logger.Printf("Cannot transition to STANDBY/UPDATING: kickstand not down")
-		return fmt.Errorf("cannot transition to STANDBY/UPDATING: kickstand not down")
+		v.logger.Printf("Cannot transition to STANDBY: kickstand not down")
+		return fmt.Errorf("cannot transition to STANDBY: kickstand not down")
 	}
 
-	// If DBC is updating, transition back to UPDATING state instead of STANDBY
-	if dbcUpdating {
-		v.logger.Printf("DBC is updating, transitioning to UPDATING from %s", currentState)
-		return v.transitionTo(types.StateUpdating)
-	} else {
-		v.logger.Printf("Transitioning to STANDBY from %s", currentState)
-		return v.transitionTo(types.StateStandby)
+	v.logger.Printf("Transitioning to STANDBY from %s", currentState)
+	if err := v.transitionTo(types.StateStandby); err != nil {
+		return err
 	}
+
+	return nil
 }
 
 func (v *VehicleSystem) isReadyToDrive() bool {
@@ -839,11 +796,6 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	oldState := v.state
 	v.state = newState
-
-	// Save previous state when entering updating state
-	if newState == types.StateUpdating {
-		v.previousState = oldState
-	}
 
 	v.mu.Unlock()
 
@@ -865,18 +817,6 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	v.logger.Printf("Applying state transition effects for %s", newState)
 	switch newState {
-	case types.StateUpdating:
-		// When entering updating state, ensure dashboard is powered on
-		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-			v.logger.Printf("Failed to enable dashboard power: %v", err)
-			return err
-		}
-		v.logger.Printf("Dashboard power enabled for update")
-
-		// Clear any pending power commands when entering update state
-		v.mu.Lock()
-		v.pendingPowerCmd = ""
-		v.mu.Unlock()
 
 	case types.StateReadyToDrive:
 		// Check if handlebar needs to be unlocked
@@ -1169,13 +1109,13 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 func (v *VehicleSystem) handlePowerRequest(action string) error {
 	v.logger.Printf("Handling power request: %s", action)
 
-	// Check if we're in updating state
+	// Check if DBC is updating
 	v.mu.RLock()
-	currentState := v.state
+	dbcUpdating := v.dbcUpdating
 	v.mu.RUnlock()
 
-	if currentState == types.StateUpdating {
-		v.logger.Printf("System is in updating state, queueing power request: %s", action)
+	if dbcUpdating {
+		v.logger.Printf("DBC is updating, queueing power request: %s", action)
 		v.mu.Lock()
 		v.pendingPowerCmd = action
 		v.mu.Unlock()
@@ -1326,12 +1266,6 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 	currentState := v.state
 	v.mu.RUnlock()
 
-	// Don't allow state changes during updates
-	if currentState == types.StateUpdating {
-		v.logger.Printf("Ignoring state request during update: %s", state)
-		return nil
-	}
-
 	switch state {
 	case "unlock":
 		kickstandValue, err := v.io.ReadDigitalInput("kickstand")
@@ -1355,18 +1289,8 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 		}
 	case "lock":
 		if currentState == types.StateParked {
-			// Check if we're in the middle of a DBC update
-			v.mu.RLock()
-			dbcUpdating := v.dbcUpdating
-			v.mu.RUnlock()
-
-			// If DBC is updating, transition to UPDATING state instead of STANDBY
-			if dbcUpdating {
-				v.logger.Printf("DBC is updating, transitioning to UPDATING instead of STANDBY")
-				return v.transitionTo(types.StateUpdating)
-			} else {
-				return v.transitionTo(types.StateStandby)
-			}
+			v.logger.Printf("Transitioning to STANDBY")
+			return v.transitionTo(types.StateStandby)
 		} else {
 			return fmt.Errorf("vehicle must be parked to lock")
 		}
@@ -1377,16 +1301,9 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 			dbcUpdating := v.dbcUpdating
 			v.mu.RUnlock()
 
-			// If DBC is updating, transition to UPDATING state instead of STANDBY
-			if dbcUpdating {
-				v.logger.Printf("DBC is updating, transitioning to UPDATING instead of STANDBY for lock-hibernate")
-				if err := v.transitionTo(types.StateUpdating); err != nil {
-					return err
-				}
-			} else {
-				if err := v.transitionTo(types.StateStandby); err != nil {
-					return err
-				}
+			v.logger.Printf("Transitioning to STANDBY for lock-hibernate")
+			if err := v.transitionTo(types.StateStandby); err != nil {
+				return err
 			}
 
 			// Only schedule hibernation if DBC is not updating
@@ -1418,25 +1335,15 @@ func (v *VehicleSystem) handleLedFadeRequest(ledChannel int, fadeIndex int) erro
 }
 
 // handleForceLockRequest is called when a "force-lock" command is received via Redis.
-// It initiates a forced transition to standby or updating state, skipping the handlebar lock.
+// It initiates a forced transition to standby state, skipping the handlebar lock.
 func (v *VehicleSystem) handleForceLockRequest() error {
-	// Check if we're in the middle of a DBC update
-	v.mu.RLock()
-	dbcUpdating := v.dbcUpdating
-	v.mu.RUnlock()
-
 	v.mu.Lock()
 	v.forceStandbyNoLock = true
 	v.mu.Unlock()
 
-	// If DBC is updating, transition to UPDATING state instead of STANDBY
-	if dbcUpdating {
-		v.logger.Printf("Handling force-lock request: DBC is updating, transitioning to UPDATING (no lock).")
-		return v.transitionTo(types.StateUpdating)
-	} else {
-		v.logger.Printf("Handling force-lock request: transitioning to STANDBY (no lock).")
-		return v.transitionTo(types.StateStandby)
-	}
+	// Always transition to STANDBY, the dbcUpdating flag is checked in the transition function
+	v.logger.Printf("Handling force-lock request: transitioning to STANDBY (no lock).")
+	return v.transitionTo(types.StateStandby)
 }
 
 // handleUpdateRequest handles update requests from the update-service
@@ -1445,9 +1352,8 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 
 	switch action {
 	case "start":
-		// Transition to updating state
 		v.logger.Printf("Starting update process")
-		return v.transitionTo(types.StateUpdating)
+		return nil
 
 	case "start-dbc":
 		// Mark DBC as updating and ensure dashboard is powered on
@@ -1461,15 +1367,6 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
 			v.logger.Printf("Failed to enable dashboard power for DBC update: %v", err)
 			return err
-		}
-
-		// If we're not already in updating state, transition to it
-		v.mu.RLock()
-		currentState := v.state
-		v.mu.RUnlock()
-
-		if currentState != types.StateUpdating {
-			return v.transitionTo(types.StateUpdating)
 		}
 
 		return nil
@@ -1502,7 +1399,6 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.mu.RLock()
 		pendingCmd := v.pendingPowerCmd
 		dbcUpdating := v.dbcUpdating
-		previousState := v.previousState
 		v.mu.RUnlock()
 
 		v.logger.Printf("Update process complete, pending power command: %s, DBC updating: %v", pendingCmd, dbcUpdating)
@@ -1512,15 +1408,10 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.pendingPowerCmd = ""
 		v.mu.Unlock()
 
-		// If DBC is still updating, don't transition back to previous state yet
+		// If DBC is still updating, don't make any changes yet
 		if dbcUpdating {
-			v.logger.Printf("DBC is still updating, staying in updating state")
+			v.logger.Printf("DBC is still updating, maintaining current state")
 			return nil
-		}
-
-		// Transition back to previous state
-		if err := v.transitionTo(previousState); err != nil {
-			return err
 		}
 
 		// Execute any pending power command
