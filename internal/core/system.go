@@ -81,6 +81,7 @@ func (v *VehicleSystem) Start() error {
 		LedCueCallback:    v.handleLedCueRequest,
 		LedFadeCallback:   v.handleLedFadeRequest,
 		UpdateCallback:    v.handleUpdateRequest,
+		GovernorCallback:  v.handleGovernorRequest,
 	})
 
 	if err := v.redis.Connect(); err != nil {
@@ -802,7 +803,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 	// Set CPU governor when leaving standby
 	if oldState == types.StateStandby && newState != types.StateStandby {
 		v.logger.Printf("Leaving Standby: Setting CPU governor to ondemand")
-		if err := exec.Command("sh", "-c", "echo ondemand > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").Run(); err != nil {
+		if err := v.handleGovernorRequest("ondemand"); err != nil {
 			v.logger.Printf("Warning: Failed to set CPU governor to ondemand: %v", err)
 			// Not returning an error here as it's not critical for state transition
 		}
@@ -944,7 +945,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 		// Set CPU governor to powersave
 		v.logger.Printf("Entering Standby: Setting CPU governor to powersave")
-		if err := exec.Command("sh", "-c", "echo powersave > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").Run(); err != nil {
+		if err := v.handleGovernorRequest("powersave"); err != nil {
 			v.logger.Printf("Warning: Failed to set CPU governor to powersave: %v", err)
 			// Not returning an error here as it's not critical for state transition
 		}
@@ -1456,5 +1457,30 @@ func (v *VehicleSystem) EnableDashboardForUpdate() error {
 	}
 
 	v.logger.Printf("Dashboard power enabled for update")
+	return nil
+}
+
+// handleGovernorRequest processes CPU governor change requests
+func (v *VehicleSystem) handleGovernorRequest(governor string) error {
+	v.logger.Printf("Handling CPU governor request: %s", governor)
+
+	// Use the direct sysfs interface to change the CPU governor
+	governorPath := "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+	
+	// Execute the change using shell command for reliability
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("echo %s > %s", governor, governorPath))
+	if err := cmd.Run(); err != nil {
+		v.logger.Printf("Failed to set CPU governor to %s: %v", governor, err)
+		return fmt.Errorf("failed to set CPU governor to %s: %w", governor, err)
+	}
+	
+	v.logger.Printf("Successfully set CPU governor to %s", governor)
+	
+	// Publish the governor change to Redis for other systems to be aware
+	if err := v.redis.PublishGovernorChange(governor); err != nil {
+		v.logger.Printf("Warning: Failed to publish governor change to Redis: %v", err)
+		// Continue without error since the governor was changed successfully
+	}
+	
 	return nil
 }

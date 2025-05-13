@@ -24,6 +24,7 @@ type Callbacks struct {
 	LedCueCallback    func(int) error
 	LedFadeCallback   func(int, int) error
 	UpdateCallback    func(string) error // "start", "complete"
+	GovernorCallback  func(string) error // "ondemand", "powersave", "performance"
 }
 
 type RedisClient struct {
@@ -86,7 +87,7 @@ func (r *RedisClient) StartListening() error {
 	go r.redisListener(pubsub)
 
 	// Start list command listeners for LPUSH commands
-	r.wg.Add(8) // Added 1 for update commands
+	r.wg.Add(9)
 	go r.listCommandListener("scooter:seatbox", r.handleSeatboxCommand)
 	go r.listCommandListener("scooter:horn", r.handleHornCommand)
 	go r.listCommandListener("scooter:blinker", r.handleBlinkerCommand)
@@ -95,8 +96,7 @@ func (r *RedisClient) StartListening() error {
 	go r.listCommandListener("scooter:led:cue", r.handleLedCueCommand)
 	go r.listCommandListener("scooter:led:fade", r.handleLedFadeCommand)
 	go r.listCommandListener("scooter:update", r.handleUpdateCommand)
-
-	// Hash field monitor replaced with pub/sub trigger on "vehicle" channel (see redisListener)
+	go r.listCommandListener("scooter:governor", r.handleGovernorCommand)
 
 	return nil
 }
@@ -249,6 +249,23 @@ func (r *RedisClient) handleUpdateCommand(value string) error {
 	}
 }
 
+// handleGovernorCommand processes CPU governor change requests
+func (r *RedisClient) handleGovernorCommand(value string) error {
+	if r.callbacks.GovernorCallback == nil {
+		return nil
+	}
+
+	r.logger.Printf("Processing governor change request: %s", value)
+	
+	switch value {
+	case "ondemand", "powersave", "performance":
+		return r.callbacks.GovernorCallback(value)
+	default:
+		r.logger.Printf("Invalid governor command value: %s", value)
+		return fmt.Errorf("invalid governor command: %s", value)
+	}
+}
+
 func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 	defer r.wg.Done()
 	defer pubsub.Close()
@@ -344,6 +361,18 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 						r.logger.Printf("Invalid update request value: %s", msg.Payload)
 					}
 				}
+				
+			case "scooter:governor":
+				if r.callbacks.GovernorCallback != nil {
+					switch msg.Payload {
+					case "ondemand", "powersave", "performance":
+						if err := r.callbacks.GovernorCallback(msg.Payload); err != nil {
+							r.logger.Printf("Failed to handle governor request: %v", err)
+						}
+					default:
+						r.logger.Printf("Invalid governor request value: %s", msg.Payload)
+					}
+				}
 
 			case "vehicle":
 				// msg.Payload contains the hash field that changed
@@ -374,6 +403,8 @@ func (r *RedisClient) processVehicleMessage(payload string) {
 		handler = r.handlePowerCommand
 	case "scooter:update":
 		handler = r.handleUpdateCommand
+	case "scooter:governor":
+		handler = r.handleGovernorCommand
 	default:
 		// Ignore unknown payloads to keep behaviour predictable
 		r.logger.Printf("Unhandled vehicle payload: %s", payload)
@@ -659,6 +690,23 @@ func (r *RedisClient) PublishButtonEvent(event string) error {
 		return err
 	}
 	r.logger.Printf("Successfully published button event")
+	return nil
+}
+
+// PublishGovernorChange publishes a governor change event to Redis
+func (r *RedisClient) PublishGovernorChange(governor string) error {
+	r.logger.Printf("Publishing governor change: %s", governor)
+	pipe := r.client.Pipeline()
+	
+	pipe.HSet(r.ctx, "system", "cpu:governor", governor)
+	pipe.Publish(r.ctx, "system", "cpu:governor")
+	
+	_, err := pipe.Exec(r.ctx)
+	if err != nil {
+		r.logger.Printf("Failed to publish governor change: %v", err)
+		return err
+	}
+	r.logger.Printf("Successfully published governor change")
 	return nil
 }
 
