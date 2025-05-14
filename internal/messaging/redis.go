@@ -126,11 +126,17 @@ func (r *RedisClient) listCommandListener(key string, handler func(string) error
 				continue
 			}
 
-			if len(result) >= 2 { // BRPOP returns [key, value]
-				value := result[1]
-				r.logger.Printf("Received command from %s: %s", key, value)
-				if err := handler(value); err != nil {
-					r.logger.Printf("Error handling %s command: %v", key, err)
+			select {
+			case <-r.ctx.Done():
+				r.logger.Printf("Context cancelled, exiting %s listener", key)
+				return
+			default:
+				if len(result) >= 2 { // BRPOP returns [key, value]
+					value := result[1]
+					r.logger.Printf("Received command from %s: %s", key, value)
+					if err := handler(value); err != nil {
+						r.logger.Printf("Error handling %s command: %v", key, err)
+					}
 				}
 			}
 		}
@@ -256,7 +262,7 @@ func (r *RedisClient) handleGovernorCommand(value string) error {
 	}
 
 	r.logger.Printf("Processing governor change request: %s", value)
-	
+
 	switch value {
 	case "ondemand", "powersave", "performance":
 		return r.callbacks.GovernorCallback(value)
@@ -275,7 +281,14 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 
 	for {
 		select {
-		case msg := <-channel:
+		case <-r.ctx.Done():
+			r.logger.Printf("Context cancelled, exiting listener")
+			return
+		case msg, ok := <-channel:
+			if !ok {
+				r.logger.Printf("Channel closed, exiting listener")
+				return
+			}
 			if msg == nil {
 				r.logger.Printf("Received nil message, exiting listener")
 				return
@@ -361,7 +374,7 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 						r.logger.Printf("Invalid update request value: %s", msg.Payload)
 					}
 				}
-				
+
 			case "scooter:governor":
 				if r.callbacks.GovernorCallback != nil {
 					switch msg.Payload {
@@ -378,10 +391,6 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 				// msg.Payload contains the hash field that changed
 				r.processVehicleMessage(msg.Payload)
 			}
-
-		case <-r.ctx.Done():
-			r.logger.Printf("Context cancelled, exiting listener")
-			return
 		}
 	}
 }
@@ -697,10 +706,10 @@ func (r *RedisClient) PublishButtonEvent(event string) error {
 func (r *RedisClient) PublishGovernorChange(governor string) error {
 	r.logger.Printf("Publishing governor change: %s", governor)
 	pipe := r.client.Pipeline()
-	
+
 	pipe.HSet(r.ctx, "system", "cpu:governor", governor)
 	pipe.Publish(r.ctx, "system", "cpu:governor")
-	
+
 	_, err := pipe.Exec(r.ctx)
 	if err != nil {
 		r.logger.Printf("Failed to publish governor change: %v", err)
@@ -711,7 +720,22 @@ func (r *RedisClient) PublishGovernorChange(governor string) error {
 }
 
 func (r *RedisClient) Close() error {
+	r.logger.Printf("Closing Redis client")
 	r.cancel()
-	r.wg.Wait()
+
+	// Wait for all goroutines to finish with a timeout
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		r.logger.Printf("All Redis goroutines finished")
+	case <-time.After(5 * time.Second):
+		r.logger.Printf("Timeout waiting for Redis goroutines to finish")
+	}
+
 	return r.client.Close()
 }
