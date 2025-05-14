@@ -375,15 +375,19 @@ func (io *LinuxHardwareIO) PlayPwmFade(ch int, idx int) error {
 func (io *LinuxHardwareIO) Cleanup() {
 	close(io.stopChan)
 
+	// First close the input file descriptor to interrupt any blocked Read() calls
+	if io.inputFile != nil {
+		io.inputFile.Close()
+		io.logger.Printf("Closed input device file descriptor")
+	}
+
+	// Short delay to allow goroutine to process the error and exit
+	time.Sleep(100 * time.Millisecond)
+
 	io.mu.Lock()
 	defer io.mu.Unlock()
 
 	io.logger.Printf("Cleaning up hardware resources")
-
-	if io.inputFile != nil {
-		io.inputFile.Close()
-		io.logger.Printf("Closed input device")
-	}
 
 	for name, line := range io.lines {
 		line.Close()

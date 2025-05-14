@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"syscall"
 	"time"
 
 	"vehicle-service/internal/hardware"
@@ -47,8 +46,8 @@ type VehicleSystem struct {
 	keycardTapCount    int
 	lastKeycardTapTime time.Time
 	forceStandbyNoLock bool
-	pendingPowerCmd    string            // Queued power command during updates
-	dbcUpdating        bool              // Track if DBC is currently updating
+	pendingPowerCmd    string // Queued power command during updates
+	dbcUpdating        bool   // Track if DBC is currently updating
 }
 
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
@@ -1133,10 +1132,8 @@ func (v *VehicleSystem) handlePowerRequest(action string) error {
 		v.logger.Printf("Initiating system reboot")
 		// Perform cleanup before reboot
 		v.Shutdown()
-		// Use syscall.Reboot directly instead of systemctl
-		// This ensures the reboot happens even if the process is terminating
-		v.logger.Printf("Executing syscall.Reboot")
-		return syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART)
+		v.logger.Printf("Executing reboot")
+		return exec.Command("systemctl", "reboot").Run()
 	default:
 		return fmt.Errorf("invalid power action: %s", action)
 	}
@@ -1471,21 +1468,21 @@ func (v *VehicleSystem) handleGovernorRequest(governor string) error {
 
 	// Use the direct sysfs interface to change the CPU governor
 	governorPath := "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
-	
+
 	// Execute the change using shell command for reliability
 	cmd := exec.Command("sh", "-c", fmt.Sprintf("echo %s > %s", governor, governorPath))
 	if err := cmd.Run(); err != nil {
 		v.logger.Printf("Failed to set CPU governor to %s: %v", governor, err)
 		return fmt.Errorf("failed to set CPU governor to %s: %w", governor, err)
 	}
-	
+
 	v.logger.Printf("Successfully set CPU governor to %s", governor)
-	
+
 	// Publish the governor change to Redis for other systems to be aware
 	if err := v.redis.PublishGovernorChange(governor); err != nil {
 		v.logger.Printf("Warning: Failed to publish governor change to Redis: %v", err)
 		// Continue without error since the governor was changed successfully
 	}
-	
+
 	return nil
 }
