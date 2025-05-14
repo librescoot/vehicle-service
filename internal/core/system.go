@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 
 	"vehicle-service/internal/hardware"
@@ -1129,9 +1130,13 @@ func (v *VehicleSystem) handlePowerRequest(action string) error {
 		// Execute shutdown until we have a proper nRF communication
 		return exec.Command("systemctl", "poweroff").Run()
 	case "reboot":
+		v.logger.Printf("Initiating system reboot")
+		// Perform cleanup before reboot
 		v.Shutdown()
-		// Execute system reboot command
-		return exec.Command("systemctl", "reboot").Run()
+		// Use syscall.Reboot directly instead of systemctl
+		// This ensures the reboot happens even if the process is terminating
+		v.logger.Printf("Executing syscall.Reboot")
+		return syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART)
 	default:
 		return fmt.Errorf("invalid power action: %s", action)
 	}
