@@ -845,6 +845,23 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 		v.logger.Printf("Dashboard power enabled")
 
+		// Check current brake state and set engine brake pin accordingly
+		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+		if err != nil {
+			v.logger.Printf("Failed to read brake_left during transition: %v", err)
+			return err
+		}
+		brakeRight, err := v.io.ReadDigitalInput("brake_right")
+		if err != nil {
+			v.logger.Printf("Failed to read brake_right during transition: %v", err)
+			return err
+		}
+		if err := v.io.WriteDigitalOutput("engine_brake", brakeLeft || brakeRight); err != nil {
+			v.logger.Printf("Failed to set engine brake during transition: %v", err)
+			return err
+		}
+		v.logger.Printf("Engine brake set to %v during transition (left: %v, right: %v)", brakeLeft || brakeRight, brakeLeft, brakeRight)
+
 		if oldState == types.StateParked {
 			if err := v.io.PlayPwmCue(3); err != nil { // LED_PARKED_TO_DRIVE
 				v.logger.Printf("Failed to play LED cue: %v", err)
