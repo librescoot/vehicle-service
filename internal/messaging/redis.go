@@ -719,6 +719,17 @@ func (r *RedisClient) PublishGovernorChange(governor string) error {
 	return nil
 }
 
+// DeleteDashboardReadyFlag deletes the dashboard ready flag from Redis
+func (r *RedisClient) DeleteDashboardReadyFlag() error {
+	r.logger.Printf("Deleting dashboard ready flag from Redis")
+	if err := r.client.HDel(r.ctx, "dashboard", "ready").Err(); err != nil {
+		r.logger.Printf("Failed to delete dashboard ready flag: %v", err)
+		return err
+	}
+	r.logger.Printf("Successfully deleted dashboard ready flag")
+	return nil
+}
+
 func (r *RedisClient) Close() error {
 	r.logger.Printf("Closing Redis client")
 	r.cancel()

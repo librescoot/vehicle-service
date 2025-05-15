@@ -968,6 +968,15 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 		isFromParked := (oldState == types.StateParked)
+		isFromDrive := (oldState == types.StateReadyToDrive)
+
+		// Delete dashboard ready flag if coming from parked or drive states
+		if isFromParked || isFromDrive {
+			if err := v.redis.DeleteDashboardReadyFlag(); err != nil {
+				v.logger.Printf("Warning: Failed to delete dashboard ready flag: %v", err)
+				// Not returning an error here as it's not critical for state transition
+			}
+		}
 
 		if forcedStandby {
 			v.logger.Printf("Forced standby: skipping handlebar lock.")
