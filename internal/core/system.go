@@ -43,11 +43,13 @@ type VehicleSystem struct {
 	handlebarUnlocked  bool        // Track if handlebar has been unlocked in this power cycle
 	handlebarTimer     *time.Timer // Timer for handlebar position window
 	hibernationTimer   *time.Timer // Timer for brake-triggered hibernation
+	shutdownTimer      *time.Timer // Timer for shutting-down to standby transition
 	keycardTapCount    int
 	lastKeycardTapTime time.Time
 	forceStandbyNoLock bool
 	pendingPowerCmd    string // Queued power command during updates
 	dbcUpdating        bool   // Track if DBC is currently updating
+	hibernationRequest bool   // Track if hibernation was requested during shutdown
 }
 
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
@@ -307,6 +309,35 @@ func (v *VehicleSystem) triggerHibernation() {
 	// Reset the timer field after it has fired
 	v.mu.Lock()
 	v.hibernationTimer = nil
+	v.mu.Unlock()
+}
+
+// triggerShutdownTimeout handles the shutdown timer expiration and transitions to standby
+func (v *VehicleSystem) triggerShutdownTimeout() {
+	v.logger.Printf("Shutdown timer expired, transitioning to standby...")
+
+	v.mu.RLock()
+	hibernationRequested := v.hibernationRequest
+	v.mu.RUnlock()
+
+	// Transition to standby
+	if err := v.transitionTo(types.StateStandby); err != nil {
+		v.logger.Printf("Failed to transition to standby after shutdown timeout: %v", err)
+		return
+	}
+
+	// If hibernation was requested, execute it after the state transition
+	if hibernationRequested {
+		v.logger.Printf("Hibernation was requested, executing hibernation...")
+		if err := v.handlePowerRequest("hibernate-manual"); err != nil {
+			v.logger.Printf("Failed to execute hibernate after shutdown: %v", err)
+		}
+	}
+
+	// Reset the timer field after it has fired
+	v.mu.Lock()
+	v.shutdownTimer = nil
+	v.hibernationRequest = false
 	v.mu.Unlock()
 }
 
@@ -773,8 +804,8 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 		return fmt.Errorf("cannot transition to STANDBY: kickstand not down")
 	}
 
-	v.logger.Printf("Transitioning to STANDBY from %s", currentState)
-	if err := v.transitionTo(types.StateStandby); err != nil {
+	v.logger.Printf("Transitioning to SHUTTING_DOWN from %s", currentState)
+	if err := v.transitionTo(types.StateShuttingDown); err != nil {
 		return err
 	}
 
@@ -1030,6 +1061,26 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			v.logger.Printf("Failed to play LED cue ALL_OFF (0): %v", err)
 		}
 
+	case types.StateShuttingDown:
+		v.logger.Printf("Entering shutting down state")
+		
+		// Stop any existing shutdown timer
+		if v.shutdownTimer != nil {
+			v.shutdownTimer.Stop()
+			v.shutdownTimer = nil
+		}
+		
+		// Turn off all outputs
+		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
+			v.logger.Printf("Failed to disable engine power during shutdown: %v", err)
+		}
+		
+		// Keep dashboard power on briefly to allow for proper shutdown messaging
+		// The timer will handle transitioning to standby and turning off dashboard power
+		
+		v.shutdownTimer = time.AfterFunc(3500*time.Millisecond, v.triggerShutdownTimeout)
+		v.logger.Printf("Started shutdown timer (3.5s)")
+
 	}
 
 	v.logger.Printf("State transition completed successfully")
@@ -1066,7 +1117,20 @@ func (v *VehicleSystem) Shutdown() {
 		v.blinkerStopChan = nil
 	}
 
-	v.transitionTo(types.StateShuttingDown)
+	// Stop any running timers
+	if v.hibernationTimer != nil {
+		v.hibernationTimer.Stop()
+		v.hibernationTimer = nil
+	}
+	if v.handlebarTimer != nil {
+		v.handlebarTimer.Stop()
+		v.handlebarTimer = nil
+	}
+	if v.shutdownTimer != nil {
+		v.shutdownTimer.Stop()
+		v.shutdownTimer = nil
+	}
+
 	if v.redis != nil {
 		v.redis.Close()
 	}
@@ -1318,8 +1382,8 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 		}
 	case "lock":
 		if currentState == types.StateParked {
-			v.logger.Printf("Transitioning to STANDBY")
-			return v.transitionTo(types.StateStandby)
+			v.logger.Printf("Transitioning to SHUTTING_DOWN")
+			return v.transitionTo(types.StateShuttingDown)
 		} else {
 			return fmt.Errorf("vehicle must be parked to lock")
 		}
@@ -1330,8 +1394,11 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 			dbcUpdating := v.dbcUpdating
 			v.mu.RUnlock()
 
-			v.logger.Printf("Transitioning to STANDBY for lock-hibernate")
-			if err := v.transitionTo(types.StateStandby); err != nil {
+			v.logger.Printf("Transitioning to SHUTTING_DOWN for lock-hibernate")
+			v.mu.Lock()
+			v.hibernationRequest = true // Set hibernation request for lock-hibernate
+			v.mu.Unlock()
+			if err := v.transitionTo(types.StateShuttingDown); err != nil {
 				return err
 			}
 
