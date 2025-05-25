@@ -998,6 +998,13 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			// Not returning an error here as it's not critical for state transition
 		}
 
+		// Track standby entry time for MDB reboot timer (3-minute requirement)
+		v.logger.Printf("Setting standby timer start for MDB reboot coordination")
+		if err := v.redis.PublishStandbyTimerStart(); err != nil {
+			v.logger.Printf("Warning: Failed to set standby timer start: %v", err)
+			// Not critical for state transition
+		}
+
 		isFromParked := (oldState == types.StateParked)
 		isFromDrive := (oldState == types.StateReadyToDrive)
 

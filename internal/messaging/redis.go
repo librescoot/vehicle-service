@@ -730,6 +730,24 @@ func (r *RedisClient) DeleteDashboardReadyFlag() error {
 	return nil
 }
 
+// PublishStandbyTimerStart sets the standby timer start timestamp for MDB reboot coordination
+func (r *RedisClient) PublishStandbyTimerStart() error {
+	r.logger.Printf("Setting standby timer start timestamp")
+	timestamp := fmt.Sprintf("%d", time.Now().Unix())
+	
+	pipe := r.client.Pipeline()
+	pipe.HSet(r.ctx, "ota", "standby-timer-start", timestamp)
+	pipe.Publish(r.ctx, "ota", "standby-timer-start")
+	
+	_, err := pipe.Exec(r.ctx)
+	if err != nil {
+		r.logger.Printf("Failed to set standby timer start: %v", err)
+		return err
+	}
+	r.logger.Printf("Successfully set standby timer start: %s", timestamp)
+	return nil
+}
+
 func (r *RedisClient) Close() error {
 	r.logger.Printf("Closing Redis client")
 	r.cancel()
