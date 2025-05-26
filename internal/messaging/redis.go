@@ -748,6 +748,20 @@ func (r *RedisClient) PublishStandbyTimerStart() error {
 	return nil
 }
 
+// GetOtaStatus gets the OTA status for a specific component from Redis
+func (r *RedisClient) GetOtaStatus(component string) (string, error) {
+	statusKey := fmt.Sprintf("status:%s", component)
+	status, err := r.client.HGet(r.ctx, "ota", statusKey).Result()
+	if err == redis.Nil {
+		// Status field doesn't exist, return empty string (idle)
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to get OTA status for component %s: %w", component, err)
+	}
+	return status, nil
+}
+
 func (r *RedisClient) Close() error {
 	r.logger.Printf("Closing Redis client")
 	r.cancel()

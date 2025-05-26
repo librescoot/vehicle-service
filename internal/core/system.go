@@ -274,6 +274,9 @@ func (v *VehicleSystem) Start() error {
 		return fmt.Errorf("failed to start Redis listeners: %w", err)
 	}
 
+	// Start monitoring DBC update status from Redis
+	go v.monitorDbcUpdateStatus()
+
 	v.logger.Printf("System started successfully")
 	return nil
 }
@@ -1585,4 +1588,34 @@ func (v *VehicleSystem) handleGovernorRequest(governor string) error {
 	}
 
 	return nil
+}
+
+// monitorDbcUpdateStatus monitors the Redis ota.status:dbc field and updates dbcUpdating flag accordingly
+func (v *VehicleSystem) monitorDbcUpdateStatus() {
+	v.logger.Printf("Starting DBC update status monitoring")
+	
+	for {
+		time.Sleep(5 * time.Second) // Check every 5 seconds
+		
+		// Get the DBC status from Redis
+		status, err := v.redis.GetOtaStatus("dbc")
+		if err != nil {
+			// If we can't read status, assume not updating to be safe
+			v.mu.Lock()
+			v.dbcUpdating = false
+			v.mu.Unlock()
+			continue
+		}
+		
+		// Update dbcUpdating flag based on status
+		v.mu.Lock()
+		isUpdating := (status == "downloading" || status == "installing")
+		
+		// Only log changes to avoid spam
+		if v.dbcUpdating != isUpdating {
+			v.logger.Printf("DBC update status changed: %s (updating: %v)", status, isUpdating)
+			v.dbcUpdating = isUpdating
+		}
+		v.mu.Unlock()
+	}
 }
