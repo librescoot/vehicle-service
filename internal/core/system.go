@@ -50,6 +50,7 @@ type VehicleSystem struct {
 	pendingPowerCmd    string // Queued power command during updates
 	dbcUpdating        bool   // Track if DBC is currently updating
 	hibernationRequest bool   // Track if hibernation was requested during shutdown
+	shutdownFromParked bool   // Track if shutdown was initiated from parked state
 }
 
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
@@ -989,8 +990,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		v.mu.Lock()
 		forcedStandby := v.forceStandbyNoLock
 		dbcUpdating := v.dbcUpdating
+		shutdownFromParked := v.shutdownFromParked
 		if forcedStandby {
 			v.forceStandbyNoLock = false // Reset the flag
+		}
+		if shutdownFromParked {
+			v.shutdownFromParked = false // Reset the flag
 		}
 		v.mu.Unlock()
 
@@ -1021,8 +1026,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 		if forcedStandby {
 			v.logger.Printf("Forced standby: skipping handlebar lock.")
-		} else if isFromParked {
-			// Normal standby transition from Parked: lock handlebar
+		} else if isFromParked || shutdownFromParked {
+			// Normal standby transition from Parked (directly or through shutting-down): lock handlebar
+			v.logger.Printf("Locking handlebar (from parked: %v, shutdown from parked: %v)", isFromParked, shutdownFromParked)
 			v.lockHandlebar()
 		}
 		// If not forced and not from Parked (e.g. Init -> Standby), no specific handlebar lock action here.
@@ -1073,6 +1079,14 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	case types.StateShuttingDown:
 		v.logger.Printf("Entering shutting down state")
+		
+		// Track if we're coming from parked state
+		if oldState == types.StateParked {
+			v.mu.Lock()
+			v.shutdownFromParked = true
+			v.mu.Unlock()
+			v.logger.Printf("Shutdown initiated from parked state")
+		}
 		
 		// Stop any existing shutdown timer
 		if v.shutdownTimer != nil {
