@@ -1015,48 +1015,20 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 		isFromParked := (oldState == types.StateParked)
 		isFromDrive := (oldState == types.StateReadyToDrive)
+		isFromShuttingDown := (oldState == types.StateShuttingDown)
 
-		// Delete dashboard ready flag if coming from parked or drive states
-		if isFromParked || isFromDrive {
+		// Delete dashboard ready flag if coming from parked, drive, or shutting-down states
+		if isFromParked || isFromDrive || isFromShuttingDown {
 			if err := v.redis.DeleteDashboardReadyFlag(); err != nil {
 				v.logger.Printf("Warning: Failed to delete dashboard ready flag: %v", err)
 				// Not returning an error here as it's not critical for state transition
 			}
 		}
 
+		// Handlebar locking is now handled in shutting-down state entry
+		// Only handle forced standby case here
 		if forcedStandby {
 			v.logger.Printf("Forced standby: skipping handlebar lock.")
-		} else if isFromParked || shutdownFromParked {
-			// Normal standby transition from Parked (directly or through shutting-down): lock handlebar
-			v.logger.Printf("Locking handlebar (from parked: %v, shutdown from parked: %v)", isFromParked, shutdownFromParked)
-			v.lockHandlebar()
-		}
-		// If not forced and not from Parked (e.g. Init -> Standby), no specific handlebar lock action here.
-
-		// LED Cues specifically for Parked -> Standby transition.
-		// These are skipped if it's a forced standby that might originate from a different state.
-		if isFromParked {
-			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-			if err != nil {
-				v.logger.Printf("Failed to read brake_left for standby cue: %v", err)
-				// Continue without returning error, best effort for cues
-			}
-			brakeRight, err := v.io.ReadDigitalInput("brake_right")
-			if err != nil {
-				v.logger.Printf("Failed to read brake_right for standby cue: %v", err)
-				// Continue
-			}
-			brakesPressed := brakeLeft || brakeRight
-
-			if brakesPressed {
-				if err := v.io.PlayPwmCue(8); err != nil { // LED_PARKED_BRAKE_ON_TO_STANDBY
-					v.logger.Printf("Failed to play LED cue (8): %v", err)
-				}
-			} else {
-				if err := v.io.PlayPwmCue(7); err != nil { // LED_PARKED_BRAKE_OFF_TO_STANDBY
-					v.logger.Printf("Failed to play LED cue (7): %v", err)
-				}
-			}
 		}
 
 		// Common actions for ALL transitions to Standby (forced or not)
@@ -1081,7 +1053,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		v.logger.Printf("Entering shutting down state")
 		
 		// Track if we're coming from parked state
-		if oldState == types.StateParked {
+		isFromParked := (oldState == types.StateParked)
+		isFromDrive := (oldState == types.StateReadyToDrive)
+		if isFromParked {
 			v.mu.Lock()
 			v.shutdownFromParked = true
 			v.mu.Unlock()
@@ -1097,6 +1071,41 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		// Turn off all outputs
 		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
 			v.logger.Printf("Failed to disable engine power during shutdown: %v", err)
+		}
+		
+		// Lock handlebar (unless it's a forced standby)
+		v.mu.RLock()
+		forcedStandby := v.forceStandbyNoLock
+		v.mu.RUnlock()
+		
+		if !forcedStandby && (isFromParked || isFromDrive) {
+			v.logger.Printf("Locking handlebar during shutdown (from parked: %v, from drive: %v)", isFromParked, isFromDrive)
+			v.lockHandlebar()
+		}
+		
+		// Play LED cues for parked -> shutting-down transition
+		if isFromParked {
+			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+			if err != nil {
+				v.logger.Printf("Failed to read brake_left for shutdown cue: %v", err)
+				// Continue without returning error, best effort for cues
+			}
+			brakeRight, err := v.io.ReadDigitalInput("brake_right")
+			if err != nil {
+				v.logger.Printf("Failed to read brake_right for shutdown cue: %v", err)
+				// Continue
+			}
+			brakesPressed := brakeLeft || brakeRight
+		
+			if brakesPressed {
+				if err := v.io.PlayPwmCue(8); err != nil { // LED_PARKED_BRAKE_ON_TO_STANDBY
+					v.logger.Printf("Failed to play LED cue (8): %v", err)
+				}
+			} else {
+				if err := v.io.PlayPwmCue(7); err != nil { // LED_PARKED_BRAKE_OFF_TO_STANDBY
+					v.logger.Printf("Failed to play LED cue (7): %v", err)
+				}
+			}
 		}
 		
 		// Keep dashboard power on briefly to allow for proper shutdown messaging
