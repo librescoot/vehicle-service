@@ -764,10 +764,6 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	v.mu.Unlock()
 
 	if performForcedStandby {
-		// Check if we're in the middle of a DBC update
-		v.mu.RLock()
-		v.mu.RUnlock()
-
 		v.logger.Printf("Transitioning to STANDBY (forced, no lock).")
 		// The forceStandbyNoLock flag will be read and reset by transitionTo
 		return v.transitionTo(types.StateStandby)
@@ -1013,24 +1009,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			// Not critical for state transition
 		}
 
-		isFromParked := (oldState == types.StateParked)
-		isFromDrive := (oldState == types.StateReadyToDrive)
-		isFromShuttingDown := (oldState == types.StateShuttingDown)
-
-		// Delete dashboard ready flag if coming from parked, drive, or shutting-down states
-		if isFromParked || isFromDrive || isFromShuttingDown {
-			if err := v.redis.DeleteDashboardReadyFlag(); err != nil {
-				v.logger.Printf("Warning: Failed to delete dashboard ready flag: %v", err)
-				// Not returning an error here as it's not critical for state transition
-			}
+		// Delete dashboard ready flag when going into stand-by
+		if err := v.redis.DeleteDashboardReadyFlag(); err != nil {
+			v.logger.Printf("Warning: Failed to delete dashboard ready flag: %v", err)
+			// Not returning an error here as it's not critical for state transition
 		}
-
-		// Handlebar locking is now handled in shutting-down state entry
-		// Only handle forced standby case here
-		if forcedStandby {
-			v.logger.Printf("Forced standby: skipping handlebar lock.")
-		}
-
+	
 		// Common actions for ALL transitions to Standby (forced or not)
 		// Keep dashboard power on if DBC is updating, otherwise turn it off
 		if !dbcUpdating {
@@ -1077,7 +1061,10 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		v.mu.RLock()
 		forcedStandby := v.forceStandbyNoLock
 		v.mu.RUnlock()
-		
+
+		if forcedStandby {
+			v.logger.Printf("Forced standby: skipping handlebar lock.")
+		}
 		if !forcedStandby && (isFromParked || isFromDrive) {
 			v.logger.Printf("Locking handlebar during shutdown (from parked: %v, from drive: %v)", isFromParked, isFromDrive)
 			v.lockHandlebar()
@@ -1110,7 +1097,6 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		
 		// Keep dashboard power on briefly to allow for proper shutdown messaging
 		// The timer will handle transitioning to standby and turning off dashboard power
-		
 		v.shutdownTimer = time.AfterFunc(3500*time.Millisecond, v.triggerShutdownTimeout)
 		v.logger.Printf("Started shutdown timer (3.5s)")
 
