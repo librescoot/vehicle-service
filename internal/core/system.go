@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -80,6 +81,8 @@ func (v *VehicleSystem) Start() error {
 		LedCueCallback:    v.handleLedCueRequest,
 		LedFadeCallback:   v.handleLedFadeRequest,
 		UpdateCallback:    v.handleUpdateRequest,
+		HardwareCallback:  v.handleHardwareRequest,
+		GovernorCallback:  v.handleGovernorRequest,
 	})
 
 	if err := v.redis.Connect(); err != nil {
@@ -97,13 +100,9 @@ func (v *VehicleSystem) Start() error {
 		v.state = savedState
 		v.mu.Unlock()
 
-		// Send initial power commands based on saved state (via pm-service)
-		if savedState == types.StateReadyToDrive || savedState == types.StateParked {
-			v.redis.SendCommand("scooter:hardware", "dashboard:on")
-			if savedState == types.StateReadyToDrive {
-				v.redis.SendCommand("scooter:hardware", "engine:on")
-			}
-		}
+		// Set initial GPIO values based on saved state
+		v.io.SetInitialValue("dashboard_power", savedState == types.StateReadyToDrive || savedState == types.StateParked)
+		v.io.SetInitialValue("engine_power", savedState == types.StateReadyToDrive)
 	}
 
 	// Reload PWM LED kernel module, log outcomes for diagnostics
@@ -802,8 +801,8 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 	// Set CPU governor when leaving standby
 	if oldState == types.StateStandby && newState != types.StateStandby {
 		v.logger.Printf("Leaving Standby: Setting CPU governor to ondemand")
-		if err := v.redis.SendCommand("scooter:governor", "ondemand"); err != nil {
-			v.logger.Printf("Warning: Failed to send CPU governor command: %v", err)
+		if err := v.handleGovernorRequest("ondemand"); err != nil {
+			v.logger.Printf("Warning: Failed to set CPU governor to ondemand: %v", err)
 			// Not returning an error here as it's not critical for state transition
 		}
 	}
@@ -832,17 +831,17 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			}
 		}
 
-		if err := v.redis.SendCommand("scooter:hardware", "engine:on"); err != nil {
-			v.logger.Printf("Warning: Failed to send engine power command: %v", err)
-		} else {
-			v.logger.Printf("Sent engine power on command")
+		if err := v.io.WriteDigitalOutput("engine_power", true); err != nil {
+			v.logger.Printf("Failed to enable engine power: %v", err)
+			return err
 		}
+		v.logger.Printf("Engine power enabled")
 
-		if err := v.redis.SendCommand("scooter:hardware", "dashboard:on"); err != nil {
-			v.logger.Printf("Warning: Failed to send dashboard power command: %v", err)
-		} else {
-			v.logger.Printf("Sent dashboard power on command")
+		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
+			v.logger.Printf("Failed to enable dashboard power: %v", err)
+			return err
 		}
+		v.logger.Printf("Dashboard power enabled")
 
 		// Check current brake state and set engine brake pin accordingly
 		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
@@ -908,17 +907,17 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			}
 		}
 
-		if err := v.redis.SendCommand("scooter:hardware", "engine:off"); err != nil {
-			v.logger.Printf("Warning: Failed to send engine power off command: %v", err)
-		} else {
-			v.logger.Printf("Sent engine power off command")
+		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
+			v.logger.Printf("Failed to disable engine power: %v", err)
+			return err
 		}
+		v.logger.Printf("Engine power disabled")
 
-		if err := v.redis.SendCommand("scooter:hardware", "dashboard:on"); err != nil {
-			v.logger.Printf("Warning: Failed to send dashboard power command: %v", err)
-		} else {
-			v.logger.Printf("Sent dashboard power on command")
+		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
+			v.logger.Printf("Failed to enable dashboard power: %v", err)
+			return err
 		}
+		v.logger.Printf("Dashboard power enabled")
 
 		if oldState == types.StateReadyToDrive {
 			if err := v.io.PlayPwmCue(6); err != nil { // LED_DRIVE_TO_PARKED
@@ -964,8 +963,8 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 		// Set CPU governor to powersave
 		v.logger.Printf("Entering Standby: Setting CPU governor to powersave")
-		if err := v.redis.SendCommand("scooter:governor", "powersave"); err != nil {
-			v.logger.Printf("Warning: Failed to send CPU governor command: %v", err)
+		if err := v.handleGovernorRequest("powersave"); err != nil {
+			v.logger.Printf("Warning: Failed to set CPU governor to powersave: %v", err)
 			// Not returning an error here as it's not critical for state transition
 		}
 
@@ -1023,12 +1022,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 		// Always turn off dashboard power when entering standby
-		// PM-service will handle coordination via inhibitors during updates
-		if err := v.redis.SendCommand("scooter:hardware", "dashboard:off"); err != nil {
-			v.logger.Printf("Warning: Failed to send dashboard power off command: %v", err)
-		} else {
-			v.logger.Printf("Sent dashboard power off command")
+		if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
+			v.logger.Printf("Failed to disable dashboard power: %v", err)
+			// Consider if this error should halt the transition or just be logged.
+			// For now, logging and continuing to ensure other shutdown steps occur.
 		}
+		v.logger.Printf("Dashboard power disabled")
 
 		// Final "all off" cue for standby.
 		if err := v.io.PlayPwmCue(0); err != nil { // ALL_OFF
@@ -1053,8 +1052,8 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 		
 		// Turn off all outputs
-		if err := v.redis.SendCommand("scooter:hardware", "engine:off"); err != nil {
-			v.logger.Printf("Warning: Failed to send engine power off command during shutdown: %v", err)
+		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
+			v.logger.Printf("Failed to disable engine power during shutdown: %v", err)
 		}
 		
 		// Keep dashboard power on briefly to allow for proper shutdown messaging
@@ -1389,9 +1388,10 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 
 	case "start-dbc":
 		v.logger.Printf("Starting DBC update process")
-		// PM-service will handle power coordination via inhibitors
-		if err := v.redis.SendCommand("scooter:hardware", "dashboard:on"); err != nil {
-			v.logger.Printf("Warning: Failed to send dashboard power command for DBC update: %v", err)
+		// Ensure dashboard is powered on
+		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
+			v.logger.Printf("Failed to enable dashboard power for DBC update: %v", err)
+			return err
 		}
 		return nil
 
@@ -1406,19 +1406,21 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		return nil
 
 	case "cycle-dashboard-power":
-		// Cycle dashboard power to reboot the DBC (via pm-service)
+		// Cycle dashboard power to reboot the DBC
 		v.logger.Printf("Cycling dashboard power to reboot DBC")
 
 		// Turn off dashboard power
-		if err := v.redis.SendCommand("scooter:hardware", "dashboard:off"); err != nil {
-			v.logger.Printf("Warning: Failed to send dashboard power off command: %v", err)
+		if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
+			v.logger.Printf("Failed to disable dashboard power: %v", err)
+			return err
 		}
 		time.Sleep(1 * time.Second)
 		// Turn dashboard power back on
-		if err := v.redis.SendCommand("scooter:hardware", "dashboard:on"); err != nil {
-			v.logger.Printf("Warning: Failed to send dashboard power on command: %v", err)
+		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
+			v.logger.Printf("Failed to re-enable dashboard power: %v", err)
+			return err
 		}
-		v.logger.Printf("Dashboard power cycle commands sent")
+		v.logger.Printf("Dashboard power cycled successfully")
 		return nil
 
 	default:
@@ -1430,12 +1432,92 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 func (v *VehicleSystem) EnableDashboardForUpdate() error {
 	v.logger.Printf("Enabling dashboard for update")
 
-	// Send dashboard power command via pm-service
-	if err := v.redis.SendCommand("scooter:hardware", "dashboard:on"); err != nil {
-		v.logger.Printf("Warning: Failed to send dashboard power command: %v", err)
+	// Turn on dashboard power
+	if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
+		v.logger.Printf("Failed to enable dashboard power: %v", err)
+		return err
 	}
 
 	v.logger.Printf("Dashboard power enabled for update")
+	return nil
+}
+
+// handleHardwareRequest processes hardware power control commands
+func (v *VehicleSystem) handleHardwareRequest(command string) error {
+	v.logger.Printf("Handling hardware request: %s", command)
+
+	parts := strings.Split(command, ":")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid hardware command format: %s", command)
+	}
+
+	component := parts[0]
+	action := parts[1]
+
+	switch component {
+	case "dashboard":
+		switch action {
+		case "on":
+			if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
+				v.logger.Printf("Failed to enable dashboard power: %v", err)
+				return err
+			}
+			v.logger.Printf("Dashboard power enabled")
+		case "off":
+			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
+				v.logger.Printf("Failed to disable dashboard power: %v", err)
+				return err
+			}
+			v.logger.Printf("Dashboard power disabled")
+		default:
+			return fmt.Errorf("invalid dashboard action: %s", action)
+		}
+	case "engine":
+		switch action {
+		case "on":
+			if err := v.io.WriteDigitalOutput("engine_power", true); err != nil {
+				v.logger.Printf("Failed to enable engine power: %v", err)
+				return err
+			}
+			v.logger.Printf("Engine power enabled")
+		case "off":
+			if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
+				v.logger.Printf("Failed to disable engine power: %v", err)
+				return err
+			}
+			v.logger.Printf("Engine power disabled")
+		default:
+			return fmt.Errorf("invalid engine action: %s", action)
+		}
+	default:
+		return fmt.Errorf("invalid hardware component: %s", component)
+	}
+
+	return nil
+}
+
+// handleGovernorRequest processes CPU governor change requests
+func (v *VehicleSystem) handleGovernorRequest(governor string) error {
+	v.logger.Printf("Handling CPU governor request: %s", governor)
+
+	// Use the direct sysfs interface to change the CPU governor
+	governorPath := "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+
+	// Execute the change using shell command for reliability
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("echo %s > %s", governor, governorPath))
+	if err := cmd.Run(); err != nil {
+		v.logger.Printf("Failed to set CPU governor to %s: %v", governor, err)
+		return fmt.Errorf("failed to set CPU governor to %s: %w", governor, err)
+	}
+
+	v.logger.Printf("Successfully set CPU governor to %s", governor)
+
+	// Publish the governor change to Redis for other systems to be aware
+	if err := v.redis.PublishGovernorChange(governor); err != nil {
+		v.logger.Printf("Warning: Failed to publish governor change to Redis: %v", err)
+		// Continue without error since the governor was changed successfully
+	}
+
 	return nil
 }
 

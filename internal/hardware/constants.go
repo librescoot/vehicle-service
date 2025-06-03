@@ -20,4 +20,6 @@ var DoMappings = map[string]struct {
 	"engine_brake":         {2, 11},
 	"handlebar_lock_close": {4, 6},
 	"handlebar_lock_open":  {4, 7},
+	"dashboard_power":      {1, 18},
+	"engine_power":         {2, 17},
 }
