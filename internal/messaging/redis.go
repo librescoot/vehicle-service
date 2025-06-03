@@ -18,12 +18,12 @@ type Callbacks struct {
 	SeatboxCallback   func(bool) error   // true for "on", false for "off"
 	HornCallback      func(bool) error   // true for "on", false for "off"
 	BlinkerCallback   func(string) error // "off", "left", "right", "both"
-	PowerCallback     func(string) error // "hibernate-manual", "reboot"
 	StateCallback     func(string) error // "unlock", "lock", "lock-hibernate"
 	ForceLockCallback func() error       // New callback for force-lock
 	LedCueCallback    func(int) error
 	LedFadeCallback   func(int, int) error
 	UpdateCallback    func(string) error // "start", "complete"
+	HardwareCallback  func(string) error // "dashboard:on", "dashboard:off", "engine:on", "engine:off"
 	GovernorCallback  func(string) error // "ondemand", "powersave", "performance"
 }
 
@@ -91,11 +91,11 @@ func (r *RedisClient) StartListening() error {
 	go r.listCommandListener("scooter:seatbox", r.handleSeatboxCommand)
 	go r.listCommandListener("scooter:horn", r.handleHornCommand)
 	go r.listCommandListener("scooter:blinker", r.handleBlinkerCommand)
-	go r.listCommandListener("scooter:power", r.handlePowerCommand)
 	go r.listCommandListener("scooter:state", r.handleStateCommand)
 	go r.listCommandListener("scooter:led:cue", r.handleLedCueCommand)
 	go r.listCommandListener("scooter:led:fade", r.handleLedFadeCommand)
 	go r.listCommandListener("scooter:update", r.handleUpdateCommand)
+	go r.listCommandListener("scooter:hardware", r.handleHardwareCommand)
 	go r.listCommandListener("scooter:governor", r.handleGovernorCommand)
 
 	return nil
@@ -182,18 +182,6 @@ func (r *RedisClient) handleBlinkerCommand(value string) error {
 	}
 }
 
-func (r *RedisClient) handlePowerCommand(value string) error {
-	if r.callbacks.PowerCallback == nil {
-		return nil
-	}
-	switch value {
-	case "hibernate-manual", "reboot":
-		return r.callbacks.PowerCallback(value)
-	default:
-		r.logger.Printf("Invalid power command value: %s", value)
-		return fmt.Errorf("invalid power command: %s", value)
-	}
-}
 
 func (r *RedisClient) handleStateCommand(value string) error {
 	if r.callbacks.StateCallback == nil && r.callbacks.ForceLockCallback == nil {
@@ -252,6 +240,24 @@ func (r *RedisClient) handleUpdateCommand(value string) error {
 	default:
 		r.logger.Printf("Invalid update command value: %s", value)
 		return fmt.Errorf("invalid update command: %s", value)
+	}
+}
+
+// handleHardwareCommand processes hardware power control commands
+func (r *RedisClient) handleHardwareCommand(value string) error {
+	if r.callbacks.HardwareCallback == nil {
+		return nil
+	}
+
+	r.logger.Printf("Processing hardware command: %s", value)
+	
+	// Validate command format (component:action)
+	switch value {
+	case "dashboard:on", "dashboard:off", "engine:on", "engine:off":
+		return r.callbacks.HardwareCallback(value)
+	default:
+		r.logger.Printf("Invalid hardware command value: %s", value)
+		return fmt.Errorf("invalid hardware command: %s", value)
 	}
 }
 
@@ -351,17 +357,6 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 					}
 				}
 
-			case "scooter:power":
-				if r.callbacks.PowerCallback != nil {
-					switch msg.Payload {
-					case "hibernate-manual", "reboot":
-						if err := r.callbacks.PowerCallback(msg.Payload); err != nil {
-							r.logger.Printf("Failed to handle power request: %v", err)
-						}
-					default:
-						r.logger.Printf("Invalid power request value: %s", msg.Payload)
-					}
-				}
 
 			case "scooter:update":
 				if r.callbacks.UpdateCallback != nil {
@@ -375,17 +370,6 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 					}
 				}
 
-			case "scooter:governor":
-				if r.callbacks.GovernorCallback != nil {
-					switch msg.Payload {
-					case "ondemand", "powersave", "performance":
-						if err := r.callbacks.GovernorCallback(msg.Payload); err != nil {
-							r.logger.Printf("Failed to handle governor request: %v", err)
-						}
-					default:
-						r.logger.Printf("Invalid governor request value: %s", msg.Payload)
-					}
-				}
 
 			case "vehicle":
 				// msg.Payload contains the hash field that changed
@@ -408,12 +392,8 @@ func (r *RedisClient) processVehicleMessage(payload string) {
 		handler = r.handleHornCommand
 	case "scooter:blinker":
 		handler = r.handleBlinkerCommand
-	case "scooter:power":
-		handler = r.handlePowerCommand
 	case "scooter:update":
 		handler = r.handleUpdateCommand
-	case "scooter:governor":
-		handler = r.handleGovernorCommand
 	default:
 		// Ignore unknown payloads to keep behaviour predictable
 		r.logger.Printf("Unhandled vehicle payload: %s", payload)
@@ -760,6 +740,17 @@ func (r *RedisClient) GetOtaStatus(component string) (string, error) {
 		return "", fmt.Errorf("failed to get OTA status for component %s: %w", component, err)
 	}
 	return status, nil
+}
+
+// SendCommand sends a command to a Redis list (for communication with other services)
+func (r *RedisClient) SendCommand(channel, command string) error {
+	err := r.client.LPush(r.ctx, channel, command).Err()
+	if err != nil {
+		r.logger.Printf("Failed to send command '%s' to channel '%s': %v", command, channel, err)
+		return err
+	}
+	r.logger.Printf("Sent command '%s' to channel '%s'", command, channel)
+	return nil
 }
 
 func (r *RedisClient) Close() error {
