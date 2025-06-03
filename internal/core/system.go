@@ -42,7 +42,6 @@ type VehicleSystem struct {
 	initialized        bool
 	handlebarUnlocked  bool        // Track if handlebar has been unlocked in this power cycle
 	handlebarTimer     *time.Timer // Timer for handlebar position window
-	hibernationTimer   *time.Timer // Timer for brake-triggered hibernation
 	shutdownTimer      *time.Timer // Timer for shutting-down to standby transition
 	keycardTapCount    int
 	lastKeycardTapTime time.Time
@@ -275,38 +274,35 @@ func (v *VehicleSystem) Start() error {
 	return nil
 }
 
-// triggerHibernation checks conditions and initiates hibernation if met.
-func (v *VehicleSystem) triggerHibernation() {
-	v.logger.Printf("Hibernation timer expired, checking conditions...")
-
-	brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-	if err != nil {
-		v.logger.Printf("Failed to read brake_left for hibernation trigger: %v", err)
-		return
-	}
-	brakeRight, err := v.io.ReadDigitalInput("brake_right")
-	if err != nil {
-		v.logger.Printf("Failed to read brake_right for hibernation trigger: %v", err)
-		return
-	}
-
+// checkHibernationConditions checks if hibernation should be triggered and sends command to pm-service
+func (v *VehicleSystem) checkHibernationConditions() {
 	v.mu.RLock()
 	currentState := v.state
 	v.mu.RUnlock()
 
-	if brakeLeft && brakeRight && currentState == types.StateParked {
-		v.logger.Printf("Conditions met, initiating hibernation.")
+	// Only check hibernation conditions in parked state
+	if currentState != types.StateParked {
+		return
+	}
+
+	brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+	if err != nil {
+		v.logger.Printf("Failed to read brake_left for hibernation check: %v", err)
+		return
+	}
+	brakeRight, err := v.io.ReadDigitalInput("brake_right")
+	if err != nil {
+		v.logger.Printf("Failed to read brake_right for hibernation check: %v", err)
+		return
+	}
+
+	// If both brakes are pressed in parked state, send hibernation command to pm-service
+	if brakeLeft && brakeRight {
+		v.logger.Printf("Both brakes pressed in PARKED state, sending hibernation command to pm-service")
 		if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
 			v.logger.Printf("Failed to send hibernate command: %v", err)
 		}
-	} else {
-		v.logger.Printf("Conditions not met for hibernation.")
 	}
-
-	// Reset the timer field after it has fired
-	v.mu.Lock()
-	v.hibernationTimer = nil
-	v.mu.Unlock()
 }
 
 // triggerShutdownTimeout handles the shutdown timer expiration and transitions to standby
@@ -563,34 +559,9 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			return fmt.Errorf("failed to set brake state in Redis: %w", err)
 		}
 
-		// Check for hibernation trigger condition
-		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-		if err != nil {
-			v.logger.Printf("Failed to read brake_left for hibernation check: %v", err)
-			// Continue without triggering hibernation
-		}
-		brakeRight, err := v.io.ReadDigitalInput("brake_right")
-		if err != nil {
-			v.logger.Printf("Failed to read brake_right for hibernation check: %v", err)
-			// Continue without triggering hibernation
-		}
-
-		v.mu.RLock()
-		currentState := v.state
-		v.mu.RUnlock()
-
-		if brakeLeft && brakeRight && currentState == types.StateParked {
-			if v.hibernationTimer == nil {
-				v.logger.Printf("Both brakes pressed in PARKED state, starting hibernation timer")
-				v.hibernationTimer = time.AfterFunc(10*time.Second, v.triggerHibernation)
-			}
-		} else {
-			if v.hibernationTimer != nil {
-				v.logger.Printf("Hibernation conditions not met, stopping timer")
-				v.hibernationTimer.Stop()
-				v.hibernationTimer = nil
-			}
-		}
+		// Check for immediate hibernation trigger (both brakes pressed in parked state)
+		// pm-service will handle the hibernation timer, vehicle-service just detects the condition
+		v.checkHibernationConditions()
 
 		return nil // Return nil as the brake state was set in Redis
 
@@ -1129,10 +1100,6 @@ func (v *VehicleSystem) Shutdown() {
 	}
 
 	// Stop any running timers
-	if v.hibernationTimer != nil {
-		v.hibernationTimer.Stop()
-		v.hibernationTimer = nil
-	}
 	if v.handlebarTimer != nil {
 		v.handlebarTimer.Stop()
 		v.handlebarTimer = nil
@@ -1377,13 +1344,9 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 				return err
 			}
 
-			// Schedule hibernation (pm-service will handle coordination via inhibitors)
-			go func() {
-				time.Sleep(30 * time.Second)
-				if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-					v.logger.Printf("Failed to send hibernate command: %v", err)
-				}
-			}()
+			if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
+				v.logger.Printf("Failed to send hibernate command: %v", err)
+			}
 			return nil
 		} else {
 			return fmt.Errorf("vehicle must be parked to lock")
