@@ -1396,9 +1396,11 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		return nil
 
 	case "complete-dbc":
-		v.logger.Printf("DBC update process complete")
-
-		// PM-service will handle dashboard power via inhibitor coordination
+		v.logger.Printf("DBC update process complete, turning off dashboard power")
+		if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
+			v.logger.Printf("Failed to disable dashboard power for DBC reboot: %v", err)
+			return err
+		}
 		return nil
 
 	case "complete":
