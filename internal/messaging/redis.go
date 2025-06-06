@@ -182,7 +182,6 @@ func (r *RedisClient) handleBlinkerCommand(value string) error {
 	}
 }
 
-
 func (r *RedisClient) handleStateCommand(value string) error {
 	if r.callbacks.StateCallback == nil && r.callbacks.ForceLockCallback == nil {
 		return nil
@@ -250,7 +249,7 @@ func (r *RedisClient) handleHardwareCommand(value string) error {
 	}
 
 	r.logger.Printf("Processing hardware command: %s", value)
-	
+
 	// Validate command format (component:action)
 	switch value {
 	case "dashboard:on", "dashboard:off", "engine:on", "engine:off":
@@ -357,7 +356,6 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 					}
 				}
 
-
 			case "scooter:update":
 				if r.callbacks.UpdateCallback != nil {
 					switch msg.Payload {
@@ -369,7 +367,6 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 						r.logger.Printf("Invalid update request value: %s", msg.Payload)
 					}
 				}
-
 
 			case "vehicle":
 				// msg.Payload contains the hash field that changed
@@ -714,11 +711,11 @@ func (r *RedisClient) DeleteDashboardReadyFlag() error {
 func (r *RedisClient) PublishStandbyTimerStart() error {
 	r.logger.Printf("Setting standby timer start timestamp")
 	timestamp := fmt.Sprintf("%d", time.Now().Unix())
-	
+
 	pipe := r.client.Pipeline()
 	pipe.HSet(r.ctx, "ota", "standby-timer-start", timestamp)
 	pipe.Publish(r.ctx, "ota", "standby-timer-start")
-	
+
 	_, err := pipe.Exec(r.ctx)
 	if err != nil {
 		r.logger.Printf("Failed to set standby timer start: %v", err)

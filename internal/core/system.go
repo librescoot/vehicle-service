@@ -30,25 +30,27 @@ const (
 )
 
 type VehicleSystem struct {
-	state              types.SystemState
-	dashboardReady     bool
-	logger             *log.Logger
-	io                 *hardware.LinuxHardwareIO
-	redis              *messaging.RedisClient
-	mu                 sync.RWMutex
-	redisHost          string
-	redisPort          int
-	blinkerState       BlinkerState
-	blinkerStopChan    chan struct{}
-	initialized        bool
-	handlebarUnlocked  bool        // Track if handlebar has been unlocked in this power cycle
-	handlebarTimer     *time.Timer // Timer for handlebar position window
-	shutdownTimer      *time.Timer // Timer for shutting-down to standby transition
-	keycardTapCount    int
-	lastKeycardTapTime time.Time
-	forceStandbyNoLock bool
-	hibernationRequest bool   // Track if hibernation was requested during shutdown
-	shutdownFromParked bool   // Track if shutdown was initiated from parked state
+	state                  types.SystemState
+	dashboardReady         bool
+	logger                 *log.Logger
+	io                     *hardware.LinuxHardwareIO
+	redis                  *messaging.RedisClient
+	mu                     sync.RWMutex
+	redisHost              string
+	redisPort              int
+	blinkerState           BlinkerState
+	blinkerStopChan        chan struct{}
+	initialized            bool
+	handlebarUnlocked      bool        // Track if handlebar has been unlocked in this power cycle
+	handlebarTimer         *time.Timer // Timer for handlebar position window
+	shutdownTimer          *time.Timer // Timer for shutting-down to standby transition
+	keycardTapCount        int
+	lastKeycardTapTime     time.Time
+	forceStandbyNoLock     bool
+	hibernationRequest     bool  // Track if hibernation was requested during shutdown
+	shutdownFromParked     bool  // Track if shutdown was initiated from parked state
+	dbcUpdating            bool  // Track if DBC update is in progress
+	deferredDashboardPower *bool // Deferred dashboard power state (nil = no change needed)
 }
 
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
@@ -1021,13 +1023,23 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			}
 		}
 
-		// Always turn off dashboard power when entering standby
-		if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-			v.logger.Printf("Failed to disable dashboard power: %v", err)
-			// Consider if this error should halt the transition or just be logged.
-			// For now, logging and continuing to ensure other shutdown steps occur.
+		// Turn off dashboard power when entering standby, unless DBC update is in progress
+		v.mu.Lock()
+		if v.dbcUpdating {
+			v.logger.Printf("DBC update in progress, deferring dashboard power OFF until update completes")
+			powerOff := false
+			v.deferredDashboardPower = &powerOff
+			v.mu.Unlock()
+		} else {
+			v.mu.Unlock()
+			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
+				v.logger.Printf("Failed to disable dashboard power: %v", err)
+				// Consider if this error should halt the transition or just be logged.
+				// For now, logging and continuing to ensure other shutdown steps occur.
+			} else {
+				v.logger.Printf("Dashboard power disabled")
+			}
 		}
-		v.logger.Printf("Dashboard power disabled")
 
 		// Final "all off" cue for standby.
 		if err := v.io.PlayPwmCue(0); err != nil { // ALL_OFF
@@ -1036,7 +1048,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	case types.StateShuttingDown:
 		v.logger.Printf("Entering shutting down state")
-		
+
 		// Track if we're coming from parked state
 		if oldState == types.StateParked {
 			v.mu.Lock()
@@ -1044,21 +1056,21 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			v.mu.Unlock()
 			v.logger.Printf("Shutdown initiated from parked state")
 		}
-		
+
 		// Stop any existing shutdown timer
 		if v.shutdownTimer != nil {
 			v.shutdownTimer.Stop()
 			v.shutdownTimer = nil
 		}
-		
+
 		// Turn off all outputs
 		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
 			v.logger.Printf("Failed to disable engine power during shutdown: %v", err)
 		}
-		
+
 		// Keep dashboard power on briefly to allow for proper shutdown messaging
 		// The timer will handle transitioning to standby and turning off dashboard power
-		
+
 		v.shutdownTimer = time.AfterFunc(3500*time.Millisecond, v.triggerShutdownTimeout)
 		v.logger.Printf("Started shutdown timer (3.5s)")
 
@@ -1173,7 +1185,6 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 
 	return v.redis.SetBlinkerState(state)
 }
-
 
 func (v *VehicleSystem) lockHandlebar() {
 	// Run the lock operation in a goroutine
@@ -1388,6 +1399,9 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 
 	case "start-dbc":
 		v.logger.Printf("Starting DBC update process")
+		v.mu.Lock()
+		v.dbcUpdating = true
+		v.mu.Unlock()
 		// Ensure dashboard is powered on
 		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
 			v.logger.Printf("Failed to enable dashboard power for DBC update: %v", err)
@@ -1396,10 +1410,28 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		return nil
 
 	case "complete-dbc":
-		v.logger.Printf("DBC update process complete, turning off dashboard power")
-		if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-			v.logger.Printf("Failed to disable dashboard power for DBC reboot: %v", err)
-			return err
+		v.logger.Printf("DBC update process complete")
+		v.mu.Lock()
+		v.dbcUpdating = false
+		deferredPower := v.deferredDashboardPower
+		v.deferredDashboardPower = nil
+		v.mu.Unlock()
+
+		// Apply any deferred dashboard power state
+		if deferredPower != nil {
+			if *deferredPower {
+				v.logger.Printf("Applying deferred dashboard power: ON")
+				if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
+					v.logger.Printf("Failed to enable deferred dashboard power: %v", err)
+					return err
+				}
+			} else {
+				v.logger.Printf("Applying deferred dashboard power: OFF")
+				if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
+					v.logger.Printf("Failed to disable deferred dashboard power: %v", err)
+					return err
+				}
+			}
 		}
 		return nil
 
@@ -1522,5 +1554,3 @@ func (v *VehicleSystem) handleGovernorRequest(governor string) error {
 
 	return nil
 }
-
-
