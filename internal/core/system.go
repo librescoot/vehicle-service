@@ -800,12 +800,11 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	v.mu.Unlock()
 
-	// Set CPU governor when leaving standby
+	// Request CPU governor change when leaving standby
 	if oldState == types.StateStandby && newState != types.StateStandby {
-		v.logger.Printf("Leaving Standby: Setting CPU governor to ondemand")
-		if err := v.handleGovernorRequest("ondemand"); err != nil {
-			v.logger.Printf("Warning: Failed to set CPU governor to ondemand: %v", err)
-			// Not returning an error here as it's not critical for state transition
+		v.logger.Printf("Leaving Standby: Requesting CPU governor change to ondemand")
+		if err := v.redis.SendCommand("scooter:governor", "ondemand"); err != nil {
+			v.logger.Printf("Warning: Failed to request CPU governor change to ondemand: %v", err)
 		}
 	}
 
@@ -963,11 +962,10 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 		v.mu.Unlock()
 
-		// Set CPU governor to powersave
-		v.logger.Printf("Entering Standby: Setting CPU governor to powersave")
-		if err := v.handleGovernorRequest("powersave"); err != nil {
-			v.logger.Printf("Warning: Failed to set CPU governor to powersave: %v", err)
-			// Not returning an error here as it's not critical for state transition
+		// Request CPU governor change to powersave
+		v.logger.Printf("Entering Standby: Requesting CPU governor change to powersave")
+		if err := v.redis.SendCommand("scooter:governor", "powersave"); err != nil {
+			v.logger.Printf("Warning: Failed to request CPU governor change to powersave: %v", err)
 		}
 
 		// Track standby entry time for MDB reboot timer (3-minute requirement)
@@ -1530,27 +1528,3 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 	return nil
 }
 
-// handleGovernorRequest processes CPU governor change requests
-func (v *VehicleSystem) handleGovernorRequest(governor string) error {
-	v.logger.Printf("Handling CPU governor request: %s", governor)
-
-	// Use the direct sysfs interface to change the CPU governor
-	governorPath := "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
-
-	// Execute the change using shell command for reliability
-	cmd := exec.Command("sh", "-c", fmt.Sprintf("echo %s > %s", governor, governorPath))
-	if err := cmd.Run(); err != nil {
-		v.logger.Printf("Failed to set CPU governor to %s: %v", governor, err)
-		return fmt.Errorf("failed to set CPU governor to %s: %w", governor, err)
-	}
-
-	v.logger.Printf("Successfully set CPU governor to %s", governor)
-
-	// Publish the governor change to Redis for other systems to be aware
-	if err := v.redis.PublishGovernorChange(governor); err != nil {
-		v.logger.Printf("Warning: Failed to publish governor change to Redis: %v", err)
-		// Continue without error since the governor was changed successfully
-	}
-
-	return nil
-}

@@ -24,7 +24,6 @@ type Callbacks struct {
 	LedFadeCallback   func(int, int) error
 	UpdateCallback    func(string) error // "start", "complete"
 	HardwareCallback  func(string) error // "dashboard:on", "dashboard:off", "engine:on", "engine:off"
-	GovernorCallback  func(string) error // "ondemand", "powersave", "performance"
 }
 
 type RedisClient struct {
@@ -87,7 +86,7 @@ func (r *RedisClient) StartListening() error {
 	go r.redisListener(pubsub)
 
 	// Start list command listeners for LPUSH commands
-	r.wg.Add(9)
+	r.wg.Add(8)
 	go r.listCommandListener("scooter:seatbox", r.handleSeatboxCommand)
 	go r.listCommandListener("scooter:horn", r.handleHornCommand)
 	go r.listCommandListener("scooter:blinker", r.handleBlinkerCommand)
@@ -96,7 +95,6 @@ func (r *RedisClient) StartListening() error {
 	go r.listCommandListener("scooter:led:fade", r.handleLedFadeCommand)
 	go r.listCommandListener("scooter:update", r.handleUpdateCommand)
 	go r.listCommandListener("scooter:hardware", r.handleHardwareCommand)
-	go r.listCommandListener("scooter:governor", r.handleGovernorCommand)
 
 	return nil
 }
@@ -260,22 +258,6 @@ func (r *RedisClient) handleHardwareCommand(value string) error {
 	}
 }
 
-// handleGovernorCommand processes CPU governor change requests
-func (r *RedisClient) handleGovernorCommand(value string) error {
-	if r.callbacks.GovernorCallback == nil {
-		return nil
-	}
-
-	r.logger.Printf("Processing governor change request: %s", value)
-
-	switch value {
-	case "ondemand", "powersave", "performance":
-		return r.callbacks.GovernorCallback(value)
-	default:
-		r.logger.Printf("Invalid governor command value: %s", value)
-		return fmt.Errorf("invalid governor command: %s", value)
-	}
-}
 
 func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 	defer r.wg.Done()
