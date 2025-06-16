@@ -1413,6 +1413,7 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.dbcUpdating = false
 		deferredPower := v.deferredDashboardPower
 		v.deferredDashboardPower = nil
+		currentState := v.state
 		v.mu.Unlock()
 
 		// Apply any deferred dashboard power state
@@ -1429,6 +1430,13 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 					v.logger.Printf("Failed to disable deferred dashboard power: %v", err)
 					return err
 				}
+			}
+		} else if currentState == types.StateStandby {
+			// No deferred power state, but we're in standby - turn off dashboard power
+			v.logger.Printf("DBC update complete and in standby state - turning off dashboard power")
+			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
+				v.logger.Printf("Failed to disable dashboard power: %v", err)
+				return err
 			}
 		}
 		return nil
