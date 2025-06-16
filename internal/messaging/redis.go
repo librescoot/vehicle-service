@@ -732,6 +732,22 @@ func (r *RedisClient) SendCommand(channel, command string) error {
 	return nil
 }
 
+// PublishHibernationState publishes hibernation state to Redis
+func (r *RedisClient) PublishHibernationState(state string, timeRemaining int) error {
+	// Set hibernation state and time remaining
+	if err := r.client.HSet(r.ctx, "hibernation", "state", state).Err(); err != nil {
+		return fmt.Errorf("failed to set hibernation state: %w", err)
+	}
+	if err := r.client.HSet(r.ctx, "hibernation", "time_remaining", timeRemaining).Err(); err != nil {
+		return fmt.Errorf("failed to set hibernation time remaining: %w", err)
+	}
+	// Publish state change notification
+	if err := r.client.Publish(r.ctx, "hibernation", "state-change").Err(); err != nil {
+		return fmt.Errorf("failed to publish hibernation state change: %w", err)
+	}
+	return nil
+}
+
 func (r *RedisClient) Close() error {
 	r.logger.Printf("Closing Redis client")
 	r.cancel()

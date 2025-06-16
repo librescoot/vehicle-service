@@ -27,7 +27,49 @@ const (
 const (
 	keycardForceStandbyTaps = 3
 	keycardTapMaxInterval   = 3 * time.Second // Max interval between taps to be part of a sequence
+
+	// Hibernation timing constants
+	hibernationInitialHoldDuration = 15 * time.Second // Initial brake hold duration
+	hibernationConfirmationTimeout = 15 * time.Second // Timeout for confirmation after brake release
+	hibernationForceHoldDuration   = 30 * time.Second // Total hold time for force hibernation
 )
+
+// Manual hibernation state machine
+type ManualHibernationState int
+
+const (
+	HibernationIdle         ManualHibernationState = iota
+	HibernationInitialHold                         // 0-15s: both brakes held
+	HibernationConfirmation                        // 15s+: awaiting confirmation
+)
+
+func (s ManualHibernationState) String() string {
+	switch s {
+	case HibernationIdle:
+		return "idle"
+	case HibernationInitialHold:
+		return "initial-hold"
+	case HibernationConfirmation:
+		return "confirmation"
+	default:
+		return "unknown"
+	}
+}
+
+// HibernationManager manages the manual hibernation state machine
+type HibernationManager struct {
+	mu                   sync.RWMutex
+	state                ManualHibernationState
+	startTime            time.Time   // When initial brake hold started
+	initialTimer         *time.Timer // 15s initial hold timer
+	confirmationTimer    *time.Timer // 15s confirmation timeout timer
+	bothBrakesHeld       bool        // Current brake state
+	brakesReleased       bool        // Whether brakes were released during confirmation
+	logger               *log.Logger
+	redis                *messaging.RedisClient
+	onHibernationConfirm func()                                                // Callback to execute hibernation
+	onStateChange        func(state ManualHibernationState, timeRemaining int) // Callback for state changes
+}
 
 type VehicleSystem struct {
 	state                  types.SystemState
@@ -47,10 +89,11 @@ type VehicleSystem struct {
 	keycardTapCount        int
 	lastKeycardTapTime     time.Time
 	forceStandbyNoLock     bool
-	hibernationRequest     bool  // Track if hibernation was requested during shutdown
-	shutdownFromParked     bool  // Track if shutdown was initiated from parked state
-	dbcUpdating            bool  // Track if DBC update is in progress
-	deferredDashboardPower *bool // Deferred dashboard power state (nil = no change needed)
+	hibernationRequest     bool                // Track if hibernation was requested during shutdown
+	shutdownFromParked     bool                // Track if shutdown was initiated from parked state
+	dbcUpdating            bool                // Track if DBC update is in progress
+	deferredDashboardPower *bool               // Deferred dashboard power state (nil = no change needed)
+	hibernationManager     *HibernationManager // Manual hibernation state machine
 }
 
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
@@ -84,8 +127,21 @@ func (v *VehicleSystem) Start() error {
 		LedFadeCallback:   v.handleLedFadeRequest,
 		UpdateCallback:    v.handleUpdateRequest,
 		HardwareCallback:  v.handleHardwareRequest,
-		GovernorCallback:  v.handleGovernorRequest,
 	})
+
+	// Initialize hibernation manager
+	v.hibernationManager = &HibernationManager{
+		state:  HibernationIdle,
+		logger: log.New(log.Writer(), "Hibernation: ", log.LstdFlags),
+		redis:  v.redis,
+		onHibernationConfirm: func() {
+			v.logger.Printf("Hibernation confirmed, sending hibernate-manual command to pm-service")
+			if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
+				v.logger.Printf("Failed to send hibernate command: %v", err)
+			}
+		},
+		onStateChange: v.publishHibernationState,
+	}
 
 	if err := v.redis.Connect(); err != nil {
 		return fmt.Errorf("failed to connect to Redis: %w", err)
@@ -275,7 +331,7 @@ func (v *VehicleSystem) Start() error {
 	return nil
 }
 
-// checkHibernationConditions checks if hibernation should be triggered and sends command to pm-service
+// checkHibernationConditions checks if hibernation should be triggered using state machine
 func (v *VehicleSystem) checkHibernationConditions() {
 	v.mu.RLock()
 	currentState := v.state
@@ -283,6 +339,7 @@ func (v *VehicleSystem) checkHibernationConditions() {
 
 	// Only check hibernation conditions in parked state
 	if currentState != types.StateParked {
+		v.hibernationManager.cancelHibernation()
 		return
 	}
 
@@ -297,11 +354,206 @@ func (v *VehicleSystem) checkHibernationConditions() {
 		return
 	}
 
-	// If both brakes are pressed in parked state, send hibernation command to pm-service
-	if brakeLeft && brakeRight {
-		v.logger.Printf("Both brakes pressed in PARKED state, sending hibernation command to pm-service")
-		if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-			v.logger.Printf("Failed to send hibernate command: %v", err)
+	// Update hibernation manager with current brake state
+	v.hibernationManager.updateBrakeState(brakeLeft && brakeRight)
+}
+
+// publishHibernationState publishes hibernation state changes to Redis
+func (v *VehicleSystem) publishHibernationState(state ManualHibernationState, timeRemaining int) {
+	// Publish hibernation state to Redis for scootui
+	if err := v.redis.PublishHibernationState(state.String(), timeRemaining); err != nil {
+		v.logger.Printf("Failed to publish hibernation state: %v", err)
+	}
+}
+
+// Hibernation Manager Methods
+
+// updateBrakeState updates the hibernation state machine based on brake input
+func (hm *HibernationManager) updateBrakeState(bothBrakesPressed bool) {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+
+	previousBrakeState := hm.bothBrakesHeld
+	hm.bothBrakesHeld = bothBrakesPressed
+
+	switch hm.state {
+	case HibernationIdle:
+		if bothBrakesPressed {
+			// Start hibernation sequence
+			hm.startInitialHold()
+		}
+
+	case HibernationInitialHold:
+		if !bothBrakesPressed {
+			// Brakes released during initial hold - cancel
+			hm.logger.Printf("Brakes released during initial hold - cancelling hibernation")
+			hm.resetToIdle()
+		}
+		// If brakes still held, timer will handle transition to confirmation
+
+	case HibernationConfirmation:
+		if previousBrakeState && !bothBrakesPressed {
+			// Brakes just released - start confirmation timeout
+			hm.logger.Printf("Brakes released - entering confirmation phase")
+			hm.brakesReleased = true
+			hm.startConfirmationTimeout()
+		} else if !previousBrakeState && bothBrakesPressed {
+			// Brakes pressed again after release during confirmation
+			if hm.brakesReleased {
+				hm.logger.Printf("Both brakes pressed again during confirmation - checking total time")
+				// Check if we're still in force hibernation window
+				if time.Since(hm.startTime) >= hibernationForceHoldDuration {
+					hm.confirmHibernation()
+				}
+			}
+		} else if bothBrakesPressed && !hm.brakesReleased {
+			// Still holding brakes continuously - check for force hibernation
+			if time.Since(hm.startTime) >= hibernationForceHoldDuration {
+				hm.logger.Printf("Force hibernation triggered - 30s continuous hold")
+				hm.confirmHibernation()
+			}
+		}
+	}
+}
+
+// startInitialHold begins the initial 15s brake hold phase
+func (hm *HibernationManager) startInitialHold() {
+	hm.state = HibernationInitialHold
+	hm.startTime = time.Now()
+	hm.brakesReleased = false
+
+	hm.logger.Printf("Starting hibernation initial hold (15s)")
+
+	// Start 15s timer for initial hold
+	hm.initialTimer = time.AfterFunc(hibernationInitialHoldDuration, func() {
+		hm.mu.Lock()
+		defer hm.mu.Unlock()
+
+		if hm.state == HibernationInitialHold && hm.bothBrakesHeld {
+			hm.logger.Printf("Initial hold completed - entering confirmation phase")
+			hm.transitionToConfirmation()
+		}
+	})
+
+	// Notify state change
+	if hm.onStateChange != nil {
+		hm.onStateChange(hm.state, int(hibernationInitialHoldDuration.Seconds()))
+	}
+}
+
+// transitionToConfirmation moves to the confirmation phase
+func (hm *HibernationManager) transitionToConfirmation() {
+	hm.state = HibernationConfirmation
+
+	// Stop initial timer if running
+	if hm.initialTimer != nil {
+		hm.initialTimer.Stop()
+		hm.initialTimer = nil
+	}
+
+	hm.logger.Printf("Hibernation confirmation phase started")
+
+	// Notify state change
+	if hm.onStateChange != nil {
+		remainingTime := int(hibernationForceHoldDuration.Seconds() - time.Since(hm.startTime).Seconds())
+		if remainingTime < 0 {
+			remainingTime = 0
+		}
+		hm.onStateChange(hm.state, remainingTime)
+	}
+}
+
+// startConfirmationTimeout starts the 15s timeout for confirmation after brake release
+func (hm *HibernationManager) startConfirmationTimeout() {
+	// Stop any existing confirmation timer
+	if hm.confirmationTimer != nil {
+		hm.confirmationTimer.Stop()
+	}
+
+	hm.confirmationTimer = time.AfterFunc(hibernationConfirmationTimeout, func() {
+		hm.mu.Lock()
+		defer hm.mu.Unlock()
+
+		if hm.state == HibernationConfirmation && hm.brakesReleased {
+			hm.logger.Printf("Confirmation timeout - cancelling hibernation")
+			hm.resetToIdle()
+		}
+	})
+
+	hm.logger.Printf("Confirmation timeout started (15s)")
+}
+
+// confirmHibernation executes the hibernation
+func (hm *HibernationManager) confirmHibernation() {
+	hm.logger.Printf("Hibernation confirmed")
+
+	// Execute hibernation callback
+	if hm.onHibernationConfirm != nil {
+		hm.onHibernationConfirm()
+	}
+
+	// Reset to idle
+	hm.resetToIdle()
+}
+
+// cancelHibernation cancels the hibernation sequence
+func (hm *HibernationManager) cancelHibernation() {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+
+	if hm.state != HibernationIdle {
+		hm.logger.Printf("Hibernation cancelled")
+		hm.resetToIdle()
+	}
+}
+
+// resetToIdle resets the hibernation manager to idle state
+func (hm *HibernationManager) resetToIdle() {
+	// Stop all timers
+	if hm.initialTimer != nil {
+		hm.initialTimer.Stop()
+		hm.initialTimer = nil
+	}
+	if hm.confirmationTimer != nil {
+		hm.confirmationTimer.Stop()
+		hm.confirmationTimer = nil
+	}
+
+	// Reset state
+	hm.state = HibernationIdle
+	hm.bothBrakesHeld = false
+	hm.brakesReleased = false
+	hm.startTime = time.Time{}
+
+	// Notify state change
+	if hm.onStateChange != nil {
+		hm.onStateChange(hm.state, 0)
+	}
+}
+
+// handleKeycardConfirmation handles keycard tap during confirmation phase
+func (hm *HibernationManager) handleKeycardConfirmation() {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+
+	if hm.state == HibernationConfirmation && hm.brakesReleased {
+		hm.logger.Printf("Keycard confirmation received")
+		hm.confirmHibernation()
+	}
+}
+
+// handleBrakeConfirmation handles individual brake presses during confirmation
+func (hm *HibernationManager) handleBrakeConfirmation(leftPressed, rightPressed bool) {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+
+	if hm.state == HibernationConfirmation && hm.brakesReleased {
+		if rightPressed && !leftPressed {
+			hm.logger.Printf("Right brake confirmation received")
+			hm.confirmHibernation()
+		} else if leftPressed && !rightPressed {
+			hm.logger.Printf("Left brake cancellation received")
+			hm.resetToIdle()
 		}
 	}
 }
@@ -490,6 +742,12 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 	case "kickstand":
 		v.logger.Printf("Kickstand changed: %v, current state: %s", value, currentState)
+
+		// Cancel hibernation if kickstand is raised
+		if !value {
+			v.hibernationManager.cancelHibernation()
+		}
+
 		if currentState == types.StateStandby {
 			v.logger.Printf("Ignoring kickstand change in %s state", currentState)
 			return nil
@@ -508,6 +766,11 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		}
 
 	case "seatbox_button":
+		// Cancel hibernation on seatbox button press
+		if value {
+			v.hibernationManager.cancelHibernation()
+		}
+
 		if err := v.redis.SetSeatboxButton(value); err != nil {
 			return err
 		}
@@ -560,8 +823,23 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			return fmt.Errorf("failed to set brake state in Redis: %w", err)
 		}
 
-		// Check for immediate hibernation trigger (both brakes pressed in parked state)
-		// pm-service will handle the hibernation timer, vehicle-service just detects the condition
+		// Handle individual brake confirmation for hibernation
+		if value { // Only handle on brake press, not release
+			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+			if err != nil {
+				v.logger.Printf("Failed to read brake_left for hibernation confirmation: %v", err)
+			} else {
+				brakeRight, err := v.io.ReadDigitalInput("brake_right")
+				if err != nil {
+					v.logger.Printf("Failed to read brake_right for hibernation confirmation: %v", err)
+				} else {
+					// Handle individual brake confirmation
+					v.hibernationManager.handleBrakeConfirmation(brakeLeft, brakeRight)
+				}
+			}
+		}
+
+		// Check for hibernation conditions (both brakes pressed in parked state)
 		v.checkHibernationConditions()
 
 		return nil // Return nil as the brake state was set in Redis
@@ -729,15 +1007,15 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	v.mu.Unlock()
 
 	if performForcedStandby {
-		// Check if we're in the middle of a DBC update
-		v.mu.RLock()
-		v.mu.RUnlock()
-
 		v.logger.Printf("Transitioning to STANDBY (forced, no lock).")
 		// The forceStandbyNoLock flag will be read and reset by transitionTo
 		return v.transitionTo(types.StateStandby)
 	}
 	// --- End Force Standby Check ---
+
+	// --- Hibernation Confirmation Check ---
+	// Check if this keycard tap should confirm hibernation
+	v.hibernationManager.handleKeycardConfirmation()
 
 	// ----- Original keycardAuthPassed logic continues if not forced standby -----
 	v.mu.RLock()
@@ -1535,4 +1813,3 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 
 	return nil
 }
-
