@@ -84,7 +84,6 @@ func (v *VehicleSystem) Start() error {
 		LedFadeCallback:   v.handleLedFadeRequest,
 		UpdateCallback:    v.handleUpdateRequest,
 		HardwareCallback:  v.handleHardwareRequest,
-		GovernorCallback:  v.handleGovernorRequest,
 	})
 
 	if err := v.redis.Connect(); err != nil {
