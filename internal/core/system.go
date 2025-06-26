@@ -818,6 +818,15 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 	switch newState {
 
 	case types.StateReadyToDrive:
+		// Cancel any ongoing handlebar locking attempt when returning to active state
+		if v.handlebarTimer != nil {
+			v.logger.Printf("Cancelling handlebar locking timer due to transition to ready-to-drive")
+			v.handlebarTimer.Stop()
+			v.handlebarTimer = nil
+			// Restore original handlebar position callback
+			v.io.RegisterInputCallback("handlebar_position", v.handleHandlebarPosition)
+		}
+
 		// Check if handlebar needs to be unlocked
 		handlebarPos, err := v.io.ReadDigitalInput("handlebar_position")
 		if err != nil {
@@ -894,6 +903,15 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 	case types.StateParked:
+		// Cancel any ongoing handlebar locking attempt when returning to active state
+		if v.handlebarTimer != nil {
+			v.logger.Printf("Cancelling handlebar locking timer due to transition to parked")
+			v.handlebarTimer.Stop()
+			v.handlebarTimer = nil
+			// Restore original handlebar position callback
+			v.io.RegisterInputCallback("handlebar_position", v.handleHandlebarPosition)
+		}
+
 		// Check if handlebar needs to be unlocked
 		handlebarPos, err := v.io.ReadDigitalInput("handlebar_position")
 		if err != nil {
@@ -987,11 +1005,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 		if forcedStandby {
 			v.logger.Printf("Forced standby: skipping handlebar lock.")
-		} else if isFromParked || shutdownFromParked {
-			// Normal standby transition from Parked (directly or through shutting-down): lock handlebar
-			v.logger.Printf("Locking handlebar (from parked: %v, shutdown from parked: %v)", isFromParked, shutdownFromParked)
+		} else if isFromParked {
+			// Direct standby transition from Parked (not through shutting-down): lock handlebar
+			v.logger.Printf("Locking handlebar (direct transition from parked)")
 			v.lockHandlebar()
 		}
+		// If shutdown from parked, handlebar locking was already started during StateShuttingDown
 		// If not forced and not from Parked (e.g. Init -> Standby), no specific handlebar lock action here.
 
 		// LED Cues specifically for Parked -> Standby transition.
@@ -1063,6 +1082,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		// Turn off all outputs
 		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
 			v.logger.Printf("Failed to disable engine power during shutdown: %v", err)
+		}
+
+		// Start handlebar locking immediately to give user more time to position handlebar
+		if oldState == types.StateParked {
+			v.logger.Printf("Starting handlebar locking during shutdown (from parked state)")
+			v.lockHandlebar()
 		}
 
 		// Keep dashboard power on briefly to allow for proper shutdown messaging
