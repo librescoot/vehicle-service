@@ -360,8 +360,8 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 
 	// Only try to transition to READY_TO_DRIVE if dashboard is ready
 	if ready {
-		// Don't process kickstand state in STANDBY state
-		if currentState == types.StateStandby {
+		// Don't process kickstand state in STANDBY or SHUTTING_DOWN state
+		if currentState == types.StateStandby || currentState == types.StateShuttingDown {
 			v.logger.Printf("Skipping kickstand check in %s state", currentState)
 			return nil
 		}
