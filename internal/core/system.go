@@ -980,10 +980,10 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		v.mu.Unlock()
 
 		// Request CPU governor change to powersave
-		v.logger.Printf("Entering Standby: Requesting CPU governor change to powersave")
-		if err := v.redis.SendCommand("scooter:governor", "powersave"); err != nil {
-			v.logger.Printf("Warning: Failed to request CPU governor change to powersave: %v", err)
-		}
+		// v.logger.Printf("Entering Standby: Requesting CPU governor change to powersave")
+		// if err := v.redis.SendCommand("scooter:governor", "powersave"); err != nil {
+		// 	v.logger.Printf("Warning: Failed to request CPU governor change to powersave: %v", err)
+		// }
 
 		// Track standby entry time for MDB reboot timer (3-minute requirement)
 		v.logger.Printf("Setting standby timer start for MDB reboot coordination")
