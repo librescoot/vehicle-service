@@ -203,7 +203,8 @@ func (v *VehicleSystem) Start() error {
 	}
 
 	// Now that hardware is initialized, restore state and outputs
-	if savedState == types.StateReadyToDrive || savedState == types.StateParked {
+	switch savedState {
+	case types.StateReadyToDrive, types.StateParked:
 		// Read brake states to determine which LED cue to play
 		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 		if err != nil {
@@ -232,7 +233,7 @@ func (v *VehicleSystem) Start() error {
 				v.logger.Printf("Failed to play LED cue: %v", err)
 			}
 		}
-	} else if savedState == types.StateShuttingDown {
+	case types.StateShuttingDown:
 		v.transitionTo(types.StateStandby)
 	}
 
@@ -728,10 +729,6 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	v.mu.Unlock()
 
 	if performForcedStandby {
-		// Check if we're in the middle of a DBC update
-		v.mu.RLock()
-		v.mu.RUnlock()
-
 		v.logger.Printf("Transitioning to STANDBY (forced, no lock).")
 		// The forceStandbyNoLock flag will be read and reset by transitionTo
 		return v.transitionTo(types.StateStandby)
@@ -869,11 +866,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 		v.logger.Printf("Engine brake set to %v during transition (left: %v, right: %v)", brakeLeft || brakeRight, brakeLeft, brakeRight)
 
-		if oldState == types.StateParked {
+		switch oldState {
+		case types.StateParked:
 			if err := v.io.PlayPwmCue(3); err != nil { // LED_PARKED_TO_DRIVE
 				v.logger.Printf("Failed to play LED cue: %v", err)
 			}
-		} else if oldState == types.StateStandby {
+		case types.StateStandby:
 			// We came directly from Standby. The first brake press might have been ignored while
 			// in Standby, so synchronise the current brake lever states now to ensure the rear
 			// light reflects the actual situation and Redis observers get an accurate value.
@@ -1172,7 +1170,6 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 		v.blinkerStopChan = nil
 	}
 
-	// Update Redis switch state first
 	var cue int
 	switch state {
 	case "off":
@@ -1191,18 +1188,15 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 		return fmt.Errorf("invalid blinker state: %s", state)
 	}
 
-	if err := v.io.PlayPwmCue(cue); err != nil {
-		return err
-	}
-
-	if err := v.redis.SetBlinkerSwitch(state); err != nil {
-		return err
-	}
-
 	if state != "off" {
 		// Start blinker routine for non-off states
 		v.blinkerStopChan = make(chan struct{})
 		go v.runBlinker(cue, state, v.blinkerStopChan)
+	} else {
+		// For off state, play the cue immediately since no goroutine will handle it
+		if err := v.io.PlayPwmCue(cue); err != nil {
+			return err
+		}
 	}
 
 	return v.redis.SetBlinkerState(state)
@@ -1559,4 +1553,3 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 
 	return nil
 }
-
