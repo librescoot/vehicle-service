@@ -62,6 +62,33 @@ The service requires Redis connection details:
 
 Additional configuration options can be found in the hardware constants and system configuration files.
 
+### LED Channel Mapping
+
+The vehicle service controls 8 PWM LED channels with the following mappings:
+
+| Index | LED Name              | Description                    |
+|-------|-----------------------|--------------------------------|
+| 0     | Headlight            | Main front illumination       |
+| 1     | Front ring           | Front accent lighting          |
+| 2     | Brake light          | Rear brake indicator           |
+| 3     | Blinker front left   | Left front turn signal        |
+| 4     | Blinker front right  | Right front turn signal       |
+| 5     | Number plates        | License plate illumination    |
+| 6     | Blinker rear left    | Left rear turn signal         |
+| 7     | Blinker rear right   | Right rear turn signal        |
+
+Channels 3, 4, 6, and 7 are configured as blinker channels and do not use adaptive mode.
+
+#### LED Channel Modes
+
+The PWM LED system supports two operational modes for each channel:
+
+- **Adaptive Mode**: When enabled, causes the channel to adapt fade playback by finding the first duty-cycle value in the fade that is nearest to the current duty-cycle, then starting the fade from that point. This prevents abrupt jumps in brightness when transitioning between different LED states. Non-blinker channels (0, 1, 2, 5) use adaptive mode for smooth transitions.
+
+- **Active/Inactive Mode**: Controls whether fade values are actually output to the LED. When active, fade values are set as the channel's duty-cycle normally. When inactive, the output is forced to 0% regardless of the fade being played. Blinker channels (3, 4, 6, 7) rely on precise active/inactive control for their flashing patterns.
+
+For more detailed information about these modes, see the [i.MX PWM LED kernel module documentation](https://github.com/unumotors/kernel-module-imx-pwm-led/blob/master/README.md).
+
 ## Safety Features
 
 The service implements several safety features:
