@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"vehicle-service/internal/diagnostics"
 	"vehicle-service/internal/hardware"
 	"vehicle-service/internal/messaging"
 	"vehicle-service/internal/types"
@@ -35,6 +36,7 @@ type VehicleSystem struct {
 	logger                 *log.Logger
 	io                     *hardware.LinuxHardwareIO
 	redis                  *messaging.RedisClient
+	diagnostics            *diagnostics.Manager
 	mu                     sync.RWMutex
 	redisHost              string
 	redisPort              int
@@ -90,6 +92,9 @@ func (v *VehicleSystem) Start() error {
 		return fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
+	// Initialize diagnostics manager with Redis reporter
+	v.diagnostics = diagnostics.NewManager(v.redis)
+
 	// Load initial state from Redis
 	savedState, err := v.redis.GetVehicleState()
 	if err != nil {
@@ -128,8 +133,11 @@ func (v *VehicleSystem) Start() error {
 
 	// Initialize hardware
 	if err := v.io.Initialize(); err != nil {
+		v.diagnostics.SetFault(types.FaultGPIOInit, fmt.Sprintf("hardware init failed: %v", err))
 		return fmt.Errorf("failed to initialize hardware: %w", err)
 	}
+	// Clear any previous GPIO init fault on successful initialization
+	v.diagnostics.ClearFault(types.FaultGPIOInit)
 
 	// Check initial handlebar lock sensor state
 	handlebarLockSensorRaw, err := v.io.ReadDigitalInput("handlebar_lock_sensor")
@@ -361,7 +369,7 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 
 	// Only try to transition to READY_TO_DRIVE if dashboard is ready
 	if ready {
-		// Don't process kickstand state in STANDBY or SHUTTING_DOWN state
+		// Don't process kickstand state in STANDBY or SHUTTING_DOWN states
 		if currentState == types.StateStandby || currentState == types.StateShuttingDown {
 			v.logger.Printf("Skipping kickstand check in %s state", currentState)
 			return nil
@@ -839,12 +847,15 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 		if err := v.io.WriteDigitalOutput("engine_power", true); err != nil {
 			v.logger.Printf("Failed to enable engine power: %v", err)
+			v.diagnostics.SetFault(types.FaultHardwareOutputControl, fmt.Sprintf("engine_power on failed: %v", err))
 			return err
 		}
 		v.logger.Printf("Engine power enabled")
+		v.diagnostics.ClearFault(types.FaultHardwareOutputControl)
 
 		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
 			v.logger.Printf("Failed to enable dashboard power: %v", err)
+			v.diagnostics.SetFault(types.FaultHardwareOutputControl, fmt.Sprintf("dashboard_power on failed: %v", err))
 			return err
 		}
 		v.logger.Printf("Dashboard power enabled")
@@ -853,13 +864,16 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 		if err != nil {
 			v.logger.Printf("Failed to read brake_left during transition: %v", err)
+			v.diagnostics.SetFault(types.FaultDigitalInputRead, fmt.Sprintf("brake_left read failed: %v", err))
 			return err
 		}
 		brakeRight, err := v.io.ReadDigitalInput("brake_right")
 		if err != nil {
 			v.logger.Printf("Failed to read brake_right during transition: %v", err)
+			v.diagnostics.SetFault(types.FaultDigitalInputRead, fmt.Sprintf("brake_right read failed: %v", err))
 			return err
 		}
+		v.diagnostics.ClearFault(types.FaultDigitalInputRead)
 		if err := v.io.WriteDigitalOutput("engine_brake", brakeLeft || brakeRight); err != nil {
 			v.logger.Printf("Failed to set engine brake during transition: %v", err)
 			return err
@@ -1061,7 +1075,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 	case types.StateShuttingDown:
-		v.logger.Printf("Entering shutting down state")
+		v.logger.Printf("Entering shutting down state from %s", oldState)
 
 		// Track if we're coming from parked state
 		if oldState == types.StateParked {
@@ -1120,7 +1134,13 @@ func (v *VehicleSystem) publishState() error {
 	state := v.state
 	v.mu.RUnlock()
 
-	return v.redis.PublishVehicleState(state)
+	v.logger.Printf("Publishing state to Redis: %s", state)
+	if err := v.redis.PublishVehicleState(state); err != nil {
+		v.diagnostics.SetFault(types.FaultRedisConnection, fmt.Sprintf("failed to publish state: %v", err))
+		return err
+	}
+	v.diagnostics.ClearFault(types.FaultRedisConnection)
+	return nil
 }
 
 func (v *VehicleSystem) Shutdown() {
@@ -1215,14 +1235,17 @@ func (v *VehicleSystem) lockHandlebar() {
 			// Handlebar is in position, lock it immediately
 			if err := v.io.WriteDigitalOutput("handlebar_lock_close", true); err != nil {
 				v.logger.Printf("Failed to activate handlebar lock close: %v", err)
+				v.diagnostics.SetFault(types.FaultHandlebarLockFailure, fmt.Sprintf("failed to activate: %v", err))
 				return
 			}
 			time.Sleep(1100 * time.Millisecond)
 			if err := v.io.WriteDigitalOutput("handlebar_lock_close", false); err != nil {
 				v.logger.Printf("Failed to deactivate handlebar lock close: %v", err)
+				v.diagnostics.SetFault(types.FaultHandlebarLockFailure, fmt.Sprintf("failed to deactivate: %v", err))
 				return
 			}
 			v.logger.Printf("Handlebar locked")
+			v.diagnostics.ClearFault(types.FaultHandlebarLockFailure)
 
 			// Reset unlock state after successful lock
 			v.mu.Lock()
@@ -1265,15 +1288,18 @@ func (v *VehicleSystem) lockHandlebar() {
 			if err := v.io.WriteDigitalOutput("handlebar_lock_close", true); err != nil {
 				cleanup()
 				v.logger.Printf("Failed to activate handlebar lock close: %v", err)
+				v.diagnostics.SetFault(types.FaultHandlebarLockFailure, fmt.Sprintf("failed to activate: %v", err))
 				return err
 			}
 			time.Sleep(1100 * time.Millisecond)
 			if err := v.io.WriteDigitalOutput("handlebar_lock_close", false); err != nil {
 				cleanup()
 				v.logger.Printf("Failed to deactivate handlebar lock close: %v", err)
+				v.diagnostics.SetFault(types.FaultHandlebarLockFailure, fmt.Sprintf("failed to deactivate: %v", err))
 				return err
 			}
 			v.logger.Printf("Handlebar locked")
+			v.diagnostics.ClearFault(types.FaultHandlebarLockFailure)
 
 			// Reset unlock state after successful lock
 			v.mu.Lock()
@@ -1297,14 +1323,17 @@ func (v *VehicleSystem) lockHandlebar() {
 
 func (v *VehicleSystem) unlockHandlebar() error {
 	if err := v.io.WriteDigitalOutput("handlebar_lock_open", true); err != nil {
+		v.diagnostics.SetFault(types.FaultHandlebarUnlockFailure, fmt.Sprintf("failed to activate: %v", err))
 		return fmt.Errorf("failed to activate handlebar lock open: %w", err)
 	}
 	time.Sleep(1100 * time.Millisecond)
 	if err := v.io.WriteDigitalOutput("handlebar_lock_open", false); err != nil {
+		v.diagnostics.SetFault(types.FaultHandlebarUnlockFailure, fmt.Sprintf("failed to deactivate: %v", err))
 		return fmt.Errorf("failed to deactivate handlebar lock open: %w", err)
 	}
 	v.handlebarUnlocked = true
 	v.logger.Printf("Handlebar unlocked")
+	v.diagnostics.ClearFault(types.FaultHandlebarUnlockFailure)
 	return nil
 }
 

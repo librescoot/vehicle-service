@@ -285,13 +285,15 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 
 			switch msg.Channel {
 			case "dashboard":
-				ready, err := r.client.HGet(r.ctx, "dashboard", "ready").Result()
-				if err != nil {
-					r.logger.Printf("Failed to get dashboard state: %v", err)
-				} else {
-					r.logger.Printf("Processing dashboard ready state: %v", ready == "true")
-					if err := r.callbacks.DashboardCallback(ready == "true"); err != nil {
-						r.logger.Printf("Failed to handle dashboard state: %v", err)
+				if msg.Payload == "ready" {
+					ready, err := r.client.HGet(r.ctx, "dashboard", "ready").Result()
+					if err != nil {
+						r.logger.Printf("Failed to get dashboard state: %v", err)
+					} else {
+						r.logger.Printf("Processing dashboard ready state: %v", ready == "true")
+						if err := r.callbacks.DashboardCallback(ready == "true"); err != nil {
+							r.logger.Printf("Failed to handle dashboard state: %v", err)
+						}
 					}
 				}
 
@@ -373,8 +375,12 @@ func (r *RedisClient) processVehicleMessage(payload string) {
 		handler = r.handleBlinkerCommand
 	case "scooter:update":
 		handler = r.handleUpdateCommand
+	case "seatbox:lock", "brake:left", "brake:right", "blinker:switch", "blinker:state",
+	     "kickstand", "handlebar:lock-sensor", "state", "update:status", "fault":
+		// These are state updates published by vehicle-service itself, ignore silently
+		return
 	default:
-		// Ignore unknown payloads to keep behaviour predictable
+		// Log truly unknown payloads for debugging
 		r.logger.Printf("Unhandled vehicle payload: %s", payload)
 		return
 	}
@@ -729,6 +735,76 @@ func (r *RedisClient) SendCommand(channel, command string) error {
 		return err
 	}
 	r.logger.Printf("Sent command '%s' to channel '%s'", command, channel)
+	return nil
+}
+
+// ReportFaultPresent reports a fault as present to Redis
+func (r *RedisClient) ReportFaultPresent(code int, description string, timestamp int64, info string) error {
+	r.logger.Printf("Reporting fault present: code=%d, description=%s", code, description)
+
+	pipe := r.client.Pipeline()
+
+	// Add fault code to active faults set
+	pipe.SAdd(r.ctx, "vehicle:fault", code)
+
+	// Add fault event to global event stream with metadata
+	eventData := map[string]interface{}{
+		"group":       "vehicle",
+		"code":        code,
+		"description": description,
+		"ts":          timestamp,
+	}
+	if info != "" {
+		eventData["info"] = info
+	}
+	pipe.XAdd(r.ctx, &redis.XAddArgs{
+		Stream: "events:faults",
+		MaxLen: 1000,
+		Values: eventData,
+	})
+
+	// Publish notification
+	pipe.Publish(r.ctx, "vehicle", "fault")
+
+	_, err := pipe.Exec(r.ctx)
+	if err != nil {
+		r.logger.Printf("Failed to report fault present: %v", err)
+		return err
+	}
+
+	r.logger.Printf("Successfully reported fault %d as present", code)
+	return nil
+}
+
+// ReportFaultAbsent reports a fault as absent (cleared) to Redis
+func (r *RedisClient) ReportFaultAbsent(code int) error {
+	r.logger.Printf("Reporting fault absent: code=%d", code)
+
+	pipe := r.client.Pipeline()
+
+	// Remove fault code from active faults set
+	pipe.SRem(r.ctx, "vehicle:fault", code)
+
+	// Add clear event to global event stream (negative code indicates cleared)
+	pipe.XAdd(r.ctx, &redis.XAddArgs{
+		Stream: "events:faults",
+		MaxLen: 1000,
+		Values: map[string]interface{}{
+			"group": "vehicle",
+			"code":  -code, // Negative code indicates fault cleared
+		},
+	})
+
+	// Publish notification
+	pipe.Publish(r.ctx, "vehicle", "fault")
+
+	_, err := pipe.Exec(r.ctx)
+	if err != nil {
+		r.logger.Printf("Failed to report fault absent: %v", err)
+		return err
+	}
+
+	r.logger.Printf("Successfully reported fault %d as absent", code)
 	return nil
 }
 
