@@ -27,6 +27,13 @@ const (
 const (
 	keycardForceStandbyTaps = 3
 	keycardTapMaxInterval   = 3 * time.Second // Max interval between taps to be part of a sequence
+
+	// Hardware timing constants
+	blinkerInterval       = 800 * time.Millisecond
+	handlebarLockDuration = 1100 * time.Millisecond
+	shutdownTimerDuration = 3500 * time.Millisecond
+	handlebarLockWindow   = 10 * time.Second
+	seatboxLockDuration   = 200 * time.Millisecond
 )
 
 type VehicleSystem struct {
@@ -669,7 +676,7 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}
 		v.logger.Printf("Error updating blinker state: %v", err)
 	}
 
-	ticker := time.NewTicker(800 * time.Millisecond)
+	ticker := time.NewTicker(blinkerInterval)
 	defer ticker.Stop()
 
 	for {
@@ -1091,7 +1098,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		// Keep dashboard power on briefly to allow for proper shutdown messaging
 		// The timer will handle transitioning to standby and turning off dashboard power
 
-		v.shutdownTimer = time.AfterFunc(3500*time.Millisecond, v.triggerShutdownTimeout)
+		v.shutdownTimer = time.AfterFunc(shutdownTimerDuration, v.triggerShutdownTimeout)
 		v.logger.Printf("Started shutdown timer (3.5s)")
 
 	}
@@ -1105,7 +1112,7 @@ func (v *VehicleSystem) openSeatboxLock() error {
 		return err
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(seatboxLockDuration)
 
 	if err := v.io.WriteDigitalOutput("seatbox_lock", false); err != nil {
 		return err
@@ -1221,7 +1228,7 @@ func (v *VehicleSystem) lockHandlebar() {
 				v.logger.Printf("Failed to activate handlebar lock close: %v", err)
 				return
 			}
-			time.Sleep(1100 * time.Millisecond)
+			time.Sleep(handlebarLockDuration)
 			if err := v.io.WriteDigitalOutput("handlebar_lock_close", false); err != nil {
 				v.logger.Printf("Failed to deactivate handlebar lock close: %v", err)
 				return
@@ -1240,7 +1247,7 @@ func (v *VehicleSystem) lockHandlebar() {
 		if v.handlebarTimer != nil {
 			v.handlebarTimer.Stop()
 		}
-		v.handlebarTimer = time.NewTimer(10 * time.Second)
+		v.handlebarTimer = time.NewTimer(handlebarLockWindow)
 
 		// Create a cleanup function to restore the original callback
 		cleanup := func() {
@@ -1271,7 +1278,7 @@ func (v *VehicleSystem) lockHandlebar() {
 				v.logger.Printf("Failed to activate handlebar lock close: %v", err)
 				return err
 			}
-			time.Sleep(1100 * time.Millisecond)
+			time.Sleep(handlebarLockDuration)
 			if err := v.io.WriteDigitalOutput("handlebar_lock_close", false); err != nil {
 				cleanup()
 				v.logger.Printf("Failed to deactivate handlebar lock close: %v", err)
@@ -1303,7 +1310,7 @@ func (v *VehicleSystem) unlockHandlebar() error {
 	if err := v.io.WriteDigitalOutput("handlebar_lock_open", true); err != nil {
 		return fmt.Errorf("failed to activate handlebar lock open: %w", err)
 	}
-	time.Sleep(1100 * time.Millisecond)
+	time.Sleep(handlebarLockDuration)
 	if err := v.io.WriteDigitalOutput("handlebar_lock_open", false); err != nil {
 		return fmt.Errorf("failed to deactivate handlebar lock open: %w", err)
 	}
