@@ -1107,17 +1107,22 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 	return nil
 }
 
+// pulseOutput activates an output for a specified duration then deactivates it
+func (v *VehicleSystem) pulseOutput(name string, duration time.Duration) error {
+	if err := v.io.WriteDigitalOutput(name, true); err != nil {
+		return err
+	}
+	time.Sleep(duration)
+	if err := v.io.WriteDigitalOutput(name, false); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (v *VehicleSystem) openSeatboxLock() error {
-	if err := v.io.WriteDigitalOutput("seatbox_lock", true); err != nil {
+	if err := v.pulseOutput("seatbox_lock", seatboxLockDuration); err != nil {
 		return err
 	}
-
-	time.Sleep(seatboxLockDuration)
-
-	if err := v.io.WriteDigitalOutput("seatbox_lock", false); err != nil {
-		return err
-	}
-
 	v.logger.Printf("Seatbox lock toggled for 0.2s")
 	return nil
 }
@@ -1224,13 +1229,8 @@ func (v *VehicleSystem) lockHandlebar() {
 
 		if handlebarPos {
 			// Handlebar is in position, lock it immediately
-			if err := v.io.WriteDigitalOutput("handlebar_lock_close", true); err != nil {
-				v.logger.Printf("Failed to activate handlebar lock close: %v", err)
-				return
-			}
-			time.Sleep(handlebarLockDuration)
-			if err := v.io.WriteDigitalOutput("handlebar_lock_close", false); err != nil {
-				v.logger.Printf("Failed to deactivate handlebar lock close: %v", err)
+			if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
+				v.logger.Printf("Failed to lock handlebar: %v", err)
 				return
 			}
 			v.logger.Printf("Handlebar locked")
@@ -1273,15 +1273,9 @@ func (v *VehicleSystem) lockHandlebar() {
 			v.handlebarTimer.Stop()
 
 			// Lock the handlebar
-			if err := v.io.WriteDigitalOutput("handlebar_lock_close", true); err != nil {
+			if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
 				cleanup()
-				v.logger.Printf("Failed to activate handlebar lock close: %v", err)
-				return err
-			}
-			time.Sleep(handlebarLockDuration)
-			if err := v.io.WriteDigitalOutput("handlebar_lock_close", false); err != nil {
-				cleanup()
-				v.logger.Printf("Failed to deactivate handlebar lock close: %v", err)
+				v.logger.Printf("Failed to lock handlebar: %v", err)
 				return err
 			}
 			v.logger.Printf("Handlebar locked")
@@ -1307,12 +1301,8 @@ func (v *VehicleSystem) lockHandlebar() {
 }
 
 func (v *VehicleSystem) unlockHandlebar() error {
-	if err := v.io.WriteDigitalOutput("handlebar_lock_open", true); err != nil {
-		return fmt.Errorf("failed to activate handlebar lock open: %w", err)
-	}
-	time.Sleep(handlebarLockDuration)
-	if err := v.io.WriteDigitalOutput("handlebar_lock_open", false); err != nil {
-		return fmt.Errorf("failed to deactivate handlebar lock open: %w", err)
+	if err := v.pulseOutput("handlebar_lock_open", handlebarLockDuration); err != nil {
+		return fmt.Errorf("failed to unlock handlebar: %w", err)
 	}
 	v.handlebarUnlocked = true
 	v.logger.Printf("Handlebar unlocked")
