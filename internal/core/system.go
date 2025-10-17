@@ -225,20 +225,14 @@ func (v *VehicleSystem) Start() error {
 		}
 		brakesPressed := brakeLeft || brakeRight
 
-		if err := v.io.PlayPwmCue(1); err != nil { // STANDBY_TO_PARKED_BRAKE_OFF
-			v.logger.Printf("Failed to play LED cue: %v", err)
-		}
+		v.playLedCue(1, "standby to parked brake off")
 
 		if savedState == types.StateReadyToDrive {
-			if err := v.io.PlayPwmCue(3); err != nil { // PARKED_TO_DRIVE
-				v.logger.Printf("Failed to play LED cue: %v", err)
-			}
+			v.playLedCue(3, "parked to drive")
 		}
 
 		if brakesPressed {
-			if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
-				v.logger.Printf("Failed to play LED cue: %v", err)
-			}
+			v.playLedCue(4, "brake off to on")
 		}
 	case types.StateShuttingDown:
 		v.transitionTo(types.StateStandby)
@@ -477,9 +471,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 					v.logger.Printf("Manual ready-to-drive activation: kickstand up, both brakes held, seatbox button pressed")
 
 					// Blink the main light once for confirmation
-					if err := v.io.PlayPwmCue(3); err != nil { // LED_PARKED_TO_DRIVE
-						v.logger.Printf("Failed to play LED cue: %v", err)
-					}
+					v.playLedCue(3, "parked to drive")
 
 					// Set the scooter to ready-to-drive
 					return v.transitionTo(types.StateReadyToDrive)
@@ -857,9 +849,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 		switch oldState {
 		case types.StateParked:
-			if err := v.io.PlayPwmCue(3); err != nil { // LED_PARKED_TO_DRIVE
-				v.logger.Printf("Failed to play LED cue: %v", err)
-			}
+			v.playLedCue(3, "parked to drive")
 		case types.StateStandby:
 			// We came directly from Standby. The first brake press might have been ignored while
 			// in Standby, so synchronise the current brake lever states now to ensure the rear
@@ -883,9 +873,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 			// Update the rear-light if at least one lever is pressed
 			if brakeLeft || brakeRight {
-				if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
-					v.logger.Printf("Failed to play brake ON cue after Standby->Ready transition: %v", err)
-				}
+				v.playLedCue(4, "brake off to on after standby->ready")
 			}
 		}
 
@@ -907,9 +895,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		v.logger.Printf("Dashboard power enabled")
 
 		if oldState == types.StateReadyToDrive {
-			if err := v.io.PlayPwmCue(6); err != nil { // LED_DRIVE_TO_PARKED
-				v.logger.Printf("Failed to play LED cue: %v", err)
-			}
+			v.playLedCue(6, "drive to parked")
 		}
 
 		if oldState == types.StateStandby {
@@ -926,13 +912,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			brakesPressed := brakeLeft || brakeRight
 
 			if brakesPressed {
-				if err := v.io.PlayPwmCue(2); err != nil { // LED_STANDBY_TO_PARKED_BRAKE_ON
-					v.logger.Printf("Failed to play LED cue: %v", err)
-				}
+				v.playLedCue(2, "standby to parked brake on")
 			} else {
-				if err := v.io.PlayPwmCue(1); err != nil { // LED_STANDBY_TO_PARKED_BRAKE_OFF
-					v.logger.Printf("Failed to play LED cue: %v", err)
-				}
+				v.playLedCue(1, "standby to parked brake off")
 			}
 		}
 
@@ -992,13 +974,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			brakesPressed := brakeLeft || brakeRight
 
 			if brakesPressed {
-				if err := v.io.PlayPwmCue(8); err != nil { // LED_PARKED_BRAKE_ON_TO_STANDBY
-					v.logger.Printf("Failed to play LED cue (8): %v", err)
-				}
+				v.playLedCue(8, "parked brake on to standby")
 			} else {
-				if err := v.io.PlayPwmCue(7); err != nil { // LED_PARKED_BRAKE_OFF_TO_STANDBY
-					v.logger.Printf("Failed to play LED cue (7): %v", err)
-				}
+				v.playLedCue(7, "parked brake off to standby")
 			}
 		}
 
@@ -1021,9 +999,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 		// Final "all off" cue for standby.
-		if err := v.io.PlayPwmCue(0); err != nil { // ALL_OFF
-			v.logger.Printf("Failed to play LED cue ALL_OFF (0): %v", err)
-		}
+		v.playLedCue(0, "all off")
 
 	case types.StateShuttingDown:
 		v.logger.Printf("Entering shutting down state from %s", oldState)
@@ -1075,6 +1051,13 @@ func (v *VehicleSystem) pulseOutput(name string, duration time.Duration) error {
 		return err
 	}
 	return nil
+}
+
+// playLedCue plays an LED cue and logs any errors with context
+func (v *VehicleSystem) playLedCue(cue int, description string) {
+	if err := v.io.PlayPwmCue(cue); err != nil {
+		v.logger.Printf("Failed to play LED cue %d (%s): %v", cue, description, err)
+	}
 }
 
 // unlockHandlebarIfNeeded checks if the handlebar needs unlocking and unlocks it
