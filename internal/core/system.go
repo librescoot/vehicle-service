@@ -729,9 +729,9 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	v.mu.Unlock()
 
 	if performForcedStandby {
-		v.logger.Printf("Transitioning to STANDBY (forced, no lock).")
-		// The forceStandbyNoLock flag will be read and reset by transitionTo
-		return v.transitionTo(types.StateStandby)
+		v.logger.Printf("Transitioning to SHUTTING_DOWN (forced, no lock).")
+		// The forceStandbyNoLock flag will be read and reset by transitionTo when transitioning to standby
+		return v.transitionTo(types.StateShuttingDown)
 	}
 	// --- End Force Standby Check ---
 
