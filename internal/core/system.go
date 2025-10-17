@@ -822,26 +822,8 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 	switch newState {
 
 	case types.StateReadyToDrive:
-		// Cancel any ongoing handlebar locking attempt when returning to active state
-		if v.handlebarTimer != nil {
-			v.logger.Printf("Cancelling handlebar locking timer due to transition to ready-to-drive")
-			v.handlebarTimer.Stop()
-			v.handlebarTimer = nil
-			// Restore original handlebar position callback
-			v.io.RegisterInputCallback("handlebar_position", v.handleHandlebarPosition)
-		}
-
-		// Check if handlebar needs to be unlocked
-		handlebarPos, err := v.io.ReadDigitalInput("handlebar_position")
-		if err != nil {
-			v.logger.Printf("Failed to read handlebar position: %v", err)
+		if err := v.unlockHandlebarIfNeeded(); err != nil {
 			return err
-		}
-		if handlebarPos && !v.handlebarUnlocked {
-			if err := v.unlockHandlebar(); err != nil {
-				v.logger.Printf("Failed to unlock handlebar: %v", err)
-				return err
-			}
 		}
 
 		if err := v.io.WriteDigitalOutput("engine_power", true); err != nil {
@@ -908,26 +890,8 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 	case types.StateParked:
-		// Cancel any ongoing handlebar locking attempt when returning to active state
-		if v.handlebarTimer != nil {
-			v.logger.Printf("Cancelling handlebar locking timer due to transition to parked")
-			v.handlebarTimer.Stop()
-			v.handlebarTimer = nil
-			// Restore original handlebar position callback
-			v.io.RegisterInputCallback("handlebar_position", v.handleHandlebarPosition)
-		}
-
-		// Check if handlebar needs to be unlocked
-		handlebarPos, err := v.io.ReadDigitalInput("handlebar_position")
-		if err != nil {
-			v.logger.Printf("Failed to read handlebar position: %v", err)
+		if err := v.unlockHandlebarIfNeeded(); err != nil {
 			return err
-		}
-		if handlebarPos && !v.handlebarUnlocked {
-			if err := v.unlockHandlebar(); err != nil {
-				v.logger.Printf("Failed to unlock handlebar: %v", err)
-				return err
-			}
 		}
 
 		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
@@ -1115,6 +1079,33 @@ func (v *VehicleSystem) pulseOutput(name string, duration time.Duration) error {
 	time.Sleep(duration)
 	if err := v.io.WriteDigitalOutput(name, false); err != nil {
 		return err
+	}
+	return nil
+}
+
+// unlockHandlebarIfNeeded checks if the handlebar needs unlocking and unlocks it
+// Also cancels any ongoing handlebar locking attempt
+func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
+	// Cancel any ongoing handlebar locking attempt when returning to active state
+	if v.handlebarTimer != nil {
+		v.logger.Printf("Cancelling handlebar locking timer")
+		v.handlebarTimer.Stop()
+		v.handlebarTimer = nil
+		// Restore original handlebar position callback
+		v.io.RegisterInputCallback("handlebar_position", v.handleHandlebarPosition)
+	}
+
+	// Check if handlebar needs to be unlocked
+	handlebarPos, err := v.io.ReadDigitalInput("handlebar_position")
+	if err != nil {
+		v.logger.Printf("Failed to read handlebar position: %v", err)
+		return err
+	}
+	if handlebarPos && !v.handlebarUnlocked {
+		if err := v.unlockHandlebar(); err != nil {
+			v.logger.Printf("Failed to unlock handlebar: %v", err)
+			return err
+		}
 	}
 	return nil
 }
