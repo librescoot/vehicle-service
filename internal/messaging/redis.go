@@ -43,7 +43,7 @@ func NewRedisClient(host string, port int, callbacks Callbacks) *RedisClient {
 			DB:   0,
 		}),
 		callbacks: callbacks,
-		logger:    log.New(log.Writer(), "Redis: ", log.LstdFlags),
+		logger:    log.New(log.Writer(), "Redis: ", log.Flags()),
 		ctx:       ctx,
 		cancel:    cancel,
 	}

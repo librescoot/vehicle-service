@@ -10,7 +10,12 @@ import (
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	// Disable timestamps when running under systemd (which adds its own)
+	if os.Getenv("INVOCATION_ID") != "" {
+		log.SetFlags(0)
+	} else {
+		log.SetFlags(log.LstdFlags)
+	}
 	log.Printf("Starting vehicle service...")
 
 	system := core.NewVehicleSystem("127.0.0.1", 6379)

@@ -56,7 +56,7 @@ type LinuxHardwareIO struct {
 
 func NewLinuxHardwareIO() *LinuxHardwareIO {
 	return &LinuxHardwareIO{
-		logger:          log.New(log.Writer(), "HardwareIO: ", log.LstdFlags),
+		logger:          log.New(log.Writer(), "HardwareIO: ", log.Flags()),
 		inputDevicePath: GpioKeysInput,
 		chips:           make(map[int]*gpiocdev.Chip),
 		lines:           make(map[string]*gpiocdev.Line),

@@ -56,7 +56,7 @@ type VehicleSystem struct {
 func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
 	return &VehicleSystem{
 		state:              types.StateInit,
-		logger:             log.New(log.Writer(), "Vehicle: ", log.LstdFlags),
+		logger:             log.New(log.Writer(), "Vehicle: ", log.Flags()),
 		io:                 hardware.NewLinuxHardwareIO(),
 		redisHost:          redisHost,
 		redisPort:          redisPort,
