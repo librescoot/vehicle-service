@@ -1516,6 +1516,24 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 		default:
 			return fmt.Errorf("invalid engine action: %s", action)
 		}
+	case "handlebar":
+		switch action {
+		case "lock":
+			if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
+				v.logger.Printf("Failed to lock handlebar: %v", err)
+				return err
+			}
+			v.logger.Printf("Handlebar lock activated")
+		case "unlock":
+			if err := v.pulseOutput("handlebar_lock_open", handlebarLockDuration); err != nil {
+				v.logger.Printf("Failed to unlock handlebar: %v", err)
+				return err
+			}
+			v.handlebarUnlocked = true
+			v.logger.Printf("Handlebar unlock activated")
+		default:
+			return fmt.Errorf("invalid handlebar action: %s", action)
+		}
 	default:
 		return fmt.Errorf("invalid hardware component: %s", component)
 	}
