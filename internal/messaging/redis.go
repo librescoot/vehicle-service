@@ -273,12 +273,12 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 			return
 		case msg, ok := <-channel:
 			if !ok {
-				r.logger.Printf("Channel closed, exiting listener")
-				return
+				r.logger.Printf("Redis channel closed unexpectedly")
+				log.Fatalf("Redis connection lost, exiting to allow systemd restart")
 			}
 			if msg == nil {
-				r.logger.Printf("Received nil message, exiting listener")
-				return
+				r.logger.Printf("Received nil Redis message")
+				log.Fatalf("Redis connection lost, exiting to allow systemd restart")
 			}
 
 			r.logger.Printf("Received Redis message: channel=%s payload=%s", msg.Channel, msg.Payload)
