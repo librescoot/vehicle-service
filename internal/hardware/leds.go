@@ -425,6 +425,10 @@ func (l *ImxPwmLed) setActive(ch int, active bool) error {
 	device.lock.Lock()
 	defer device.lock.Unlock()
 
+	return l.setActiveLocked(device, active)
+}
+
+func (l *ImxPwmLed) setActiveLocked(device *LedDevice, active bool) error {
 	var value int
 	if active {
 		value = 1
@@ -466,7 +470,7 @@ func (l *ImxPwmLed) PlayFade(ch int, idx int) error {
 	defer device.lock.Unlock()
 
 	// First ensure the LED is active
-	err := l.setActive(ch, true)
+	err := l.setActiveLocked(device, true)
 	if err != nil {
 		log.Printf("Failed to activate LED %d: %v", ch, err)
 		return err
