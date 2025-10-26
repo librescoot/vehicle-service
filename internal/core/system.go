@@ -847,13 +847,11 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 		v.logger.Printf("Engine brake set to %v during transition (left: %v, right: %v)", brakeLeft || brakeRight, brakeLeft, brakeRight)
 
-		switch oldState {
-		case types.StateParked:
-			v.playLedCue(3, "parked to drive")
-		case types.StateStandby:
-			// We came directly from Standby. The first brake press might have been ignored while
-			// in Standby, so synchronise the current brake lever states now to ensure the rear
-			// light reflects the actual situation and Redis observers get an accurate value.
+		// Always play parked-to-drive cue when entering ready-to-drive
+		v.playLedCue(3, "parked to drive")
+
+		// When coming from standby, synchronize brake states since brake inputs were ignored
+		if oldState == types.StateStandby {
 			brakeLeft, errL := v.io.ReadDigitalInput("brake_left")
 			if errL != nil {
 				v.logger.Printf("Failed to read brake_left after Standby->Ready transition: %v", errL)
@@ -863,7 +861,6 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 				v.logger.Printf("Failed to read brake_right after Standby->Ready transition: %v", errR)
 			}
 
-			// Publish the actual states so that other services get the correct information
 			if err := v.redis.SetBrakeState("left", brakeLeft); err != nil {
 				v.logger.Printf("Warning: failed to publish brake_left state after Standby->Ready transition: %v", err)
 			}
@@ -871,9 +868,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 				v.logger.Printf("Warning: failed to publish brake_right state after Standby->Ready transition: %v", err)
 			}
 
-			// Update the rear-light if at least one lever is pressed
+			// Play brake cue if either brake is pressed
 			if brakeLeft || brakeRight {
-				v.playLedCue(4, "brake off to on after standby->ready")
+				v.playLedCue(4, "brake off to on")
 			}
 		}
 
@@ -951,25 +948,17 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		if forcedStandby {
 			v.logger.Printf("Forced standby: skipping handlebar lock.")
 		} else if isFromParked {
-			// Direct standby transition from Parked (not through shutting-down): lock handlebar
 			v.logger.Printf("Locking handlebar (direct transition from parked)")
 			v.lockHandlebar()
-		}
-		// If shutdown from parked, handlebar locking was already started during StateShuttingDown
-		// If not forced and not from Parked (e.g. Init -> Standby), no specific handlebar lock action here.
 
-		// LED Cues specifically for Parked -> Standby transition.
-		// These are skipped if it's a forced standby that might originate from a different state.
-		if isFromParked {
+			// Play shutdown LED cue (only for direct parked→standby without shutting-down)
 			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 			if err != nil {
 				v.logger.Printf("Failed to read brake_left for standby cue: %v", err)
-				// Continue without returning error, best effort for cues
 			}
 			brakeRight, err := v.io.ReadDigitalInput("brake_right")
 			if err != nil {
 				v.logger.Printf("Failed to read brake_right for standby cue: %v", err)
-				// Continue
 			}
 			brakesPressed := brakeLeft || brakeRight
 
@@ -1021,6 +1010,23 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		// Turn off all outputs
 		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
 			v.logger.Printf("Failed to disable engine power during shutdown: %v", err)
+		}
+
+		// Play shutdown LED cue based on brake state
+		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+		if err != nil {
+			v.logger.Printf("Failed to read brake_left for shutdown cue: %v", err)
+		}
+		brakeRight, err := v.io.ReadDigitalInput("brake_right")
+		if err != nil {
+			v.logger.Printf("Failed to read brake_right for shutdown cue: %v", err)
+		}
+		brakesPressed := brakeLeft || brakeRight
+
+		if brakesPressed {
+			v.playLedCue(8, "parked brake on to standby")
+		} else {
+			v.playLedCue(7, "parked brake off to standby")
 		}
 
 		// Start handlebar locking immediately to give user more time to position handlebar
