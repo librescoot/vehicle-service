@@ -111,6 +111,14 @@ func (v *VehicleSystem) Start() error {
 		// Set initial GPIO values based on saved state
 		v.io.SetInitialValue("dashboard_power", savedState == types.StateReadyToDrive || savedState == types.StateParked)
 		v.io.SetInitialValue("engine_power", savedState == types.StateReadyToDrive)
+
+		// If restoring standby state, set the standby timer for MDB reboot coordination
+		if savedState == types.StateStandby {
+			v.logger.Printf("Restored standby state - setting standby timer start for MDB reboot coordination")
+			if err := v.redis.PublishStandbyTimerStart(); err != nil {
+				v.logger.Printf("Warning: Failed to set standby timer start on restore: %v", err)
+			}
+		}
 	}
 
 	// Reload PWM LED kernel module, log outcomes for diagnostics
