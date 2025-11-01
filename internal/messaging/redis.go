@@ -583,6 +583,15 @@ func (r *RedisClient) SetSeatboxLockState(isLocked bool) error {
 	return nil
 }
 
+func (r *RedisClient) PublishSeatboxOpened() error {
+	r.logger.Infof("Publishing seatbox opened event")
+	if err := r.client.Publish(r.ctx, "vehicle", "seatbox:opened").Err(); err != nil {
+		r.logger.Infof("Failed to publish seatbox opened: %v", err)
+		return err
+	}
+	return nil
+}
+
 func (r *RedisClient) SetKickstandState(isDown bool) error {
 	r.logger.Infof("Setting kickstand state: %v", isDown)
 	state := "up"

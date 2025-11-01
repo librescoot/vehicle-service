@@ -1149,6 +1149,9 @@ func (v *VehicleSystem) Shutdown() {
 func (v *VehicleSystem) handleSeatboxRequest(on bool) error {
 	v.logger.Debugf("Handling seatbox request: %v", on)
 	if on {
+		if err := v.redis.PublishSeatboxOpened(); err != nil {
+			v.logger.Warnf("Failed to publish seatbox opened event: %v", err)
+		}
 		return v.openSeatboxLock()
 	}
 	return nil
