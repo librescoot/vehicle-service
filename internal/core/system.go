@@ -2,7 +2,6 @@ package core
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"vehicle-service/internal/hardware"
+	"vehicle-service/internal/logger"
 	"vehicle-service/internal/messaging"
 	"vehicle-service/internal/types"
 )
@@ -39,7 +39,7 @@ const (
 type VehicleSystem struct {
 	state                  types.SystemState
 	dashboardReady         bool
-	logger                 *log.Logger
+	logger                 *logger.Logger
 	io                     *hardware.LinuxHardwareIO
 	redis                  *messaging.RedisClient
 	mu                     sync.RWMutex
@@ -60,11 +60,11 @@ type VehicleSystem struct {
 	deferredDashboardPower *bool // Deferred dashboard power state (nil = no change needed)
 }
 
-func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
+func NewVehicleSystem(redisHost string, redisPort int, l *logger.Logger) *VehicleSystem {
 	return &VehicleSystem{
 		state:              types.StateInit,
-		logger:             log.New(log.Writer(), "Vehicle: ", log.Flags()),
-		io:                 hardware.NewLinuxHardwareIO(),
+		logger:             l.WithTag("Vehicle"),
+		io:                 hardware.NewLinuxHardwareIO(l.WithTag("Hardware")),
 		redisHost:          redisHost,
 		redisPort:          redisPort,
 		blinkerState:       BlinkerOff,
@@ -76,10 +76,10 @@ func NewVehicleSystem(redisHost string, redisPort int) *VehicleSystem {
 }
 
 func (v *VehicleSystem) Start() error {
-	v.logger.Printf("Starting vehicle system")
+	v.logger.Infof("Starting vehicle system")
 
 	// Initialize Redis client first (but don't start listeners yet)
-	v.redis = messaging.NewRedisClient(v.redisHost, v.redisPort, messaging.Callbacks{
+	v.redis = messaging.NewRedisClient(v.redisHost, v.redisPort, v.logger.WithTag("Redis"), messaging.Callbacks{
 		DashboardCallback: v.handleDashboardReady,
 		KeycardCallback:   v.keycardAuthPassed,
 		SeatboxCallback:   v.handleSeatboxRequest,
@@ -100,10 +100,10 @@ func (v *VehicleSystem) Start() error {
 	// Load initial state from Redis
 	savedState, err := v.redis.GetVehicleState()
 	if err != nil {
-		v.logger.Printf("Failed to get saved state from Redis: %v", err)
+		v.logger.Warnf("Failed to get saved state from Redis: %v", err)
 		// Continue with default state
 	} else if savedState != types.StateInit && savedState != types.StateShuttingDown {
-		v.logger.Printf("Restoring saved state from Redis: %s", savedState)
+		v.logger.Infof("Restoring saved state from Redis: %s", savedState)
 		v.mu.Lock()
 		v.state = savedState
 		v.mu.Unlock()
@@ -114,24 +114,24 @@ func (v *VehicleSystem) Start() error {
 
 		// If restoring standby state, set the standby timer for MDB reboot coordination
 		if savedState == types.StateStandby {
-			v.logger.Printf("Restored standby state - setting standby timer start for MDB reboot coordination")
+			v.logger.Infof("Restored standby state - setting standby timer start for MDB reboot coordination")
 			if err := v.redis.PublishStandbyTimerStart(); err != nil {
-				v.logger.Printf("Warning: Failed to set standby timer start on restore: %v", err)
+				v.logger.Infof("Warning: Failed to set standby timer start on restore: %v", err)
 			}
 		}
 	}
 
 	// Reload PWM LED kernel module, log outcomes for diagnostics
-	v.logger.Printf("Reloading PWM LED kernel module (imx_pwm_led)")
+	v.logger.Debugf("Reloading PWM LED kernel module (imx_pwm_led)")
 	if err := exec.Command("rmmod", "imx_pwm_led").Run(); err != nil {
-		v.logger.Printf("Warning: Failed to remove PWM LED module: %v", err)
+		v.logger.Warnf("Warning: Failed to remove PWM LED module: %v", err)
 	} else {
-		v.logger.Printf("Successfully removed existing imx_pwm_led module (if present)")
+		v.logger.Debugf("Successfully removed existing imx_pwm_led module (if present)")
 	}
 	if err := exec.Command("modprobe", "imx_pwm_led").Run(); err != nil {
 		return fmt.Errorf("failed to load PWM LED module: %w", err)
 	}
-	v.logger.Printf("Successfully inserted imx_pwm_led module, waiting for device nodes")
+	v.logger.Debugf("Successfully inserted imx_pwm_led module, waiting for device nodes")
 
 	// Give udev some time to create /dev/pwm_led* nodes (up to 1s)
 	for i := 0; i < 10; i++ {
@@ -149,13 +149,13 @@ func (v *VehicleSystem) Start() error {
 	// Check initial handlebar lock sensor state
 	handlebarLockSensorRaw, err := v.io.ReadDigitalInput("handlebar_lock_sensor")
 	if err != nil {
-		v.logger.Printf("Warning: Failed to read initial handlebar lock sensor state: %v", err)
+		v.logger.Warnf("Warning: Failed to read initial handlebar lock sensor state: %v", err)
 	} else if !handlebarLockSensorRaw { // Invert the logic: true (pressed) means unlocked, false (released) means locked. We want to know if it's locked initially.
 		v.handlebarUnlocked = false // Sensor is released (false), meaning it's locked
-		v.logger.Printf("Initial state: handlebar is locked")
+		v.logger.Debugf("Initial state: handlebar is locked")
 	} else {
 		v.handlebarUnlocked = true // Sensor is pressed (true), meaning it's unlocked
-		v.logger.Printf("Initial state: handlebar is unlocked")
+		v.logger.Debugf("Initial state: handlebar is unlocked")
 	}
 
 	// Register input callbacks
@@ -165,7 +165,7 @@ func (v *VehicleSystem) Start() error {
 		"handlebar_position", "seatbox_lock_sensor", "48v_detect",
 	}
 
-	v.logger.Printf("Registering input callbacks for %d channels", len(channels))
+	v.logger.Debugf("Registering input callbacks for %d channels", len(channels))
 	for _, ch := range channels {
 		switch ch {
 		case "handlebar_position":
@@ -177,11 +177,11 @@ func (v *VehicleSystem) Start() error {
 		default:
 			v.io.RegisterInputCallback(ch, v.handleInputChange)
 		}
-		v.logger.Printf("Registered callback for channel: %s", ch)
+		v.logger.Debugf("Registered callback for channel: %s", ch)
 	}
 
 	// Publish initial sensor states to Redis
-	v.logger.Printf("Publishing initial sensor states to Redis")
+	v.logger.Debugf("Publishing initial sensor states to Redis")
 	initialSensors := []string{
 		"brake_right", "brake_left", "kickstand",
 		"handlebar_lock_sensor", "seatbox_lock_sensor", "handlebar_position",
@@ -190,10 +190,10 @@ func (v *VehicleSystem) Start() error {
 	for _, sensor := range initialSensors {
 		value, err := v.io.ReadDigitalInput(sensor)
 		if err != nil {
-			v.logger.Printf("Warning: Failed to read initial state for %s: %v", sensor, err)
+			v.logger.Warnf("Warning: Failed to read initial state for %s: %v", sensor, err)
 			continue
 		}
-		v.logger.Printf("Initial state %s: %v", sensor, value)
+		v.logger.Debugf("Initial state %s: %v", sensor, value)
 
 		var redisErr error
 		switch sensor {
@@ -213,7 +213,7 @@ func (v *VehicleSystem) Start() error {
 		}
 
 		if redisErr != nil {
-			v.logger.Printf("Warning: Failed to publish initial state for %s to Redis: %v", sensor, redisErr)
+			v.logger.Warnf("Warning: Failed to publish initial state for %s to Redis: %v", sensor, redisErr)
 		}
 	}
 
@@ -223,12 +223,12 @@ func (v *VehicleSystem) Start() error {
 		// Read brake states to determine which LED cue to play
 		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 		if err != nil {
-			v.logger.Printf("Failed to read brake_left: %v", err)
+			v.logger.Errorf("Failed to read brake_left: %v", err)
 			return err
 		}
 		brakeRight, err := v.io.ReadDigitalInput("brake_right")
 		if err != nil {
-			v.logger.Printf("Failed to read brake_right: %v", err)
+			v.logger.Errorf("Failed to read brake_right: %v", err)
 			return err
 		}
 		brakesPressed := brakeLeft || brakeRight
@@ -255,7 +255,7 @@ func (v *VehicleSystem) Start() error {
 	v.mu.RUnlock()
 	if isReady {
 		if err := v.handleDashboardReady(true); err != nil {
-			v.logger.Printf("Failed to handle initial dashboard ready state: %v", err)
+			v.logger.Warnf("Failed to handle initial dashboard ready state: %v", err)
 		}
 	}
 
@@ -268,10 +268,10 @@ func (v *VehicleSystem) Start() error {
 	currentState := v.state
 	v.mu.RUnlock()
 	if currentState == types.StateInit {
-		v.logger.Printf("Initial state is Init, transitioning to Standby")
+		v.logger.Infof("Initial state is Init, transitioning to Standby")
 		if err := v.transitionTo(types.StateStandby); err != nil {
 			// Log the error but continue startup, as standby is a safe default
-			v.logger.Printf("Warning: failed to transition to Standby from Init: %v", err)
+			v.logger.Warnf("Warning: failed to transition to Standby from Init: %v", err)
 		}
 	}
 
@@ -280,7 +280,7 @@ func (v *VehicleSystem) Start() error {
 		return fmt.Errorf("failed to start Redis listeners: %w", err)
 	}
 
-	v.logger.Printf("System started successfully")
+	v.logger.Infof("System started successfully")
 	return nil
 }
 
@@ -297,27 +297,27 @@ func (v *VehicleSystem) checkHibernationConditions() {
 
 	brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 	if err != nil {
-		v.logger.Printf("Failed to read brake_left for hibernation check: %v", err)
+		v.logger.Errorf("Failed to read brake_left for hibernation check: %v", err)
 		return
 	}
 	brakeRight, err := v.io.ReadDigitalInput("brake_right")
 	if err != nil {
-		v.logger.Printf("Failed to read brake_right for hibernation check: %v", err)
+		v.logger.Errorf("Failed to read brake_right for hibernation check: %v", err)
 		return
 	}
 
 	// If both brakes are pressed in parked state, send hibernation command to pm-service
 	if brakeLeft && brakeRight {
-		v.logger.Printf("Both brakes pressed in PARKED state, sending hibernation command to pm-service")
+		v.logger.Infof("Both brakes pressed in PARKED state, sending hibernation command to pm-service")
 		if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-			v.logger.Printf("Failed to send hibernate command: %v", err)
+			v.logger.Errorf("Failed to send hibernate command: %v", err)
 		}
 	}
 }
 
 // triggerShutdownTimeout handles the shutdown timer expiration and transitions to standby
 func (v *VehicleSystem) triggerShutdownTimeout() {
-	v.logger.Printf("Shutdown timer expired, transitioning to standby...")
+	v.logger.Debugf("Shutdown timer expired, transitioning to standby...")
 
 	v.mu.RLock()
 	hibernationRequested := v.hibernationRequest
@@ -325,15 +325,15 @@ func (v *VehicleSystem) triggerShutdownTimeout() {
 
 	// Transition to standby
 	if err := v.transitionTo(types.StateStandby); err != nil {
-		v.logger.Printf("Failed to transition to standby after shutdown timeout: %v", err)
+		v.logger.Errorf("Failed to transition to standby after shutdown timeout: %v", err)
 		return
 	}
 
 	// If hibernation was requested, execute it after the state transition
 	if hibernationRequested {
-		v.logger.Printf("Hibernation was requested, executing hibernation...")
+		v.logger.Infof("Hibernation was requested, executing hibernation...")
 		if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-			v.logger.Printf("Failed to send hibernate command after shutdown: %v", err)
+			v.logger.Errorf("Failed to send hibernate command after shutdown: %v", err)
 		}
 	}
 
@@ -345,11 +345,11 @@ func (v *VehicleSystem) triggerShutdownTimeout() {
 }
 
 func (v *VehicleSystem) handleDashboardReady(ready bool) error {
-	v.logger.Printf("Handling dashboard ready state: %v", ready)
+	v.logger.Debugf("Handling dashboard ready state: %v", ready)
 
 	// Skip state transitions during initialization
 	if !v.initialized {
-		v.logger.Printf("Skipping dashboard ready handling - system not yet initialized")
+		v.logger.Debugf("Skipping dashboard ready handling - system not yet initialized")
 		v.mu.Lock()
 		v.dashboardReady = ready
 		v.mu.Unlock()
@@ -361,10 +361,10 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 	currentState := v.state
 	v.mu.Unlock()
 
-	v.logger.Printf("Current state: %s, Dashboard ready: %v", currentState, ready)
+	v.logger.Debugf("Current state: %s, Dashboard ready: %v", currentState, ready)
 
 	if !ready && currentState == types.StateReadyToDrive {
-		v.logger.Printf("Dashboard not ready, transitioning to PARKED")
+		v.logger.Infof("Dashboard not ready, transitioning to PARKED")
 		return v.transitionTo(types.StateParked)
 	}
 
@@ -372,22 +372,22 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 	if ready {
 		// Don't process kickstand state in STANDBY or SHUTTING_DOWN states
 		if currentState == types.StateStandby || currentState == types.StateShuttingDown {
-			v.logger.Printf("Skipping kickstand check in %s state", currentState)
+			v.logger.Debugf("Skipping kickstand check in %s state", currentState)
 			return nil
 		}
 
 		kickstandValue, err := v.io.ReadDigitalInput("kickstand")
 		if err != nil {
-			v.logger.Printf("Failed to read kickstand: %v", err)
+			v.logger.Errorf("Failed to read kickstand: %v", err)
 			return err
 		}
 
-		v.logger.Printf("Kickstand state: %v", kickstandValue)
+		v.logger.Debugf("Kickstand state: %v", kickstandValue)
 		if !kickstandValue && v.isReadyToDrive() {
-			v.logger.Printf("Dashboard ready and kickstand up, transitioning to READY_TO_DRIVE")
+			v.logger.Infof("Dashboard ready and kickstand up, transitioning to READY_TO_DRIVE")
 			return v.transitionTo(types.StateReadyToDrive)
 		} else if kickstandValue {
-			v.logger.Printf("Kickstand down, staying in/transitioning to PARKED")
+			v.logger.Debugf("Kickstand down, staying in/transitioning to PARKED")
 			return v.transitionTo(types.StateParked)
 		}
 	}
@@ -396,7 +396,7 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 }
 
 func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
-	v.logger.Printf("Input %s => %v", channel, value)
+	v.logger.Debugf("Input %s => %v", channel, value)
 
 	// Publish button event via PUBSUB for immediate response in UI
 	// This happens regardless of vehicle state, letting the UI decide what to do with it
@@ -427,7 +427,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 	if shouldPublish {
 		if err := v.redis.PublishButtonEvent(buttonEvent); err != nil {
-			v.logger.Printf("Warning: Failed to publish button event: %v", err)
+			v.logger.Warnf("Warning: Failed to publish button event: %v", err)
 			// Continue with normal processing even if PUBSUB fails
 		}
 	}
@@ -442,7 +442,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		switch channel {
 		case "horn_button", "seatbox_button", "brake_right", "brake_left",
 			"blinker_right", "blinker_left":
-			v.logger.Printf("Ignoring %s in standby state", channel)
+			v.logger.Debugf("Ignoring %s in standby state", channel)
 			return nil
 		}
 	}
@@ -458,7 +458,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			// Check if kickstand is up
 			kickstandValue, err := v.io.ReadDigitalInput("kickstand")
 			if err != nil {
-				v.logger.Printf("Failed to read kickstand: %v", err)
+				v.logger.Errorf("Failed to read kickstand: %v", err)
 				return err
 			}
 
@@ -466,17 +466,17 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 				// Check if both brakes are held
 				brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 				if err != nil {
-					v.logger.Printf("Failed to read brake_left: %v", err)
+					v.logger.Errorf("Failed to read brake_left: %v", err)
 					return err
 				}
 				brakeRight, err := v.io.ReadDigitalInput("brake_right")
 				if err != nil {
-					v.logger.Printf("Failed to read brake_right: %v", err)
+					v.logger.Errorf("Failed to read brake_right: %v", err)
 					return err
 				}
 
 				if brakeLeft && brakeRight {
-					v.logger.Printf("Manual ready-to-drive activation: kickstand up, both brakes held, seatbox button pressed")
+					v.logger.Infof("Manual ready-to-drive activation: kickstand up, both brakes held, seatbox button pressed")
 
 					// Blink the main light once for confirmation
 					v.playLedCue(3, "parked to drive")
@@ -496,9 +496,9 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		return v.redis.SetHornButton(value)
 
 	case "kickstand":
-		v.logger.Printf("Kickstand changed: %v, current state: %s", value, currentState)
+		v.logger.Debugf("Kickstand changed: %v, current state: %s", value, currentState)
 		if currentState == types.StateStandby {
-			v.logger.Printf("Ignoring kickstand change in %s state", currentState)
+			v.logger.Debugf("Ignoring kickstand change in %s state", currentState)
 			return nil
 		}
 		if err := v.redis.SetKickstandState(value); err != nil {
@@ -506,11 +506,11 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		}
 		if value {
 			// Kickstand down - always go to PARKED
-			v.logger.Printf("Kickstand down, transitioning to PARKED")
+			v.logger.Infof("Kickstand down, transitioning to PARKED")
 			return v.transitionTo(types.StateParked)
 		} else if v.isReadyToDrive() {
 			// Kickstand up and dashboard ready - go to READY_TO_DRIVE
-			v.logger.Printf("Kickstand up and dashboard ready, transitioning to READY_TO_DRIVE")
+			v.logger.Infof("Kickstand up and dashboard ready, transitioning to READY_TO_DRIVE")
 			return v.transitionTo(types.StateReadyToDrive)
 		}
 
@@ -619,12 +619,12 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		// Also publish the button event directly via PUBSUB for immediate handling
 		if channel == "blinker_right" {
 			if err := v.redis.PublishButtonEvent("blinker:right:off"); err != nil {
-				v.logger.Printf("Failed to publish blinker right button event: %v", err)
+				v.logger.Warnf("Failed to publish blinker right button event: %v", err)
 				// Continue with normal processing even if PUBSUB fails
 			}
 		} else {
 			if err := v.redis.PublishButtonEvent("blinker:left:off"); err != nil {
-				v.logger.Printf("Failed to publish blinker left button event: %v", err)
+				v.logger.Warnf("Failed to publish blinker left button event: %v", err)
 				// Continue with normal processing even if PUBSUB fails
 			}
 		}
@@ -640,7 +640,7 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 
 		// Publish button press event via PUBSUB for immediate handling
 		if err := v.redis.PublishButtonEvent("blinker:right:on"); err != nil {
-			v.logger.Printf("Failed to publish blinker right button event: %v", err)
+			v.logger.Warnf("Failed to publish blinker right button event: %v", err)
 			// Continue with normal processing even if PUBSUB fails
 		}
 	} else {
@@ -650,7 +650,7 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 
 		// Publish button press event via PUBSUB for immediate handling
 		if err := v.redis.PublishButtonEvent("blinker:left:on"); err != nil {
-			v.logger.Printf("Failed to publish blinker left button event: %v", err)
+			v.logger.Warnf("Failed to publish blinker left button event: %v", err)
 			// Continue with normal processing even if PUBSUB fails
 		}
 	}
@@ -670,10 +670,10 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}) {
 	// Trigger first blink immediately
 	if err := v.io.PlayPwmCue(cue); err != nil {
-		v.logger.Printf("Error playing blinker cue: %v", err)
+		v.logger.Errorf("Error playing blinker cue: %v", err)
 	}
 	if err := v.redis.SetBlinkerState(state); err != nil {
-		v.logger.Printf("Error updating blinker state: %v", err)
+		v.logger.Errorf("Error updating blinker state: %v", err)
 	}
 
 	ticker := time.NewTicker(blinkerInterval)
@@ -685,27 +685,27 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}
 			return
 		case <-ticker.C:
 			if err := v.io.PlayPwmCue(cue); err != nil {
-				v.logger.Printf("Error playing blinker cue: %v", err)
+				v.logger.Errorf("Error playing blinker cue: %v", err)
 			}
 			if err := v.redis.SetBlinkerState(state); err != nil {
-				v.logger.Printf("Error updating blinker state: %v", err)
+				v.logger.Errorf("Error updating blinker state: %v", err)
 			}
 		}
 	}
 }
 
 func (v *VehicleSystem) keycardAuthPassed() error {
-	v.logger.Printf("Processing keycard authentication tap")
+	v.logger.Debugf("Processing keycard authentication tap")
 
 	// --- Force Standby Check ---
 	brakeLeft, errL := v.io.ReadDigitalInput("brake_left")
 	if errL != nil {
-		v.logger.Printf("Warning: Failed to read brake_left for keycard auth, assuming not pressed: %v", errL)
+		v.logger.Warnf("Warning: Failed to read brake_left for keycard auth, assuming not pressed: %v", errL)
 		brakeLeft = false
 	}
 	brakeRight, errR := v.io.ReadDigitalInput("brake_right")
 	if errR != nil {
-		v.logger.Printf("Warning: Failed to read brake_right for keycard auth, assuming not pressed: %v", errR)
+		v.logger.Warnf("Warning: Failed to read brake_right for keycard auth, assuming not pressed: %v", errR)
 		brakeRight = false
 	}
 	brakePressed := brakeLeft || brakeRight
@@ -716,27 +716,27 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	v.mu.Lock()
 	if v.lastKeycardTapTime.IsZero() || currentTime.Sub(v.lastKeycardTapTime) > keycardTapMaxInterval {
 		v.keycardTapCount = 1
-		v.logger.Printf("Keycard tap sequence: Start/Reset. Count: 1")
+		v.logger.Debugf("Keycard tap sequence: Start/Reset. Count: 1")
 	} else {
 		v.keycardTapCount++
-		v.logger.Printf("Keycard tap sequence: Incremented. Count: %d", v.keycardTapCount)
+		v.logger.Debugf("Keycard tap sequence: Incremented. Count: %d", v.keycardTapCount)
 	}
 	v.lastKeycardTapTime = currentTime
 
 	if v.keycardTapCount >= keycardForceStandbyTaps {
 		if brakePressed {
-			v.logger.Printf("Force standby condition met: %d taps, brake pressed.", v.keycardTapCount)
+			v.logger.Infof("Force standby condition met: %d taps, brake pressed.", v.keycardTapCount)
 			v.forceStandbyNoLock = true
 			performForcedStandby = true
 		} else {
-			v.logger.Printf("Force standby condition NOT met: %d taps, but brake not pressed. Resetting count.", v.keycardTapCount)
+			v.logger.Debugf("Force standby condition NOT met: %d taps, but brake not pressed. Resetting count.", v.keycardTapCount)
 		}
 		v.keycardTapCount = 0 // Reset after 3 taps, regardless of brake, for the next sequence
 	}
 	v.mu.Unlock()
 
 	if performForcedStandby {
-		v.logger.Printf("Transitioning to SHUTTING_DOWN (forced, no lock).")
+		v.logger.Infof("Transitioning to SHUTTING_DOWN (forced, no lock).")
 		// The forceStandbyNoLock flag will be read and reset by transitionTo when transitioning to standby
 		return v.transitionTo(types.StateShuttingDown)
 	}
@@ -747,13 +747,13 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	currentState := v.state
 	v.mu.RUnlock()
 
-	v.logger.Printf("Current state during keycard auth (normal flow): %s", currentState)
+	v.logger.Debugf("Current state during keycard auth (normal flow): %s", currentState)
 
 	if currentState == types.StateStandby {
-		v.logger.Printf("Reading kickstand state")
+		v.logger.Debugf("Reading kickstand state")
 		kickstandValue, err := v.io.ReadDigitalInput("kickstand")
 		if err != nil {
-			v.logger.Printf("Failed to read kickstand: %v", err)
+			v.logger.Errorf("Failed to read kickstand: %v", err)
 			return fmt.Errorf("failed to read kickstand: %w", err)
 		}
 
@@ -761,22 +761,22 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 		if kickstandValue {
 			newState = types.StateParked
 		}
-		v.logger.Printf("Transitioning from STANDBY to %s (kickstand=%v)", newState, kickstandValue)
+		v.logger.Infof("Transitioning from STANDBY to %s (kickstand=%v)", newState, kickstandValue)
 		return v.transitionTo(newState)
 	}
 
 	// Check kickstand before going to STANDBY
 	kickstandValue, err := v.io.ReadDigitalInput("kickstand")
 	if err != nil {
-		v.logger.Printf("Failed to read kickstand: %v", err)
+		v.logger.Errorf("Failed to read kickstand: %v", err)
 		return fmt.Errorf("failed to read kickstand: %w", err)
 	}
 	if !kickstandValue {
-		v.logger.Printf("Cannot transition to STANDBY: kickstand not down")
+		v.logger.Warnf("Cannot transition to STANDBY: kickstand not down")
 		return fmt.Errorf("cannot transition to STANDBY: kickstand not down")
 	}
 
-	v.logger.Printf("Transitioning to SHUTTING_DOWN from %s", currentState)
+	v.logger.Infof("Transitioning to SHUTTING_DOWN from %s", currentState)
 	if err := v.transitionTo(types.StateShuttingDown); err != nil {
 		return err
 	}
@@ -793,7 +793,7 @@ func (v *VehicleSystem) isReadyToDrive() bool {
 func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 	v.mu.Lock()
 	if newState == v.state {
-		v.logger.Printf("State transition skipped - already in state %s", newState)
+		v.logger.Debugf("State transition skipped - already in state %s", newState)
 		v.mu.Unlock()
 		return nil
 	}
@@ -805,20 +805,20 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	// Request CPU governor change when leaving standby
 	if oldState == types.StateStandby && newState != types.StateStandby {
-		v.logger.Printf("Leaving Standby: Requesting CPU governor change to ondemand")
+		v.logger.Debugf("Leaving Standby: Requesting CPU governor change to ondemand")
 		if err := v.redis.SendCommand("scooter:governor", "ondemand"); err != nil {
-			v.logger.Printf("Warning: Failed to request CPU governor change to ondemand: %v", err)
+			v.logger.Warnf("Warning: Failed to request CPU governor change to ondemand: %v", err)
 		}
 	}
 
-	v.logger.Printf("State transition: %s -> %s", oldState, newState)
+	v.logger.Infof("State transition: %s -> %s", oldState, newState)
 
 	if err := v.publishState(); err != nil {
-		v.logger.Printf("Failed to publish state: %v", err)
+		v.logger.Errorf("Failed to publish state: %v", err)
 		return fmt.Errorf("failed to publish state: %w", err)
 	}
 
-	v.logger.Printf("Applying state transition effects for %s", newState)
+	v.logger.Debugf("Applying state transition effects for %s", newState)
 	switch newState {
 
 	case types.StateReadyToDrive:
@@ -827,33 +827,33 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 		if err := v.io.WriteDigitalOutput("engine_power", true); err != nil {
-			v.logger.Printf("Failed to enable engine power: %v", err)
+			v.logger.Errorf("Failed to enable engine power: %v", err)
 			return err
 		}
-		v.logger.Printf("Engine power enabled")
+		v.logger.Debugf("Engine power enabled")
 
 		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-			v.logger.Printf("Failed to enable dashboard power: %v", err)
+			v.logger.Errorf("Failed to enable dashboard power: %v", err)
 			return err
 		}
-		v.logger.Printf("Dashboard power enabled")
+		v.logger.Debugf("Dashboard power enabled")
 
 		// Check current brake state and set engine brake pin accordingly
 		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 		if err != nil {
-			v.logger.Printf("Failed to read brake_left during transition: %v", err)
+			v.logger.Errorf("Failed to read brake_left during transition: %v", err)
 			return err
 		}
 		brakeRight, err := v.io.ReadDigitalInput("brake_right")
 		if err != nil {
-			v.logger.Printf("Failed to read brake_right during transition: %v", err)
+			v.logger.Errorf("Failed to read brake_right during transition: %v", err)
 			return err
 		}
 		if err := v.io.WriteDigitalOutput("engine_brake", brakeLeft || brakeRight); err != nil {
-			v.logger.Printf("Failed to set engine brake during transition: %v", err)
+			v.logger.Errorf("Failed to set engine brake during transition: %v", err)
 			return err
 		}
-		v.logger.Printf("Engine brake set to %v during transition (left: %v, right: %v)", brakeLeft || brakeRight, brakeLeft, brakeRight)
+		v.logger.Debugf("Engine brake set to %v during transition (left: %v, right: %v)", brakeLeft || brakeRight, brakeLeft, brakeRight)
 
 		// Always play parked-to-drive cue when entering ready-to-drive
 		v.playLedCue(3, "parked to drive")
@@ -862,18 +862,18 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		if oldState == types.StateStandby {
 			brakeLeft, errL := v.io.ReadDigitalInput("brake_left")
 			if errL != nil {
-				v.logger.Printf("Failed to read brake_left after Standby->Ready transition: %v", errL)
+				v.logger.Errorf("Failed to read brake_left after Standby->Ready transition: %v", errL)
 			}
 			brakeRight, errR := v.io.ReadDigitalInput("brake_right")
 			if errR != nil {
-				v.logger.Printf("Failed to read brake_right after Standby->Ready transition: %v", errR)
+				v.logger.Errorf("Failed to read brake_right after Standby->Ready transition: %v", errR)
 			}
 
 			if err := v.redis.SetBrakeState("left", brakeLeft); err != nil {
-				v.logger.Printf("Warning: failed to publish brake_left state after Standby->Ready transition: %v", err)
+				v.logger.Warnf("Warning: failed to publish brake_left state after Standby->Ready transition: %v", err)
 			}
 			if err := v.redis.SetBrakeState("right", brakeRight); err != nil {
-				v.logger.Printf("Warning: failed to publish brake_right state after Standby->Ready transition: %v", err)
+				v.logger.Warnf("Warning: failed to publish brake_right state after Standby->Ready transition: %v", err)
 			}
 
 			// Play brake cue if either brake is pressed
@@ -888,16 +888,16 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
-			v.logger.Printf("Failed to disable engine power: %v", err)
+			v.logger.Errorf("Failed to disable engine power: %v", err)
 			return err
 		}
-		v.logger.Printf("Engine power disabled")
+		v.logger.Debugf("Engine power disabled")
 
 		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-			v.logger.Printf("Failed to enable dashboard power: %v", err)
+			v.logger.Errorf("Failed to enable dashboard power: %v", err)
 			return err
 		}
-		v.logger.Printf("Dashboard power enabled")
+		v.logger.Debugf("Dashboard power enabled")
 
 		if oldState == types.StateReadyToDrive {
 			v.playLedCue(6, "drive to parked")
@@ -906,12 +906,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		if oldState == types.StateStandby {
 			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 			if err != nil {
-				v.logger.Printf("Failed to read brake_left: %v", err)
+				v.logger.Errorf("Failed to read brake_left: %v", err)
 				return err
 			}
 			brakeRight, err := v.io.ReadDigitalInput("brake_right")
 			if err != nil {
-				v.logger.Printf("Failed to read brake_right: %v", err)
+				v.logger.Errorf("Failed to read brake_right: %v", err)
 				return err
 			}
 			brakesPressed := brakeLeft || brakeRight
@@ -936,9 +936,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		v.mu.Unlock()
 
 		// Track standby entry time for MDB reboot timer (3-minute requirement)
-		v.logger.Printf("Setting standby timer start for MDB reboot coordination")
+		v.logger.Debugf("Setting standby timer start for MDB reboot coordination")
 		if err := v.redis.PublishStandbyTimerStart(); err != nil {
-			v.logger.Printf("Warning: Failed to set standby timer start: %v", err)
+			v.logger.Warnf("Warning: Failed to set standby timer start: %v", err)
 			// Not critical for state transition
 		}
 
@@ -948,25 +948,25 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		// Delete dashboard ready flag if coming from parked or drive states
 		if isFromParked || isFromDrive {
 			if err := v.redis.DeleteDashboardReadyFlag(); err != nil {
-				v.logger.Printf("Warning: Failed to delete dashboard ready flag: %v", err)
+				v.logger.Warnf("Warning: Failed to delete dashboard ready flag: %v", err)
 				// Not returning an error here as it's not critical for state transition
 			}
 		}
 
 		if forcedStandby {
-			v.logger.Printf("Forced standby: skipping handlebar lock.")
+			v.logger.Debugf("Forced standby: skipping handlebar lock.")
 		} else if isFromParked {
-			v.logger.Printf("Locking handlebar (direct transition from parked)")
+			v.logger.Infof("Locking handlebar (direct transition from parked)")
 			v.lockHandlebar()
 
 			// Play shutdown LED cue (only for direct parked→standby without shutting-down)
 			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 			if err != nil {
-				v.logger.Printf("Failed to read brake_left for standby cue: %v", err)
+				v.logger.Infof("Failed to read brake_left for standby cue: %v", err)
 			}
 			brakeRight, err := v.io.ReadDigitalInput("brake_right")
 			if err != nil {
-				v.logger.Printf("Failed to read brake_right for standby cue: %v", err)
+				v.logger.Infof("Failed to read brake_right for standby cue: %v", err)
 			}
 			brakesPressed := brakeLeft || brakeRight
 
@@ -980,18 +980,18 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		// Turn off dashboard power when entering standby, unless DBC update is in progress
 		v.mu.Lock()
 		if v.dbcUpdating {
-			v.logger.Printf("DBC update in progress, deferring dashboard power OFF until update completes")
+			v.logger.Debugf("DBC update in progress, deferring dashboard power OFF until update completes")
 			powerOff := false
 			v.deferredDashboardPower = &powerOff
 			v.mu.Unlock()
 		} else {
 			v.mu.Unlock()
 			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-				v.logger.Printf("Failed to disable dashboard power: %v", err)
+				v.logger.Errorf("Failed to disable dashboard power: %v", err)
 				// Consider if this error should halt the transition or just be logged.
 				// For now, logging and continuing to ensure other shutdown steps occur.
 			} else {
-				v.logger.Printf("Dashboard power disabled")
+				v.logger.Debugf("Dashboard power disabled")
 			}
 		}
 
@@ -999,14 +999,14 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		v.playLedCue(0, "all off")
 
 	case types.StateShuttingDown:
-		v.logger.Printf("Entering shutting down state from %s", oldState)
+		v.logger.Infof("Entering shutting down state from %s", oldState)
 
 		// Track if we're coming from parked state
 		if oldState == types.StateParked {
 			v.mu.Lock()
 			v.shutdownFromParked = true
 			v.mu.Unlock()
-			v.logger.Printf("Shutdown initiated from parked state")
+			v.logger.Debugf("Shutdown initiated from parked state")
 		}
 
 		// Stop any existing shutdown timer
@@ -1017,17 +1017,17 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 		// Turn off all outputs
 		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
-			v.logger.Printf("Failed to disable engine power during shutdown: %v", err)
+			v.logger.Errorf("Failed to disable engine power during shutdown: %v", err)
 		}
 
 		// Play shutdown LED cue based on brake state
 		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 		if err != nil {
-			v.logger.Printf("Failed to read brake_left for shutdown cue: %v", err)
+			v.logger.Infof("Failed to read brake_left for shutdown cue: %v", err)
 		}
 		brakeRight, err := v.io.ReadDigitalInput("brake_right")
 		if err != nil {
-			v.logger.Printf("Failed to read brake_right for shutdown cue: %v", err)
+			v.logger.Infof("Failed to read brake_right for shutdown cue: %v", err)
 		}
 		brakesPressed := brakeLeft || brakeRight
 
@@ -1039,7 +1039,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 		// Start handlebar locking immediately to give user more time to position handlebar
 		if oldState == types.StateParked {
-			v.logger.Printf("Starting handlebar locking during shutdown (from parked state)")
+			v.logger.Debugf("Starting handlebar locking during shutdown (from parked state)")
 			v.lockHandlebar()
 		}
 
@@ -1047,11 +1047,11 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		// The timer will handle transitioning to standby and turning off dashboard power
 
 		v.shutdownTimer = time.AfterFunc(shutdownTimerDuration, v.triggerShutdownTimeout)
-		v.logger.Printf("Started shutdown timer (3.5s)")
+		v.logger.Infof("Started shutdown timer (3.5s)")
 
 	}
 
-	v.logger.Printf("State transition completed successfully")
+	v.logger.Debugf("State transition completed successfully")
 	return nil
 }
 
@@ -1070,7 +1070,7 @@ func (v *VehicleSystem) pulseOutput(name string, duration time.Duration) error {
 // playLedCue plays an LED cue and logs any errors with context
 func (v *VehicleSystem) playLedCue(cue int, description string) {
 	if err := v.io.PlayPwmCue(cue); err != nil {
-		v.logger.Printf("Failed to play LED cue %d (%s): %v", cue, description, err)
+		v.logger.Infof("Failed to play LED cue %d (%s): %v", cue, description, err)
 	}
 }
 
@@ -1079,7 +1079,7 @@ func (v *VehicleSystem) playLedCue(cue int, description string) {
 func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
 	// Cancel any ongoing handlebar locking attempt when returning to active state
 	if v.handlebarTimer != nil {
-		v.logger.Printf("Cancelling handlebar locking timer")
+		v.logger.Infof("Cancelling handlebar locking timer")
 		v.handlebarTimer.Stop()
 		v.handlebarTimer = nil
 		// Restore original handlebar position callback
@@ -1089,12 +1089,12 @@ func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
 	// Check if handlebar needs to be unlocked
 	handlebarPos, err := v.io.ReadDigitalInput("handlebar_position")
 	if err != nil {
-		v.logger.Printf("Failed to read handlebar position: %v", err)
+		v.logger.Infof("Failed to read handlebar position: %v", err)
 		return err
 	}
 	if handlebarPos && !v.handlebarUnlocked {
 		if err := v.unlockHandlebar(); err != nil {
-			v.logger.Printf("Failed to unlock handlebar: %v", err)
+			v.logger.Infof("Failed to unlock handlebar: %v", err)
 			return err
 		}
 	}
@@ -1105,7 +1105,7 @@ func (v *VehicleSystem) openSeatboxLock() error {
 	if err := v.pulseOutput("seatbox_lock", seatboxLockDuration); err != nil {
 		return err
 	}
-	v.logger.Printf("Seatbox lock toggled for 0.2s")
+	v.logger.Infof("Seatbox lock toggled for 0.2s")
 	return nil
 }
 
@@ -1114,7 +1114,7 @@ func (v *VehicleSystem) publishState() error {
 	state := v.state
 	v.mu.RUnlock()
 
-	v.logger.Printf("Publishing state to Redis: %s", state)
+	v.logger.Debugf("Publishing state to Redis: %s", state)
 	if err := v.redis.PublishVehicleState(state); err != nil {
 		return err
 	}
@@ -1147,7 +1147,7 @@ func (v *VehicleSystem) Shutdown() {
 }
 
 func (v *VehicleSystem) handleSeatboxRequest(on bool) error {
-	v.logger.Printf("Handling seatbox request: %v", on)
+	v.logger.Debugf("Handling seatbox request: %v", on)
 	if on {
 		return v.openSeatboxLock()
 	}
@@ -1155,12 +1155,12 @@ func (v *VehicleSystem) handleSeatboxRequest(on bool) error {
 }
 
 func (v *VehicleSystem) handleHornRequest(on bool) error {
-	v.logger.Printf("Handling horn request: %v", on)
+	v.logger.Debugf("Handling horn request: %v", on)
 	return v.io.WriteDigitalOutput("horn", on)
 }
 
 func (v *VehicleSystem) handleBlinkerRequest(state string) error {
-	v.logger.Printf("Handling blinker request: %s", state)
+	v.logger.Debugf("Handling blinker request: %s", state)
 
 	// Stop any existing blinker routine
 	if v.blinkerStopChan != nil {
@@ -1205,23 +1205,23 @@ func (v *VehicleSystem) lockHandlebar() {
 	go func() {
 		handlebarPos, err := v.io.ReadDigitalInput("handlebar_position")
 		if err != nil {
-			v.logger.Printf("Failed to read handlebar position: %v", err)
+			v.logger.Errorf("Failed to read handlebar position: %v", err)
 			return
 		}
 
 		if handlebarPos {
 			// Handlebar is in position, lock it immediately
 			if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
-				v.logger.Printf("Failed to lock handlebar: %v", err)
+				v.logger.Infof("Failed to lock handlebar: %v", err)
 				return
 			}
-			v.logger.Printf("Handlebar locked")
+			v.logger.Infof("Handlebar locked")
 
 			// Reset unlock state after successful lock
 			v.mu.Lock()
 			v.handlebarUnlocked = false
 			v.mu.Unlock()
-			v.logger.Printf("Reset handlebar unlock state after successful lock")
+			v.logger.Debugf("Reset handlebar unlock state after successful lock")
 			return
 		}
 
@@ -1236,7 +1236,7 @@ func (v *VehicleSystem) lockHandlebar() {
 			v.handlebarTimer = nil
 			// Re-register the original handlebar position callback
 			v.io.RegisterInputCallback("handlebar_position", v.handleHandlebarPosition)
-			v.logger.Printf("Restored original handlebar position callback")
+			v.logger.Debugf("Restored original handlebar position callback")
 		}
 
 		// Register temporary callback for handlebar position during lock window
@@ -1247,7 +1247,7 @@ func (v *VehicleSystem) lockHandlebar() {
 
 			// Check if we're still in the window
 			if v.handlebarTimer == nil {
-				v.logger.Printf("Lock window has expired")
+				v.logger.Debugf("Lock window has expired")
 				return nil
 			}
 
@@ -1257,28 +1257,28 @@ func (v *VehicleSystem) lockHandlebar() {
 			// Lock the handlebar
 			if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
 				cleanup()
-				v.logger.Printf("Failed to lock handlebar: %v", err)
+				v.logger.Infof("Failed to lock handlebar: %v", err)
 				return err
 			}
-			v.logger.Printf("Handlebar locked")
+			v.logger.Infof("Handlebar locked")
 
 			// Reset unlock state after successful lock
 			v.mu.Lock()
 			v.handlebarUnlocked = false
 			v.mu.Unlock()
-			v.logger.Printf("Reset handlebar unlock state after successful lock")
+			v.logger.Debugf("Reset handlebar unlock state after successful lock")
 
 			// Restore original callback
 			cleanup()
 			return nil
 		})
 
-		v.logger.Printf("Started 10 second window for handlebar lock")
+		v.logger.Debugf("Started 10 second window for handlebar lock")
 
 		// Wait for timer expiration
 		<-v.handlebarTimer.C
 		cleanup()
-		v.logger.Printf("Handlebar lock window expired")
+		v.logger.Debugf("Handlebar lock window expired")
 	}()
 }
 
@@ -1287,7 +1287,7 @@ func (v *VehicleSystem) unlockHandlebar() error {
 		return fmt.Errorf("failed to unlock handlebar: %w", err)
 	}
 	v.handlebarUnlocked = true
-	v.logger.Printf("Handlebar unlocked")
+	v.logger.Infof("Handlebar unlocked")
 	return nil
 }
 
@@ -1310,7 +1310,7 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 }
 
 func (v *VehicleSystem) handleStateRequest(state string) error {
-	v.logger.Printf("Handling state request: %s", state)
+	v.logger.Debugf("Handling state request: %s", state)
 	v.mu.RLock()
 	currentState := v.state
 	v.mu.RUnlock()
@@ -1319,7 +1319,7 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 	case "unlock":
 		kickstandValue, err := v.io.ReadDigitalInput("kickstand")
 		if err != nil {
-			v.logger.Printf("Failed to read kickstand: %v", err)
+			v.logger.Errorf("Failed to read kickstand: %v", err)
 			if currentState == types.StateStandby {
 				return v.transitionTo(types.StateParked)
 			} else {
@@ -1338,14 +1338,14 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 		}
 	case "lock":
 		if currentState == types.StateParked {
-			v.logger.Printf("Transitioning to SHUTTING_DOWN")
+			v.logger.Infof("Transitioning to SHUTTING_DOWN")
 			return v.transitionTo(types.StateShuttingDown)
 		} else {
 			return fmt.Errorf("vehicle must be parked to lock")
 		}
 	case "lock-hibernate":
 		if currentState == types.StateParked {
-			v.logger.Printf("Transitioning to SHUTTING_DOWN for lock-hibernate")
+			v.logger.Infof("Transitioning to SHUTTING_DOWN for lock-hibernate")
 			v.mu.Lock()
 			v.hibernationRequest = true // Set hibernation request for lock-hibernate
 			v.mu.Unlock()
@@ -1354,7 +1354,7 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 			}
 
 			if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-				v.logger.Printf("Failed to send hibernate command: %v", err)
+				v.logger.Errorf("Failed to send hibernate command: %v", err)
 			}
 			return nil
 		} else {
@@ -1366,12 +1366,12 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 }
 
 func (v *VehicleSystem) handleLedCueRequest(cueIndex int) error {
-	v.logger.Printf("Handling LED cue request: %d", cueIndex)
+	v.logger.Debugf("Handling LED cue request: %d", cueIndex)
 	return v.io.PlayPwmCue(cueIndex)
 }
 
 func (v *VehicleSystem) handleLedFadeRequest(ledChannel int, fadeIndex int) error {
-	v.logger.Printf("Handling LED fade request: channel=%d, index=%d", ledChannel, fadeIndex)
+	v.logger.Debugf("Handling LED fade request: channel=%d, index=%d", ledChannel, fadeIndex)
 	return v.io.PlayPwmFade(ledChannel, fadeIndex)
 }
 
@@ -1383,33 +1383,33 @@ func (v *VehicleSystem) handleForceLockRequest() error {
 	v.mu.Unlock()
 
 	// Always transition to STANDBY, the dbcUpdating flag is checked in the transition function
-	v.logger.Printf("Handling force-lock request: transitioning to STANDBY (no lock).")
+	v.logger.Infof("Handling force-lock request: transitioning to STANDBY (no lock).")
 	return v.transitionTo(types.StateStandby)
 }
 
 // handleUpdateRequest handles update requests from the update-service
 func (v *VehicleSystem) handleUpdateRequest(action string) error {
-	v.logger.Printf("Handling update request: %s", action)
+	v.logger.Debugf("Handling update request: %s", action)
 
 	switch action {
 	case "start":
-		v.logger.Printf("Starting update process")
+		v.logger.Infof("Starting update process")
 		return nil
 
 	case "start-dbc":
-		v.logger.Printf("Starting DBC update process")
+		v.logger.Infof("Starting DBC update process")
 		v.mu.Lock()
 		v.dbcUpdating = true
 		v.mu.Unlock()
 		// Ensure dashboard is powered on
 		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-			v.logger.Printf("Failed to enable dashboard power for DBC update: %v", err)
+			v.logger.Errorf("Failed to enable dashboard power for DBC update: %v", err)
 			return err
 		}
 		return nil
 
 	case "complete-dbc":
-		v.logger.Printf("DBC update process complete")
+		v.logger.Infof("DBC update process complete")
 		v.mu.Lock()
 		v.dbcUpdating = false
 		deferredPower := v.deferredDashboardPower
@@ -1420,48 +1420,48 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		// Apply any deferred dashboard power state
 		if deferredPower != nil {
 			if *deferredPower {
-				v.logger.Printf("Applying deferred dashboard power: ON")
+				v.logger.Debugf("Applying deferred dashboard power: ON")
 				if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-					v.logger.Printf("Failed to enable deferred dashboard power: %v", err)
+					v.logger.Errorf("Failed to enable deferred dashboard power: %v", err)
 					return err
 				}
 			} else {
-				v.logger.Printf("Applying deferred dashboard power: OFF")
+				v.logger.Debugf("Applying deferred dashboard power: OFF")
 				if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-					v.logger.Printf("Failed to disable deferred dashboard power: %v", err)
+					v.logger.Errorf("Failed to disable deferred dashboard power: %v", err)
 					return err
 				}
 			}
 		} else if currentState == types.StateStandby {
 			// No deferred power state, but we're in standby - turn off dashboard power
-			v.logger.Printf("DBC update complete and in standby state - turning off dashboard power")
+			v.logger.Debugf("DBC update complete and in standby state - turning off dashboard power")
 			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-				v.logger.Printf("Failed to disable dashboard power: %v", err)
+				v.logger.Errorf("Failed to disable dashboard power: %v", err)
 				return err
 			}
 		}
 		return nil
 
 	case "complete":
-		v.logger.Printf("Update process complete")
+		v.logger.Infof("Update process complete")
 		return nil
 
 	case "cycle-dashboard-power":
 		// Cycle dashboard power to reboot the DBC
-		v.logger.Printf("Cycling dashboard power to reboot DBC")
+		v.logger.Infof("Cycling dashboard power to reboot DBC")
 
 		// Turn off dashboard power
 		if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-			v.logger.Printf("Failed to disable dashboard power: %v", err)
+			v.logger.Errorf("Failed to disable dashboard power: %v", err)
 			return err
 		}
 		time.Sleep(1 * time.Second)
 		// Turn dashboard power back on
 		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-			v.logger.Printf("Failed to re-enable dashboard power: %v", err)
+			v.logger.Errorf("Failed to re-enable dashboard power: %v", err)
 			return err
 		}
-		v.logger.Printf("Dashboard power cycled successfully")
+		v.logger.Infof("Dashboard power cycled successfully")
 		return nil
 
 	default:
@@ -1471,21 +1471,21 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 
 // EnableDashboardForUpdate turns on the dashboard without entering ready-to-drive state
 func (v *VehicleSystem) EnableDashboardForUpdate() error {
-	v.logger.Printf("Enabling dashboard for update")
+	v.logger.Debugf("Enabling dashboard for update")
 
 	// Turn on dashboard power
 	if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-		v.logger.Printf("Failed to enable dashboard power: %v", err)
+		v.logger.Errorf("Failed to enable dashboard power: %v", err)
 		return err
 	}
 
-	v.logger.Printf("Dashboard power enabled for update")
+	v.logger.Infof("Dashboard power enabled for update")
 	return nil
 }
 
 // handleHardwareRequest processes hardware power control commands
 func (v *VehicleSystem) handleHardwareRequest(command string) error {
-	v.logger.Printf("Handling hardware request: %s", command)
+	v.logger.Debugf("Handling hardware request: %s", command)
 
 	parts := strings.Split(command, ":")
 	if len(parts) != 2 {
@@ -1500,16 +1500,16 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 		switch action {
 		case "on":
 			if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-				v.logger.Printf("Failed to enable dashboard power: %v", err)
+				v.logger.Errorf("Failed to enable dashboard power: %v", err)
 				return err
 			}
-			v.logger.Printf("Dashboard power enabled")
+			v.logger.Infof("Dashboard power enabled")
 		case "off":
 			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-				v.logger.Printf("Failed to disable dashboard power: %v", err)
+				v.logger.Errorf("Failed to disable dashboard power: %v", err)
 				return err
 			}
-			v.logger.Printf("Dashboard power disabled")
+			v.logger.Infof("Dashboard power disabled")
 		default:
 			return fmt.Errorf("invalid dashboard action: %s", action)
 		}
@@ -1517,16 +1517,16 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 		switch action {
 		case "on":
 			if err := v.io.WriteDigitalOutput("engine_power", true); err != nil {
-				v.logger.Printf("Failed to enable engine power: %v", err)
+				v.logger.Errorf("Failed to enable engine power: %v", err)
 				return err
 			}
-			v.logger.Printf("Engine power enabled")
+			v.logger.Infof("Engine power enabled")
 		case "off":
 			if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
-				v.logger.Printf("Failed to disable engine power: %v", err)
+				v.logger.Errorf("Failed to disable engine power: %v", err)
 				return err
 			}
-			v.logger.Printf("Engine power disabled")
+			v.logger.Infof("Engine power disabled")
 		default:
 			return fmt.Errorf("invalid engine action: %s", action)
 		}
@@ -1534,17 +1534,17 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 		switch action {
 		case "lock":
 			if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
-				v.logger.Printf("Failed to lock handlebar: %v", err)
+				v.logger.Infof("Failed to lock handlebar: %v", err)
 				return err
 			}
-			v.logger.Printf("Handlebar lock activated")
+			v.logger.Infof("Handlebar lock activated")
 		case "unlock":
 			if err := v.pulseOutput("handlebar_lock_open", handlebarLockDuration); err != nil {
-				v.logger.Printf("Failed to unlock handlebar: %v", err)
+				v.logger.Infof("Failed to unlock handlebar: %v", err)
 				return err
 			}
 			v.handlebarUnlocked = true
-			v.logger.Printf("Handlebar unlock activated")
+			v.logger.Infof("Handlebar unlock activated")
 		default:
 			return fmt.Errorf("invalid handlebar action: %s", action)
 		}

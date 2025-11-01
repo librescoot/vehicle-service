@@ -1,35 +1,50 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"vehicle-service/internal/core"
+	"vehicle-service/internal/logger"
 )
 
 func main() {
-	// Disable timestamps when running under systemd (which adds its own)
+	// Service log level
+	var serviceLogLevel int
+	flag.IntVar(&serviceLogLevel, "log", 3, "Service log level (0=NONE, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG)")
+
+	flag.Parse()
+
+	// Create standard logger with appropriate format
+	var stdLogger *log.Logger
 	if os.Getenv("INVOCATION_ID") != "" {
-		log.SetFlags(0)
+		// Running under systemd, use minimal format
+		stdLogger = log.New(os.Stdout, "", 0)
 	} else {
-		log.SetFlags(log.LstdFlags)
+		// Running interactively, use timestamps
+		stdLogger = log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds|log.Lmsgprefix)
 	}
-	log.Printf("Starting vehicle service...")
 
-	system := core.NewVehicleSystem("127.0.0.1", 6379)
+	// Create leveled logger
+	l := logger.NewLogger(stdLogger, logger.LogLevel(serviceLogLevel))
+
+	l.Infof("Starting vehicle service...")
+
+	system := core.NewVehicleSystem("127.0.0.1", 6379, l)
 	if err := system.Start(); err != nil {
-		log.Fatalf("Failed to start system: %v", err)
+		l.Fatalf("Failed to start system: %v", err)
 	}
 
-	log.Printf("System started successfully")
+	l.Infof("System started successfully")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	sig := <-sigChan
-	log.Printf("Received signal %v, shutting down...", sig)
+	l.Infof("Received signal %v, shutting down...", sig)
 	system.Shutdown()
-	log.Printf("Shutdown complete")
+	l.Infof("Shutdown complete")
 }

@@ -3,12 +3,13 @@ package hardware
 import (
 	"encoding/binary"
 	"fmt"
-	"log"
 	"os"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
+
+	"vehicle-service/internal/logger"
 
 	"github.com/warthog618/go-gpiocdev"
 )
@@ -41,7 +42,7 @@ type InputEvent struct {
 type InputCallback func(channel string, value bool) error
 
 type LinuxHardwareIO struct {
-	logger          *log.Logger
+	logger          *logger.Logger
 	inputDevicePath string
 	inputFile       *os.File
 	chips           map[int]*gpiocdev.Chip
@@ -54,9 +55,9 @@ type LinuxHardwareIO struct {
 	initialValues   map[string]bool // Initial values for outputs
 }
 
-func NewLinuxHardwareIO() *LinuxHardwareIO {
+func NewLinuxHardwareIO(l *logger.Logger) *LinuxHardwareIO {
 	return &LinuxHardwareIO{
-		logger:          log.New(log.Writer(), "HardwareIO: ", log.Flags()),
+		logger:          l,
 		inputDevicePath: GpioKeysInput,
 		chips:           make(map[int]*gpiocdev.Chip),
 		lines:           make(map[string]*gpiocdev.Line),
@@ -74,7 +75,7 @@ func (io *LinuxHardwareIO) SetInitialValue(name string, value bool) {
 }
 
 func (io *LinuxHardwareIO) Initialize() error {
-	io.logger.Printf("Initializing hardware IO")
+	io.logger.Infof("Initializing hardware IO")
 
 	// Initialize PWM LED
 	io.pwmLed = NewImxPwmLed()
@@ -108,21 +109,21 @@ func (io *LinuxHardwareIO) Initialize() error {
 		}
 
 		io.lines[name] = line
-		io.logger.Printf("Configured DO %s: chip=%d, line=%d", name, mapping.Chip, mapping.Line)
+		io.logger.Infof("Configured DO %s: chip=%d, line=%d", name, mapping.Chip, mapping.Line)
 	}
 
 	// Open input device
-	io.logger.Printf("Opening input device: %s", io.inputDevicePath)
+	io.logger.Infof("Opening input device: %s", io.inputDevicePath)
 	var err error
 	io.inputFile, err = os.OpenFile(io.inputDevicePath, os.O_RDONLY, 0)
 	if err != nil {
 		return fmt.Errorf("failed to open input device %s: %w", io.inputDevicePath, err)
 	}
-	io.logger.Printf("Successfully opened input device")
+	io.logger.Infof("Successfully opened input device")
 
 	// Get initial state of all inputs
 	if err := io.readInitialState(); err != nil {
-		io.logger.Printf("Warning: Failed to read initial input states: %v", err)
+		io.logger.Infof("Warning: Failed to read initial input states: %v", err)
 	}
 
 	// Start input monitoring
@@ -162,7 +163,7 @@ func (io *LinuxHardwareIO) readInitialState() error {
 			io.activeKeys[code] = isPressed
 			if isPressed {
 				channel := io.mapKeycode(code)
-				io.logger.Printf("Initial state: %s (code %d) is pressed", channel, code)
+				io.logger.Infof("Initial state: %s (code %d) is pressed", channel, code)
 			}
 		}
 	}
@@ -174,22 +175,22 @@ func (io *LinuxHardwareIO) monitorInputs() {
 	defer io.inputFile.Close()
 
 	buffer := make([]byte, 16)
-	io.logger.Printf("Starting input event monitoring with buffer size: %d", len(buffer))
+	io.logger.Infof("Starting input event monitoring with buffer size: %d", len(buffer))
 
 	for {
 		select {
 		case <-io.stopChan:
-			io.logger.Printf("Stopping input monitoring")
+			io.logger.Infof("Stopping input monitoring")
 			return
 		default:
 			n, err := io.inputFile.Read(buffer)
 			if err != nil {
-				io.logger.Printf("Error reading input: %v", err)
+				io.logger.Infof("Error reading input: %v", err)
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 			if n != len(buffer) {
-				io.logger.Printf("Incomplete read: got %d bytes, expected %d", n, len(buffer))
+				io.logger.Infof("Incomplete read: got %d bytes, expected %d", n, len(buffer))
 				continue
 			}
 
@@ -199,7 +200,7 @@ func (io *LinuxHardwareIO) monitorInputs() {
 			code := binary.LittleEndian.Uint16(buffer[10:12])
 			val := int32(binary.LittleEndian.Uint32(buffer[12:16]))
 
-			io.logger.Printf("Event: type=%d code=%d value=%d time=%d.%d",
+			io.logger.Infof("Event: type=%d code=%d value=%d time=%d.%d",
 				typ, code, val, sec, usec)
 
 			if typ == EV_KEY {
@@ -217,28 +218,28 @@ func (io *LinuxHardwareIO) monitorInputs() {
 
 func (io *LinuxHardwareIO) handleKeyEvent(event *InputEvent) {
 	channel := io.mapKeycode(event.Code)
-	io.logger.Printf("Key event: code=%d channel=%q value=%d",
+	io.logger.Infof("Key event: code=%d channel=%q value=%d",
 		event.Code, channel, event.Value)
 
 	// Update active keys map
 	io.mu.Lock()
 	if event.Value == 0 {
 		delete(io.activeKeys, event.Code)
-		io.logger.Printf("Key released: code=%d", event.Code)
+		io.logger.Infof("Key released: code=%d", event.Code)
 	} else {
 		io.activeKeys[event.Code] = true
-		io.logger.Printf("Key pressed: code=%d", event.Code)
+		io.logger.Infof("Key pressed: code=%d", event.Code)
 	}
 	io.mu.Unlock()
 
 	// Only process key press (1) and release (0)
 	if event.Value > 1 {
-		io.logger.Printf("Ignoring repeat event")
+		io.logger.Infof("Ignoring repeat event")
 		return
 	}
 
 	if channel == "" {
-		io.logger.Printf("Unknown key code: %d", event.Code)
+		io.logger.Infof("Unknown key code: %d", event.Code)
 		return
 	}
 
@@ -247,13 +248,13 @@ func (io *LinuxHardwareIO) handleKeyEvent(event *InputEvent) {
 	io.mu.RUnlock()
 
 	if exists {
-		io.logger.Printf("Executing callback for channel %s (value=%v)",
+		io.logger.Infof("Executing callback for channel %s (value=%v)",
 			channel, event.Value == 1)
 		if err := callback(channel, event.Value == 1); err != nil {
-			io.logger.Printf("Error in callback for %s: %v", channel, err)
+			io.logger.Infof("Error in callback for %s: %v", channel, err)
 		}
 	} else {
-		io.logger.Printf("No callback registered for channel: %s", channel)
+		io.logger.Infof("No callback registered for channel: %s", channel)
 	}
 }
 
@@ -302,7 +303,7 @@ func (io *LinuxHardwareIO) ReadDigitalInput(channel string) (bool, error) {
 	state := io.activeKeys[keycode]
 	io.mu.RUnlock()
 
-	io.logger.Printf("Reading digital input for channel %s (keycode %d) -> %v (cached)", channel, keycode, state)
+	io.logger.Infof("Reading digital input for channel %s (keycode %d) -> %v (cached)", channel, keycode, state)
 	return state, nil
 }
 
@@ -339,7 +340,7 @@ func (io *LinuxHardwareIO) RegisterInputCallback(channel string, callback InputC
 	io.mu.Lock()
 	defer io.mu.Unlock()
 	io.inputCallbacks[channel] = callback
-	io.logger.Printf("Registered callback for channel: %s", channel)
+	io.logger.Infof("Registered callback for channel: %s", channel)
 }
 
 func (io *LinuxHardwareIO) WriteDigitalOutput(channel string, value bool) error {
@@ -360,7 +361,7 @@ func (io *LinuxHardwareIO) WriteDigitalOutput(channel string, value bool) error 
 		return fmt.Errorf("failed to set DO %s=%v: %w", channel, value, err)
 	}
 
-	io.logger.Printf("Set DO %s=%v", channel, value)
+	io.logger.Infof("Set DO %s=%v", channel, value)
 	return nil
 }
 
@@ -378,7 +379,7 @@ func (io *LinuxHardwareIO) Cleanup() {
 	// First close the input file descriptor to interrupt any blocked Read() calls
 	if io.inputFile != nil {
 		io.inputFile.Close()
-		io.logger.Printf("Closed input device file descriptor")
+		io.logger.Infof("Closed input device file descriptor")
 	}
 
 	// Short delay to allow goroutine to process the error and exit
@@ -387,22 +388,22 @@ func (io *LinuxHardwareIO) Cleanup() {
 	io.mu.Lock()
 	defer io.mu.Unlock()
 
-	io.logger.Printf("Cleaning up hardware resources")
+	io.logger.Infof("Cleaning up hardware resources")
 
 	for name, line := range io.lines {
 		line.Close()
-		io.logger.Printf("Closed GPIO line for %s", name)
+		io.logger.Infof("Closed GPIO line for %s", name)
 	}
 
 	for id, chip := range io.chips {
 		chip.Close()
-		io.logger.Printf("Closed GPIO chip %d", id)
+		io.logger.Infof("Closed GPIO chip %d", id)
 	}
 
 	if io.pwmLed != nil {
 		io.pwmLed.Cleanup()
-		io.logger.Printf("Cleaned up PWM LED")
+		io.logger.Infof("Cleaned up PWM LED")
 	}
 
-	io.logger.Printf("Hardware cleanup complete")
+	io.logger.Infof("Hardware cleanup complete")
 }
