@@ -221,14 +221,9 @@ func (v *VehicleSystem) Start() error {
 	switch savedState {
 	case types.StateReadyToDrive, types.StateParked:
 		// Read brake states to determine which LED cue to play
-		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+		brakeLeft, brakeRight, err := v.readBrakeStates()
 		if err != nil {
-			v.logger.Errorf("Failed to read brake_left: %v", err)
-			return err
-		}
-		brakeRight, err := v.io.ReadDigitalInput("brake_right")
-		if err != nil {
-			v.logger.Errorf("Failed to read brake_right: %v", err)
+			v.logger.Errorf("%v", err)
 			return err
 		}
 		brakesPressed := brakeLeft || brakeRight
@@ -284,6 +279,19 @@ func (v *VehicleSystem) Start() error {
 	return nil
 }
 
+// readBrakeStates reads both brake lever states and returns them
+func (v *VehicleSystem) readBrakeStates() (left, right bool, err error) {
+	left, err = v.io.ReadDigitalInput("brake_left")
+	if err != nil {
+		return false, false, fmt.Errorf("failed to read brake_left: %w", err)
+	}
+	right, err = v.io.ReadDigitalInput("brake_right")
+	if err != nil {
+		return false, false, fmt.Errorf("failed to read brake_right: %w", err)
+	}
+	return left, right, nil
+}
+
 // checkHibernationConditions checks if hibernation should be triggered and sends command to pm-service
 func (v *VehicleSystem) checkHibernationConditions() {
 	v.mu.RLock()
@@ -295,14 +303,9 @@ func (v *VehicleSystem) checkHibernationConditions() {
 		return
 	}
 
-	brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+	brakeLeft, brakeRight, err := v.readBrakeStates()
 	if err != nil {
-		v.logger.Errorf("Failed to read brake_left for hibernation check: %v", err)
-		return
-	}
-	brakeRight, err := v.io.ReadDigitalInput("brake_right")
-	if err != nil {
-		v.logger.Errorf("Failed to read brake_right for hibernation check: %v", err)
+		v.logger.Errorf("Hibernation check: %v", err)
 		return
 	}
 
@@ -464,14 +467,9 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 			if !kickstandValue {
 				// Check if both brakes are held
-				brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+				brakeLeft, brakeRight, err := v.readBrakeStates()
 				if err != nil {
-					v.logger.Errorf("Failed to read brake_left: %v", err)
-					return err
-				}
-				brakeRight, err := v.io.ReadDigitalInput("brake_right")
-				if err != nil {
-					v.logger.Errorf("Failed to read brake_right: %v", err)
+					v.logger.Errorf("%v", err)
 					return err
 				}
 
@@ -543,13 +541,9 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 		if inDriveMode {
 			// Check if either brake is pressed after this change
-			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+			brakeLeft, brakeRight, err := v.readBrakeStates()
 			if err != nil {
-				return fmt.Errorf("failed to read brake_left: %w", err)
-			}
-			brakeRight, err := v.io.ReadDigitalInput("brake_right")
-			if err != nil {
-				return fmt.Errorf("failed to read brake_right: %w", err)
+				return err
 			}
 
 			// Enable engine brake if either brake is pressed, disable if both are released
@@ -698,15 +692,10 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	v.logger.Debugf("Processing keycard authentication tap")
 
 	// --- Force Standby Check ---
-	brakeLeft, errL := v.io.ReadDigitalInput("brake_left")
-	if errL != nil {
-		v.logger.Warnf("Warning: Failed to read brake_left for keycard auth, assuming not pressed: %v", errL)
-		brakeLeft = false
-	}
-	brakeRight, errR := v.io.ReadDigitalInput("brake_right")
-	if errR != nil {
-		v.logger.Warnf("Warning: Failed to read brake_right for keycard auth, assuming not pressed: %v", errR)
-		brakeRight = false
+	brakeLeft, brakeRight, err := v.readBrakeStates()
+	if err != nil {
+		v.logger.Warnf("Warning: %v for keycard auth, assuming not pressed", err)
+		brakeLeft, brakeRight = false, false
 	}
 	brakePressed := brakeLeft || brakeRight
 
@@ -839,14 +828,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		v.logger.Debugf("Dashboard power enabled")
 
 		// Check current brake state and set engine brake pin accordingly
-		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+		brakeLeft, brakeRight, err := v.readBrakeStates()
 		if err != nil {
-			v.logger.Errorf("Failed to read brake_left during transition: %v", err)
-			return err
-		}
-		brakeRight, err := v.io.ReadDigitalInput("brake_right")
-		if err != nil {
-			v.logger.Errorf("Failed to read brake_right during transition: %v", err)
+			v.logger.Errorf("%v during transition", err)
 			return err
 		}
 		if err := v.io.WriteDigitalOutput("engine_brake", brakeLeft || brakeRight); err != nil {
@@ -860,13 +844,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 		// When coming from standby, synchronize brake states since brake inputs were ignored
 		if oldState == types.StateStandby {
-			brakeLeft, errL := v.io.ReadDigitalInput("brake_left")
-			if errL != nil {
-				v.logger.Errorf("Failed to read brake_left after Standby->Ready transition: %v", errL)
-			}
-			brakeRight, errR := v.io.ReadDigitalInput("brake_right")
-			if errR != nil {
-				v.logger.Errorf("Failed to read brake_right after Standby->Ready transition: %v", errR)
+			brakeLeft, brakeRight, err := v.readBrakeStates()
+			if err != nil {
+				v.logger.Errorf("%v after Standby->Ready transition", err)
 			}
 
 			if err := v.redis.SetBrakeState("left", brakeLeft); err != nil {
@@ -904,14 +884,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 		if oldState == types.StateStandby {
-			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+			brakeLeft, brakeRight, err := v.readBrakeStates()
 			if err != nil {
-				v.logger.Errorf("Failed to read brake_left: %v", err)
-				return err
-			}
-			brakeRight, err := v.io.ReadDigitalInput("brake_right")
-			if err != nil {
-				v.logger.Errorf("Failed to read brake_right: %v", err)
+				v.logger.Errorf("%v", err)
 				return err
 			}
 			brakesPressed := brakeLeft || brakeRight
@@ -965,13 +940,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			v.lockHandlebar()
 
 			// Play shutdown LED cue (only for direct parked→standby without shutting-down)
-			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+			brakeLeft, brakeRight, err := v.readBrakeStates()
 			if err != nil {
-				v.logger.Infof("Failed to read brake_left for standby cue: %v", err)
-			}
-			brakeRight, err := v.io.ReadDigitalInput("brake_right")
-			if err != nil {
-				v.logger.Infof("Failed to read brake_right for standby cue: %v", err)
+				v.logger.Infof("%v for standby cue", err)
 			}
 			brakesPressed := brakeLeft || brakeRight
 
@@ -1026,13 +997,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 		// Play shutdown LED cue based on brake state
-		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+		brakeLeft, brakeRight, err := v.readBrakeStates()
 		if err != nil {
-			v.logger.Infof("Failed to read brake_left for shutdown cue: %v", err)
-		}
-		brakeRight, err := v.io.ReadDigitalInput("brake_right")
-		if err != nil {
-			v.logger.Infof("Failed to read brake_right for shutdown cue: %v", err)
+			v.logger.Infof("%v for shutdown cue", err)
 		}
 		brakesPressed := brakeLeft || brakeRight
 
