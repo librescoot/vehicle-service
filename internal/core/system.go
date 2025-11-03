@@ -182,12 +182,18 @@ func (v *VehicleSystem) Start() error {
 
 	// Publish initial sensor states to Redis
 	v.logger.Debugf("Publishing initial sensor states to Redis")
-	initialSensors := []string{
-		"brake_right", "brake_left", "kickstand",
-		"handlebar_lock_sensor", "seatbox_lock_sensor", "handlebar_position",
-		// "48v_detect", // Add if a corresponding Redis key/method exists
+
+	// Map sensors to their Redis publisher functions
+	sensorPublishers := map[string]func(bool) error{
+		"brake_right":           func(val bool) error { return v.redis.SetBrakeState("right", val) },
+		"brake_left":            func(val bool) error { return v.redis.SetBrakeState("left", val) },
+		"kickstand":             v.redis.SetKickstandState,
+		"handlebar_lock_sensor": func(val bool) error { return v.redis.SetHandlebarLockState(!val) }, // Invert: sensor true = unlocked, Redis true = locked
+		"seatbox_lock_sensor":   v.redis.SetSeatboxLockState,
+		"handlebar_position":    v.redis.SetHandlebarPosition,
 	}
-	for _, sensor := range initialSensors {
+
+	for sensor, publisher := range sensorPublishers {
 		value, err := v.io.ReadDigitalInput(sensor)
 		if err != nil {
 			v.logger.Warnf("Warning: Failed to read initial state for %s: %v", sensor, err)
@@ -195,25 +201,8 @@ func (v *VehicleSystem) Start() error {
 		}
 		v.logger.Debugf("Initial state %s: %v", sensor, value)
 
-		var redisErr error
-		switch sensor {
-		case "brake_right":
-			redisErr = v.redis.SetBrakeState("right", value)
-		case "brake_left":
-			redisErr = v.redis.SetBrakeState("left", value)
-		case "kickstand":
-			redisErr = v.redis.SetKickstandState(value)
-		case "handlebar_lock_sensor":
-			isLocked := !value // Invert logic: sensor true (pressed) = unlocked, Redis true = locked
-			redisErr = v.redis.SetHandlebarLockState(isLocked)
-		case "seatbox_lock_sensor":
-			redisErr = v.redis.SetSeatboxLockState(value)
-		case "handlebar_position":
-			redisErr = v.redis.SetHandlebarPosition(value)
-		}
-
-		if redisErr != nil {
-			v.logger.Warnf("Warning: Failed to publish initial state for %s to Redis: %v", sensor, redisErr)
+		if err := publisher(value); err != nil {
+			v.logger.Warnf("Warning: Failed to publish initial state for %s to Redis: %v", sensor, err)
 		}
 	}
 
