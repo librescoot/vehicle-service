@@ -259,10 +259,7 @@ func (v *VehicleSystem) Start() error {
 	}
 
 	// If we are still in Init state after initialization, transition to Standby
-	v.mu.RLock()
-	currentState := v.state
-	v.mu.RUnlock()
-	if currentState == types.StateInit {
+	if v.getCurrentState() == types.StateInit {
 		v.logger.Infof("Initial state is Init, transitioning to Standby")
 		if err := v.transitionTo(types.StateStandby); err != nil {
 			// Log the error but continue startup, as standby is a safe default
@@ -310,14 +307,17 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 	return nil
 }
 
+// getCurrentState returns the current system state in a thread-safe manner
+func (v *VehicleSystem) getCurrentState() types.SystemState {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.state
+}
+
 // checkHibernationConditions checks if hibernation should be triggered and sends command to pm-service
 func (v *VehicleSystem) checkHibernationConditions() {
-	v.mu.RLock()
-	currentState := v.state
-	v.mu.RUnlock()
-
 	// Only check hibernation conditions in parked state
-	if currentState != types.StateParked {
+	if v.getCurrentState() != types.StateParked {
 		return
 	}
 
@@ -454,9 +454,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 	}
 
 	// First check if we should handle this input in current state
-	v.mu.RLock()
-	currentState := v.state
-	v.mu.RUnlock()
+	currentState := v.getCurrentState()
 
 	// Handle inputs that should only work when not in standby
 	if currentState == types.StateStandby {
@@ -750,9 +748,7 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	// --- End Force Standby Check ---
 
 	// ----- Original keycardAuthPassed logic continues if not forced standby -----
-	v.mu.RLock()
-	currentState := v.state
-	v.mu.RUnlock()
+	currentState := v.getCurrentState()
 
 	v.logger.Debugf("Current state during keycard auth (normal flow): %s", currentState)
 
@@ -1092,9 +1088,7 @@ func (v *VehicleSystem) openSeatboxLock() error {
 }
 
 func (v *VehicleSystem) publishState() error {
-	v.mu.RLock()
-	state := v.state
-	v.mu.RUnlock()
+	state := v.getCurrentState()
 
 	v.logger.Debugf("Publishing state to Redis: %s", state)
 	if err := v.redis.PublishVehicleState(state); err != nil {
@@ -1281,8 +1275,8 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 		return nil // Only care about activation
 	}
 
+	state := v.getCurrentState()
 	v.mu.RLock()
-	state := v.state
 	unlocked := v.handlebarUnlocked
 	v.mu.RUnlock()
 
@@ -1296,9 +1290,7 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 
 func (v *VehicleSystem) handleStateRequest(state string) error {
 	v.logger.Debugf("Handling state request: %s", state)
-	v.mu.RLock()
-	currentState := v.state
-	v.mu.RUnlock()
+	currentState := v.getCurrentState()
 
 	switch state {
 	case "unlock":
