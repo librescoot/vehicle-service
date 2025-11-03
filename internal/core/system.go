@@ -292,6 +292,24 @@ func (v *VehicleSystem) readBrakeStates() (left, right bool, err error) {
 	return left, right, nil
 }
 
+// setPower controls a power output (dashboard_power or engine_power) with consistent logging
+func (v *VehicleSystem) setPower(component string, enabled bool) error {
+	if err := v.io.WriteDigitalOutput(component, enabled); err != nil {
+		action := "enable"
+		if !enabled {
+			action = "disable"
+		}
+		return fmt.Errorf("failed to %s %s: %w", action, component, err)
+	}
+
+	state := "enabled"
+	if !enabled {
+		state = "disabled"
+	}
+	v.logger.Debugf("%s %s", component, state)
+	return nil
+}
+
 // checkHibernationConditions checks if hibernation should be triggered and sends command to pm-service
 func (v *VehicleSystem) checkHibernationConditions() {
 	v.mu.RLock()
@@ -815,17 +833,15 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			return err
 		}
 
-		if err := v.io.WriteDigitalOutput("engine_power", true); err != nil {
-			v.logger.Errorf("Failed to enable engine power: %v", err)
+		if err := v.setPower("engine_power", true); err != nil {
+			v.logger.Errorf("%v", err)
 			return err
 		}
-		v.logger.Debugf("Engine power enabled")
 
-		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-			v.logger.Errorf("Failed to enable dashboard power: %v", err)
+		if err := v.setPower("dashboard_power", true); err != nil {
+			v.logger.Errorf("%v", err)
 			return err
 		}
-		v.logger.Debugf("Dashboard power enabled")
 
 		// Check current brake state and set engine brake pin accordingly
 		brakeLeft, brakeRight, err := v.readBrakeStates()
@@ -867,17 +883,15 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			return err
 		}
 
-		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
-			v.logger.Errorf("Failed to disable engine power: %v", err)
+		if err := v.setPower("engine_power", false); err != nil {
+			v.logger.Errorf("%v", err)
 			return err
 		}
-		v.logger.Debugf("Engine power disabled")
 
-		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-			v.logger.Errorf("Failed to enable dashboard power: %v", err)
+		if err := v.setPower("dashboard_power", true); err != nil {
+			v.logger.Errorf("%v", err)
 			return err
 		}
-		v.logger.Debugf("Dashboard power enabled")
 
 		if oldState == types.StateReadyToDrive {
 			v.playLedCue(6, "drive to parked")
@@ -962,12 +976,8 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			v.mu.Unlock()
 		} else {
 			v.mu.Unlock()
-			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-				v.logger.Errorf("Failed to disable dashboard power: %v", err)
-				// Consider if this error should halt the transition or just be logged.
-				// For now, logging and continuing to ensure other shutdown steps occur.
-			} else {
-				v.logger.Debugf("Dashboard power disabled")
+			if err := v.setPower("dashboard_power", false); err != nil {
+				v.logger.Errorf("%v", err)
 			}
 		}
 
@@ -992,8 +1002,8 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 		// Turn off all outputs
-		if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
-			v.logger.Errorf("Failed to disable engine power during shutdown: %v", err)
+		if err := v.setPower("engine_power", false); err != nil {
+			v.logger.Errorf("%v during shutdown", err)
 		}
 
 		// Play shutdown LED cue based on brake state
@@ -1377,8 +1387,8 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.dbcUpdating = true
 		v.mu.Unlock()
 		// Ensure dashboard is powered on
-		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-			v.logger.Errorf("Failed to enable dashboard power for DBC update: %v", err)
+		if err := v.setPower("dashboard_power", true); err != nil {
+			v.logger.Errorf("%v for DBC update", err)
 			return err
 		}
 		return nil
@@ -1396,22 +1406,22 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		if deferredPower != nil {
 			if *deferredPower {
 				v.logger.Debugf("Applying deferred dashboard power: ON")
-				if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-					v.logger.Errorf("Failed to enable deferred dashboard power: %v", err)
+				if err := v.setPower("dashboard_power", true); err != nil {
+					v.logger.Errorf("%v (deferred)", err)
 					return err
 				}
 			} else {
 				v.logger.Debugf("Applying deferred dashboard power: OFF")
-				if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-					v.logger.Errorf("Failed to disable deferred dashboard power: %v", err)
+				if err := v.setPower("dashboard_power", false); err != nil {
+					v.logger.Errorf("%v (deferred)", err)
 					return err
 				}
 			}
 		} else if currentState == types.StateStandby {
 			// No deferred power state, but we're in standby - turn off dashboard power
 			v.logger.Debugf("DBC update complete and in standby state - turning off dashboard power")
-			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-				v.logger.Errorf("Failed to disable dashboard power: %v", err)
+			if err := v.setPower("dashboard_power", false); err != nil {
+				v.logger.Errorf("%v", err)
 				return err
 			}
 		}
@@ -1426,14 +1436,14 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.logger.Infof("Cycling dashboard power to reboot DBC")
 
 		// Turn off dashboard power
-		if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-			v.logger.Errorf("Failed to disable dashboard power: %v", err)
+		if err := v.setPower("dashboard_power", false); err != nil {
+			v.logger.Errorf("%v", err)
 			return err
 		}
 		time.Sleep(1 * time.Second)
 		// Turn dashboard power back on
-		if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-			v.logger.Errorf("Failed to re-enable dashboard power: %v", err)
+		if err := v.setPower("dashboard_power", true); err != nil {
+			v.logger.Errorf("%v", err)
 			return err
 		}
 		v.logger.Infof("Dashboard power cycled successfully")
@@ -1449,8 +1459,8 @@ func (v *VehicleSystem) EnableDashboardForUpdate() error {
 	v.logger.Debugf("Enabling dashboard for update")
 
 	// Turn on dashboard power
-	if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-		v.logger.Errorf("Failed to enable dashboard power: %v", err)
+	if err := v.setPower("dashboard_power", true); err != nil {
+		v.logger.Errorf("%v for update", err)
 		return err
 	}
 
@@ -1474,14 +1484,14 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 	case "dashboard":
 		switch action {
 		case "on":
-			if err := v.io.WriteDigitalOutput("dashboard_power", true); err != nil {
-				v.logger.Errorf("Failed to enable dashboard power: %v", err)
+			if err := v.setPower("dashboard_power", true); err != nil {
+				v.logger.Errorf("%v", err)
 				return err
 			}
 			v.logger.Infof("Dashboard power enabled")
 		case "off":
-			if err := v.io.WriteDigitalOutput("dashboard_power", false); err != nil {
-				v.logger.Errorf("Failed to disable dashboard power: %v", err)
+			if err := v.setPower("dashboard_power", false); err != nil {
+				v.logger.Errorf("%v", err)
 				return err
 			}
 			v.logger.Infof("Dashboard power disabled")
@@ -1491,14 +1501,14 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 	case "engine":
 		switch action {
 		case "on":
-			if err := v.io.WriteDigitalOutput("engine_power", true); err != nil {
-				v.logger.Errorf("Failed to enable engine power: %v", err)
+			if err := v.setPower("engine_power", true); err != nil {
+				v.logger.Errorf("%v", err)
 				return err
 			}
 			v.logger.Infof("Engine power enabled")
 		case "off":
-			if err := v.io.WriteDigitalOutput("engine_power", false); err != nil {
-				v.logger.Errorf("Failed to disable engine power: %v", err)
+			if err := v.setPower("engine_power", false); err != nil {
+				v.logger.Errorf("%v", err)
 				return err
 			}
 			v.logger.Infof("Engine power disabled")
