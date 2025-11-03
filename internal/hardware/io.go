@@ -25,6 +25,7 @@ const (
 	KEY_E = 18 // kickstand
 	KEY_F = 33 // blinker_right
 	KEY_G = 34 // blinker_left
+	KEY_H = 35 // ecu_power
 	KEY_K = 37 // handlebar_lock_sensor
 	KEY_I = 38 // handlebar_position
 	KEY_J = 36 // seatbox_lock_sensor
@@ -40,6 +41,33 @@ type InputEvent struct {
 }
 
 type InputCallback func(channel string, value bool) error
+
+// Single source of truth for keycode to channel mappings
+var keycodeToChannel = map[uint16]string{
+	KEY_A: "brake_right",
+	KEY_B: "brake_left",
+	KEY_C: "horn_button",
+	KEY_D: "seatbox_button",
+	KEY_E: "kickstand",
+	KEY_F: "blinker_right",
+	KEY_G: "blinker_left",
+	KEY_H: "ecu_power",
+	KEY_K: "handlebar_lock_sensor",
+	KEY_I: "handlebar_position",
+	KEY_J: "seatbox_lock_sensor",
+	KEY_Q: "48v_detect",
+}
+
+// Reverse map built at initialization
+var channelToKeycode map[string]uint16
+
+func init() {
+	// Build reverse map from forward map
+	channelToKeycode = make(map[string]uint16, len(keycodeToChannel))
+	for code, channel := range keycodeToChannel {
+		channelToKeycode[channel] = code
+	}
+}
 
 type LinuxHardwareIO struct {
 	logger          *logger.Logger
@@ -151,7 +179,7 @@ func (io *LinuxHardwareIO) readInitialState() error {
 
 	// Check each key we care about
 	keycodes := []uint16{
-		KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G,
+		KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H,
 		KEY_K, KEY_I, KEY_J, KEY_Q,
 	}
 
@@ -259,32 +287,7 @@ func (io *LinuxHardwareIO) handleKeyEvent(event *InputEvent) {
 }
 
 func (io *LinuxHardwareIO) mapKeycode(code uint16) string {
-	switch code {
-	case KEY_A:
-		return "brake_right"
-	case KEY_B:
-		return "brake_left"
-	case KEY_C:
-		return "horn_button"
-	case KEY_D:
-		return "seatbox_button"
-	case KEY_E:
-		return "kickstand"
-	case KEY_F:
-		return "blinker_right"
-	case KEY_G:
-		return "blinker_left"
-	case KEY_K:
-		return "handlebar_lock_sensor"
-	case KEY_I:
-		return "handlebar_position"
-	case KEY_J:
-		return "seatbox_lock_sensor"
-	case KEY_Q:
-		return "48v_detect"
-	default:
-		return ""
-	}
+	return keycodeToChannel[code]
 }
 
 func (io *LinuxHardwareIO) ReadDigitalInput(channel string) (bool, error) {
@@ -308,32 +311,7 @@ func (io *LinuxHardwareIO) ReadDigitalInput(channel string) (bool, error) {
 }
 
 func (io *LinuxHardwareIO) getKeycodeForChannel(channel string) uint16 {
-	switch channel {
-	case "brake_right":
-		return KEY_A
-	case "brake_left":
-		return KEY_B
-	case "horn_button":
-		return KEY_C
-	case "seatbox_button":
-		return KEY_D
-	case "kickstand":
-		return KEY_E
-	case "blinker_right":
-		return KEY_F
-	case "blinker_left":
-		return KEY_G
-	case "handlebar_lock_sensor":
-		return KEY_K
-	case "handlebar_position":
-		return KEY_I
-	case "seatbox_lock_sensor":
-		return KEY_J
-	case "48v_detect":
-		return KEY_Q
-	default:
-		return 0
-	}
+	return channelToKeycode[channel]
 }
 
 func (io *LinuxHardwareIO) RegisterInputCallback(channel string, callback InputCallback) {

@@ -162,7 +162,7 @@ func (v *VehicleSystem) Start() error {
 	channels := []string{
 		"brake_right", "brake_left", "horn_button", "seatbox_button",
 		"kickstand", "blinker_right", "blinker_left", "handlebar_lock_sensor",
-		"handlebar_position", "seatbox_lock_sensor", "48v_detect",
+		"handlebar_position", "seatbox_lock_sensor", "48v_detect", "ecu_power",
 	}
 
 	v.logger.Debugf("Registering input callbacks for %d channels", len(channels))
