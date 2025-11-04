@@ -97,6 +97,17 @@ func (v *VehicleSystem) Start() error {
 		return fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
+	// Check if DBC update is in progress and restore dbcUpdating flag
+	dbcStatus, err := v.redis.GetOtaStatus("dbc")
+	if err != nil {
+		v.logger.Warnf("Failed to get DBC OTA status on startup: %v", err)
+	} else if dbcStatus == "downloading" || dbcStatus == "installing" || dbcStatus == "rebooting" {
+		v.logger.Infof("DBC update in progress on startup (status=%s), restoring dbcUpdating flag", dbcStatus)
+		v.mu.Lock()
+		v.dbcUpdating = true
+		v.mu.Unlock()
+	}
+
 	// Load initial state from Redis
 	savedState, err := v.redis.GetVehicleState()
 	if err != nil {
@@ -109,7 +120,11 @@ func (v *VehicleSystem) Start() error {
 		v.mu.Unlock()
 
 		// Set initial GPIO values based on saved state
-		v.io.SetInitialValue("dashboard_power", savedState == types.StateReadyToDrive || savedState == types.StateParked)
+		// If DBC update is in progress, dashboard must stay ON regardless of state
+		v.mu.RLock()
+		dashboardPower := savedState == types.StateReadyToDrive || savedState == types.StateParked || v.dbcUpdating
+		v.mu.RUnlock()
+		v.io.SetInitialValue("dashboard_power", dashboardPower)
 		v.io.SetInitialValue("engine_power", savedState == types.StateReadyToDrive)
 
 		// If restoring standby state, set the standby timer for MDB reboot coordination
