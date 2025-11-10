@@ -24,6 +24,7 @@ type Callbacks struct {
 	LedFadeCallback   func(int, int) error
 	UpdateCallback    func(string) error // "start", "complete"
 	HardwareCallback  func(string) error // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
+	SettingsCallback  func(string) error // setting key that was updated (e.g., "scooter.brake-hibernation")
 }
 
 type RedisClient struct {
@@ -78,8 +79,8 @@ func (r *RedisClient) StartListening() error {
 	r.logger.Infof("Starting Redis listeners")
 
 	// Subscribe to pub/sub channels for system events
-	pubsub := r.client.Subscribe(r.ctx, "dashboard", "keycard", "ota", "power-manager", "vehicle")
-	r.logger.Infof("Subscribed to Redis channels: dashboard, keycard, ota, power-manager, vehicle")
+	pubsub := r.client.Subscribe(r.ctx, "dashboard", "keycard", "ota", "power-manager", "vehicle", "settings")
+	r.logger.Infof("Subscribed to Redis channels: dashboard, keycard, ota, power-manager, vehicle, settings")
 
 	// Start pub/sub listener
 	r.wg.Add(1)
@@ -294,6 +295,14 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 						if err := r.callbacks.DashboardCallback(ready == "true"); err != nil {
 							r.logger.Infof("Failed to handle dashboard state: %v", err)
 						}
+					}
+				}
+
+			case "settings":
+				if r.callbacks.SettingsCallback != nil {
+					r.logger.Infof("Processing settings update: %s", msg.Payload)
+					if err := r.callbacks.SettingsCallback(msg.Payload); err != nil {
+						r.logger.Infof("Failed to handle settings update: %v", err)
 					}
 				}
 
@@ -821,6 +830,19 @@ func (r *RedisClient) ReportFaultAbsent(code int) error {
 
 	r.logger.Infof("Successfully reported fault %d as absent", code)
 	return nil
+}
+
+// GetHashField reads a field from a Redis hash using HGET
+func (r *RedisClient) GetHashField(hash, field string) (string, error) {
+	value, err := r.client.HGet(r.ctx, hash, field).Result()
+	if err == redis.Nil {
+		// Field doesn't exist, return empty string
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to get hash field %s from %s: %w", field, hash, err)
+	}
+	return value, nil
 }
 
 func (r *RedisClient) Close() error {
