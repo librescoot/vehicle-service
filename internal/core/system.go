@@ -455,17 +455,14 @@ func (hm *HibernationManager) updateBrakeState(bothBrakesPressed bool) {
 		} else if !previousBrakeState && bothBrakesPressed {
 			// Brakes pressed again after release during confirmation
 			if hm.brakesReleased {
-				hm.logger.Infof("Both brakes pressed again during confirmation - checking total time")
-				// Check if we're still in force hibernation window
-				if time.Since(hm.startTime) >= hibernationForceHoldDuration {
-					hm.confirmHibernation()
-				}
+				hm.logger.Infof("Both brakes pressed again during confirmation - manual confirm")
+				hm.confirmHibernation(false) // Manual confirmation - require seatbox closed
 			}
 		} else if bothBrakesPressed && !hm.brakesReleased {
 			// Still holding brakes continuously - check for force hibernation
 			if time.Since(hm.startTime) >= hibernationForceHoldDuration {
-				hm.logger.Infof("Force hibernation triggered - 30s continuous hold")
-				hm.confirmHibernation()
+				hm.logger.Infof("Force hibernation triggered - 40s continuous hold")
+				hm.confirmHibernation(true) // Auto-confirm - skip seatbox check
 			}
 		}
 	}
@@ -551,10 +548,15 @@ func (hm *HibernationManager) startConfirmationTimeout() {
 }
 
 // confirmHibernation executes the hibernation after checking safety conditions
-func (hm *HibernationManager) confirmHibernation() {
-	hm.logger.Infof("Hibernation confirmed, checking safety conditions")
+// autoConfirm: if true, skips seatbox check (for 40s continuous hold warehouse mode)
+func (hm *HibernationManager) confirmHibernation(autoConfirm bool) {
+	if autoConfirm {
+		hm.logger.Infof("Hibernation auto-confirmed (40s hold), checking safety conditions")
+	} else {
+		hm.logger.Infof("Hibernation confirmed, checking safety conditions")
+	}
 
-	// Check kickstand state - must be down
+	// Check kickstand state - must be down (always required)
 	if hm.isKickstandDown != nil {
 		kickstandDown, err := hm.isKickstandDown()
 		if err != nil {
@@ -569,8 +571,8 @@ func (hm *HibernationManager) confirmHibernation() {
 		}
 	}
 
-	// Check seatbox state - must be closed
-	if hm.isSeatboxClosed != nil {
+	// Check seatbox state - must be closed (skip for auto-confirm)
+	if !autoConfirm && hm.isSeatboxClosed != nil {
 		seatboxClosed, err := hm.isSeatboxClosed()
 		if err != nil {
 			hm.logger.Infof("Failed to read seatbox state: %v, aborting hibernation", err)
@@ -587,6 +589,8 @@ func (hm *HibernationManager) confirmHibernation() {
 			// Don't reset to idle - stay in confirmation waiting for seatbox to close
 			return
 		}
+	} else if autoConfirm {
+		hm.logger.Infof("Auto-confirm mode: skipping seatbox check (warehouse mode)")
 	}
 
 	hm.logger.Infof("Safety checks passed, transitioning to confirmation state")
@@ -656,7 +660,7 @@ func (hm *HibernationManager) handleKeycardConfirmation() {
 
 	if hm.state == HibernationConfirmation && hm.brakesReleased {
 		hm.logger.Infof("Keycard confirmation received")
-		hm.confirmHibernation()
+		hm.confirmHibernation(false) // Keycard confirmation - require seatbox closed
 	}
 }
 
@@ -668,7 +672,7 @@ func (hm *HibernationManager) handleBrakeConfirmation(leftPressed, rightPressed 
 	if hm.state == HibernationConfirmation && hm.brakesReleased {
 		if rightPressed && !leftPressed {
 			hm.logger.Infof("Right brake confirmation received")
-			hm.confirmHibernation()
+			hm.confirmHibernation(false) // Single brake confirmation - require seatbox closed
 		} else if leftPressed && !rightPressed {
 			hm.logger.Infof("Left brake cancellation received")
 			hm.resetToIdle()
