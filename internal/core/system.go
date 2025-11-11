@@ -35,9 +35,9 @@ const (
 	seatboxLockDuration   = 200 * time.Millisecond
 
 	// Hibernation timing constants
-	hibernationInitialHoldDuration = 15 * time.Second // Initial brake hold duration
-	hibernationConfirmationTimeout = 15 * time.Second // Timeout for confirmation after brake release
-	hibernationForceHoldDuration   = 30 * time.Second // Total hold time for force hibernation
+	hibernationInitialHoldDuration = 20 * time.Second // Initial brake hold duration (overlay display)
+	hibernationConfirmationTimeout = 20 * time.Second // Timeout for confirmation after brake release
+	hibernationForceHoldDuration   = 40 * time.Second // Total hold time for auto-confirm hibernation
 )
 
 // Manual hibernation state machine
@@ -67,14 +67,16 @@ type HibernationManager struct {
 	mu                   sync.RWMutex
 	state                ManualHibernationState
 	startTime            time.Time   // When initial brake hold started
-	initialTimer         *time.Timer // 15s initial hold timer
-	confirmationTimer    *time.Timer // 15s confirmation timeout timer
+	initialTimer         *time.Timer // Initial hold timer
+	confirmationTimer    *time.Timer // Confirmation timeout timer
 	bothBrakesHeld       bool        // Current brake state
 	brakesReleased       bool        // Whether brakes were released during confirmation
 	logger               *logger.Logger
 	redis                *messaging.RedisClient
 	onHibernationConfirm func()                                                // Callback to execute hibernation
 	onStateChange        func(state ManualHibernationState, timeRemaining int) // Callback for state changes
+	isKickstandDown      func() (bool, error)                                  // Callback to check if kickstand is down (true = down)
+	isSeatboxClosed      func() (bool, error)                                  // Callback to check if seatbox is closed (true = closed)
 }
 
 type VehicleSystem struct {
@@ -153,6 +155,14 @@ func (v *VehicleSystem) Start() error {
 			}
 		},
 		onStateChange: v.publishHibernationState,
+		isKickstandDown: func() (bool, error) {
+			// kickstand input: true = down, false = up
+			return v.io.ReadDigitalInput("kickstand")
+		},
+		isSeatboxClosed: func() (bool, error) {
+			// seatbox_lock_sensor: true = closed, false = open
+			return v.io.ReadDigitalInput("seatbox_lock_sensor")
+		},
 	}
 
 	if err := v.redis.Connect(); err != nil {
@@ -535,9 +545,41 @@ func (hm *HibernationManager) startConfirmationTimeout() {
 	hm.logger.Infof("Confirmation timeout started (15s)")
 }
 
-// confirmHibernation executes the hibernation
+// confirmHibernation executes the hibernation after checking safety conditions
 func (hm *HibernationManager) confirmHibernation() {
-	hm.logger.Infof("Hibernation confirmed")
+	hm.logger.Infof("Hibernation confirmed, checking safety conditions")
+
+	// Check kickstand state - must be down
+	if hm.isKickstandDown != nil {
+		kickstandDown, err := hm.isKickstandDown()
+		if err != nil {
+			hm.logger.Infof("Failed to read kickstand state: %v, aborting hibernation", err)
+			hm.resetToIdle()
+			return
+		}
+		if !kickstandDown {
+			hm.logger.Infof("Kickstand is up, aborting hibernation")
+			hm.resetToIdle()
+			return
+		}
+	}
+
+	// Check seatbox state - must be closed
+	if hm.isSeatboxClosed != nil {
+		seatboxClosed, err := hm.isSeatboxClosed()
+		if err != nil {
+			hm.logger.Infof("Failed to read seatbox state: %v, aborting hibernation", err)
+			hm.resetToIdle()
+			return
+		}
+		if !seatboxClosed {
+			hm.logger.Infof("Seatbox is open, aborting hibernation")
+			hm.resetToIdle()
+			return
+		}
+	}
+
+	hm.logger.Infof("Safety checks passed, executing hibernation")
 
 	// Execute hibernation callback
 	if hm.onHibernationConfirm != nil {
