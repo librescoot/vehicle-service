@@ -73,10 +73,10 @@ type HibernationManager struct {
 	brakesReleased       bool        // Whether brakes were released during confirmation
 	logger               *logger.Logger
 	redis                *messaging.RedisClient
-	onHibernationConfirm func()                                                // Callback to execute hibernation
-	onStateChange        func(state ManualHibernationState, timeRemaining int) // Callback for state changes
-	isKickstandDown      func() (bool, error)                                  // Callback to check if kickstand is down (true = down)
-	isSeatboxClosed      func() (bool, error)                                  // Callback to check if seatbox is closed (true = closed)
+	onHibernationConfirm func()                        // Callback to execute hibernation
+	transitionTo         func(types.SystemState) error // Callback to transition vehicle state
+	isKickstandDown      func() (bool, error)          // Callback to check if kickstand is down (true = down)
+	isSeatboxClosed      func() (bool, error)          // Callback to check if seatbox is closed (true = closed)
 }
 
 type VehicleSystem struct {
@@ -154,7 +154,7 @@ func (v *VehicleSystem) Start() error {
 				v.logger.Infof("Failed to transition to shutdown for hibernation: %v", err)
 			}
 		},
-		onStateChange: v.publishHibernationState,
+		transitionTo: v.transitionTo,
 		isKickstandDown: func() (bool, error) {
 			// kickstand input: true = down, false = up
 			return v.io.ReadDigitalInput("kickstand")
@@ -420,13 +420,6 @@ func (v *VehicleSystem) checkHibernationConditions() {
 	v.hibernationManager.updateBrakeState(brakeLeft && brakeRight)
 }
 
-// publishHibernationState publishes hibernation state changes to Redis
-func (v *VehicleSystem) publishHibernationState(state ManualHibernationState, timeRemaining int) {
-	// Publish hibernation state to Redis for scootui
-	if err := v.redis.PublishHibernationState(state.String(), timeRemaining); err != nil {
-		v.logger.Infof("Failed to publish hibernation state: %v", err)
-	}
-}
 
 // Hibernation Manager Methods
 
@@ -478,15 +471,22 @@ func (hm *HibernationManager) updateBrakeState(bothBrakesPressed bool) {
 	}
 }
 
-// startInitialHold begins the initial 15s brake hold phase
+// startInitialHold begins the initial brake hold phase
 func (hm *HibernationManager) startInitialHold() {
 	hm.state = HibernationInitialHold
 	hm.startTime = time.Now()
 	hm.brakesReleased = false
 
-	hm.logger.Infof("Starting hibernation initial hold (15s)")
+	hm.logger.Infof("Starting hibernation initial hold (%ds)", int(hibernationInitialHoldDuration.Seconds()))
 
-	// Start 15s timer for initial hold
+	// Transition vehicle to waiting-hibernation state
+	if hm.transitionTo != nil {
+		if err := hm.transitionTo(types.StateWaitingHibernation); err != nil {
+			hm.logger.Infof("Failed to transition to waiting-hibernation: %v", err)
+		}
+	}
+
+	// Start timer for initial hold
 	hm.initialTimer = time.AfterFunc(hibernationInitialHoldDuration, func() {
 		hm.mu.Lock()
 		defer hm.mu.Unlock()
@@ -496,11 +496,6 @@ func (hm *HibernationManager) startInitialHold() {
 			hm.transitionToConfirmation()
 		}
 	})
-
-	// Notify state change
-	if hm.onStateChange != nil {
-		hm.onStateChange(hm.state, int(hibernationInitialHoldDuration.Seconds()))
-	}
 }
 
 // transitionToConfirmation moves to the confirmation phase
@@ -515,14 +510,24 @@ func (hm *HibernationManager) transitionToConfirmation() {
 
 	hm.logger.Infof("Hibernation confirmation phase started")
 
-	// Notify state change
-	if hm.onStateChange != nil {
-		remainingTime := int(hibernationForceHoldDuration.Seconds() - time.Since(hm.startTime).Seconds())
-		if remainingTime < 0 {
-			remainingTime = 0
+	// Check if seatbox is open - if so, transition to seatbox notification state
+	if hm.isSeatboxClosed != nil {
+		seatboxClosed, err := hm.isSeatboxClosed()
+		if err != nil {
+			hm.logger.Infof("Failed to read seatbox state: %v", err)
+		} else if !seatboxClosed {
+			hm.logger.Infof("Seatbox is open - showing seatbox notification")
+			if hm.transitionTo != nil {
+				if err := hm.transitionTo(types.StateWaitingHibernationSeatbox); err != nil {
+					hm.logger.Infof("Failed to transition to waiting-hibernation-seatbox: %v", err)
+				}
+			}
+			return
 		}
-		hm.onStateChange(hm.state, remainingTime)
 	}
+
+	// Seatbox is closed, stay in standard confirmation state
+	// (no separate state needed, waiting-hibernation covers this)
 }
 
 // startConfirmationTimeout starts the 15s timeout for confirmation after brake release
@@ -573,21 +578,38 @@ func (hm *HibernationManager) confirmHibernation() {
 			return
 		}
 		if !seatboxClosed {
-			hm.logger.Infof("Seatbox is open, aborting hibernation")
+			hm.logger.Infof("Seatbox is open, transitioning to seatbox notification state")
+			if hm.transitionTo != nil {
+				if err := hm.transitionTo(types.StateWaitingHibernationSeatbox); err != nil {
+					hm.logger.Infof("Failed to transition to waiting-hibernation-seatbox: %v", err)
+				}
+			}
+			// Don't reset to idle - stay in confirmation waiting for seatbox to close
+			return
+		}
+	}
+
+	hm.logger.Infof("Safety checks passed, transitioning to confirmation state")
+
+	// Transition to 3-second confirmation state
+	if hm.transitionTo != nil {
+		if err := hm.transitionTo(types.StateWaitingHibernationConfirm); err != nil {
+			hm.logger.Infof("Failed to transition to waiting-hibernation-confirm: %v", err)
 			hm.resetToIdle()
 			return
 		}
 	}
 
-	hm.logger.Infof("Safety checks passed, executing hibernation")
-
-	// Execute hibernation callback
-	if hm.onHibernationConfirm != nil {
-		hm.onHibernationConfirm()
-	}
-
-	// Reset to idle
-	hm.resetToIdle()
+	// Start 3-second non-abortable confirmation timer
+	time.AfterFunc(3*time.Second, func() {
+		hm.logger.Infof("Confirmation timer complete, executing hibernation")
+		// Execute hibernation callback
+		if hm.onHibernationConfirm != nil {
+			hm.onHibernationConfirm()
+		}
+		// Reset to idle
+		hm.resetToIdle()
+	})
 }
 
 // cancelHibernation cancels the hibernation sequence
@@ -619,9 +641,11 @@ func (hm *HibernationManager) resetToIdle() {
 	hm.brakesReleased = false
 	hm.startTime = time.Time{}
 
-	// Notify state change
-	if hm.onStateChange != nil {
-		hm.onStateChange(hm.state, 0)
+	// Transition vehicle back to parked state
+	if hm.transitionTo != nil {
+		if err := hm.transitionTo(types.StateParked); err != nil {
+			hm.logger.Infof("Failed to transition back to parked: %v", err)
+		}
 	}
 }
 
