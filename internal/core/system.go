@@ -144,9 +144,12 @@ func (v *VehicleSystem) Start() error {
 		logger: v.logger.WithTag("Hibernation"),
 		redis:  v.redis,
 		onHibernationConfirm: func() {
-			v.logger.Infof("Hibernation confirmed, sending hibernate-manual command to pm-service")
-			if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-				v.logger.Infof("Failed to send hibernate command: %v", err)
+			v.logger.Infof("Hibernation confirmed, initiating proper shutdown sequence")
+			v.mu.Lock()
+			v.hibernationRequest = true
+			v.mu.Unlock()
+			if err := v.transitionTo(types.StateShuttingDown); err != nil {
+				v.logger.Infof("Failed to transition to shutdown for hibernation: %v", err)
 			}
 		},
 		onStateChange: v.publishHibernationState,
@@ -1669,14 +1672,9 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 			v.mu.Lock()
 			v.hibernationRequest = true // Set hibernation request for lock-hibernate
 			v.mu.Unlock()
-			if err := v.transitionTo(types.StateShuttingDown); err != nil {
-				return err
-			}
-
-			if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-				v.logger.Infof("Failed to send hibernate command: %v", err)
-			}
-			return nil
+			// Transition to SHUTTING_DOWN, which will shut down the DBC properly
+			// The hibernation command will be sent after shutdown completes (in triggerShutdownTimeout)
+			return v.transitionTo(types.StateShuttingDown)
 		} else {
 			return fmt.Errorf("vehicle must be parked to lock")
 		}
