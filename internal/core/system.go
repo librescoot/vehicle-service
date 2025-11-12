@@ -1205,6 +1205,9 @@ func (v *VehicleSystem) handleSeatboxRequest(on bool) error {
 		if err := v.redis.PublishSeatboxOpened(); err != nil {
 			v.logger.Warnf("Failed to publish seatbox opened event: %v", err)
 		}
+		// Delay to allow alarm-service to receive event and disable interrupts
+		// before physical seatbox movement occurs
+		time.Sleep(150 * time.Millisecond)
 		return v.openSeatboxLock()
 	}
 	return nil
