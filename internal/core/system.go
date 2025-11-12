@@ -57,19 +57,21 @@ type VehicleSystem struct {
 	shutdownFromParked     bool  // Track if shutdown was initiated from parked state
 	dbcUpdating            bool  // Track if DBC update is in progress
 	deferredDashboardPower *bool // Deferred dashboard power state (nil = no change needed)
+	brakeHibernationEnabled bool  // Track if brake lever hibernation is enabled (default: true)
 }
 
 func NewVehicleSystem(redisHost string, redisPort int, l *logger.Logger) *VehicleSystem {
 	return &VehicleSystem{
-		state:              types.StateInit,
-		logger:             l.WithTag("Vehicle"),
-		io:                 hardware.NewLinuxHardwareIO(l.WithTag("Hardware")),
-		redisHost:          redisHost,
-		redisPort:          redisPort,
-		blinkerState:       BlinkerOff,
-		initialized:        false,
-		keycardTapCount:    0,
-		forceStandbyNoLock: false,
+		state:                   types.StateInit,
+		logger:                  l.WithTag("Vehicle"),
+		io:                      hardware.NewLinuxHardwareIO(l.WithTag("Hardware")),
+		redisHost:               redisHost,
+		redisPort:               redisPort,
+		blinkerState:            BlinkerOff,
+		initialized:             false,
+		keycardTapCount:         0,
+		forceStandbyNoLock:      false,
+		brakeHibernationEnabled: true, // Default to enabled for backward compatibility
 		// lastKeycardTapTime will be zero value (time.IsZero() will be true)
 	}
 }
@@ -90,10 +92,34 @@ func (v *VehicleSystem) Start() error {
 		LedFadeCallback:   v.handleLedFadeRequest,
 		UpdateCallback:    v.handleUpdateRequest,
 		HardwareCallback:  v.handleHardwareRequest,
+		SettingsCallback:  v.handleSettingsUpdate,
 	})
 
 	if err := v.redis.Connect(); err != nil {
 		return fmt.Errorf("failed to connect to Redis: %w", err)
+	}
+
+	// Read initial brake hibernation setting from Redis
+	brakeHibernationSetting, err := v.redis.GetHashField("settings", "scooter.brake-hibernation")
+	if err != nil {
+		v.logger.Warnf("Failed to read brake hibernation setting on startup: %v", err)
+		// Continue with default (enabled)
+	} else if brakeHibernationSetting != "" {
+		v.mu.Lock()
+		switch brakeHibernationSetting {
+		case "enabled":
+			v.brakeHibernationEnabled = true
+			v.logger.Infof("Brake hibernation setting on startup: enabled")
+		case "disabled":
+			v.brakeHibernationEnabled = false
+			v.logger.Infof("Brake hibernation setting on startup: disabled")
+		default:
+			v.logger.Warnf("Unknown brake hibernation setting value on startup: '%s', using default (enabled)", brakeHibernationSetting)
+			v.brakeHibernationEnabled = true
+		}
+		v.mu.Unlock()
+	} else {
+		v.logger.Infof("No brake hibernation setting found on startup, using default (enabled)")
 	}
 
 	// Check if DBC update is in progress and restore dbcUpdating flag
@@ -321,6 +347,16 @@ func (v *VehicleSystem) getCurrentState() types.SystemState {
 func (v *VehicleSystem) checkHibernationConditions() {
 	// Only check hibernation conditions in parked state
 	if v.getCurrentState() != types.StateParked {
+		return
+	}
+
+	// Check if brake hibernation is enabled
+	v.mu.RLock()
+	hibernationEnabled := v.brakeHibernationEnabled
+	v.mu.RUnlock()
+
+	if !hibernationEnabled {
+		v.logger.Debugf("Brake hibernation is disabled, skipping hibernation check")
 		return
 	}
 
