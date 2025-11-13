@@ -417,17 +417,29 @@ func (r *RedisClient) processVehicleMessage(payload string) {
 	}
 }
 
+// publishHashSet is a helper that atomically updates a hash field and publishes a notification
+func (r *RedisClient) publishHashSet(hash, field string, value interface{}, channel, payload string) error {
+	pipe := r.client.Pipeline()
+	pipe.HSet(r.ctx, hash, field, value)
+	pipe.Publish(r.ctx, channel, payload)
+	_, err := pipe.Exec(r.ctx)
+	return err
+}
+
+// publishHashDel is a helper that atomically deletes a hash field and publishes a notification
+func (r *RedisClient) publishHashDel(hash, field, channel, payload string) error {
+	pipe := r.client.Pipeline()
+	pipe.HDel(r.ctx, hash, field)
+	pipe.Publish(r.ctx, channel, payload)
+	_, err := pipe.Exec(r.ctx)
+	return err
+}
+
 func (r *RedisClient) PublishVehicleState(state types.SystemState) error {
 	r.logger.Infof("Publishing vehicle state: %s", state)
-	pipe := r.client.Pipeline()
-
 	stateStr := string(state)
 
-	pipe.HSet(r.ctx, "vehicle", "state", stateStr)
-	pipe.Publish(r.ctx, "vehicle", "state")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	if err := r.publishHashSet("vehicle", "state", stateStr, "vehicle", "state"); err != nil {
 		r.logger.Infof("Failed to publish vehicle state: %v", err)
 		return err
 	}
@@ -452,12 +464,7 @@ func (r *RedisClient) SetBlinkerSwitch(state string) error {
 		blinkerStr = "unknown"
 	}
 
-	pipe := r.client.Pipeline()
-	pipe.HSet(r.ctx, "vehicle", "blinker:switch", blinkerStr)
-	pipe.Publish(r.ctx, "vehicle", "blinker:switch")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	if err := r.publishHashSet("vehicle", "blinker:switch", blinkerStr, "vehicle", "blinker:switch"); err != nil {
 		r.logger.Infof("Failed to set blinker switch: %v", err)
 		return err
 	}
@@ -482,12 +489,7 @@ func (r *RedisClient) SetBlinkerState(state string) error {
 		blinkerStr = "unknown"
 	}
 
-	pipe := r.client.Pipeline()
-	pipe.HSet(r.ctx, "vehicle", "blinker:state", blinkerStr)
-	pipe.Publish(r.ctx, "vehicle", "blinker:state")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	if err := r.publishHashSet("vehicle", "blinker:state", blinkerStr, "vehicle", "blinker:state"); err != nil {
 		r.logger.Infof("Failed to set blinker state: %v", err)
 		return err
 	}
@@ -517,12 +519,8 @@ func (r *RedisClient) SetBrakeState(side string, isPressed bool) error {
 		state = "on"
 	}
 
-	pipe := r.client.Pipeline()
-	pipe.HSet(r.ctx, "vehicle", fmt.Sprintf("brake:%s", side), state)
-	pipe.Publish(r.ctx, "vehicle", fmt.Sprintf("brake:%s", side))
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	field := fmt.Sprintf("brake:%s", side)
+	if err := r.publishHashSet("vehicle", field, state, "vehicle", field); err != nil {
 		r.logger.Infof("Failed to set brake state: %v", err)
 		return err
 	}
@@ -537,13 +535,8 @@ func (r *RedisClient) SetHornButton(isPressed bool) error {
 		state = "on"
 	}
 
-	pipe := r.client.Pipeline()
-	pipe.HSet(r.ctx, "vehicle", "horn:button", state)
-	// Also publish an immediate event via pubsub for button press
-	pipe.Publish(r.ctx, "buttons", fmt.Sprintf("horn:%s", state))
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	// Publish to buttons channel for immediate event handling
+	if err := r.publishHashSet("vehicle", "horn:button", state, "buttons", fmt.Sprintf("horn:%s", state)); err != nil {
 		r.logger.Infof("Failed to set horn button state: %v", err)
 		return err
 	}
@@ -558,13 +551,8 @@ func (r *RedisClient) SetSeatboxButton(isPressed bool) error {
 		state = "on"
 	}
 
-	pipe := r.client.Pipeline()
-	pipe.HSet(r.ctx, "vehicle", "seatbox:button", state)
-	// Also publish an immediate event via pubsub for button press
-	pipe.Publish(r.ctx, "buttons", fmt.Sprintf("seatbox:%s", state))
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	// Publish to buttons channel for immediate event handling
+	if err := r.publishHashSet("vehicle", "seatbox:button", state, "buttons", fmt.Sprintf("seatbox:%s", state)); err != nil {
 		r.logger.Infof("Failed to set seatbox button state: %v", err)
 		return err
 	}
@@ -579,12 +567,7 @@ func (r *RedisClient) SetSeatboxLockState(isLocked bool) error {
 		state = "closed"
 	}
 
-	pipe := r.client.Pipeline()
-	pipe.HSet(r.ctx, "vehicle", "seatbox:lock", state)
-	pipe.Publish(r.ctx, "vehicle", "seatbox:lock")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	if err := r.publishHashSet("vehicle", "seatbox:lock", state, "vehicle", "seatbox:lock"); err != nil {
 		r.logger.Infof("Failed to set seatbox lock state: %v", err)
 		return err
 	}
@@ -608,12 +591,7 @@ func (r *RedisClient) SetKickstandState(isDown bool) error {
 		state = "down"
 	}
 
-	pipe := r.client.Pipeline()
-	pipe.HSet(r.ctx, "vehicle", "kickstand", state)
-	pipe.Publish(r.ctx, "vehicle", "kickstand")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	if err := r.publishHashSet("vehicle", "kickstand", state, "vehicle", "kickstand"); err != nil {
 		r.logger.Infof("Failed to set kickstand state: %v", err)
 		return err
 	}
@@ -644,12 +622,7 @@ func (r *RedisClient) SetHandlebarLockState(isLocked bool) error {
 		state = "locked"
 	}
 
-	pipe := r.client.Pipeline()
-	pipe.HSet(r.ctx, "vehicle", "handlebar:lock-sensor", state)
-	pipe.Publish(r.ctx, "vehicle", "handlebar:lock-sensor")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	if err := r.publishHashSet("vehicle", "handlebar:lock-sensor", state, "vehicle", "handlebar:lock-sensor"); err != nil {
 		r.logger.Infof("Failed to set handlebar lock state: %v", err)
 		return err
 	}
@@ -660,13 +633,8 @@ func (r *RedisClient) SetHandlebarLockState(isLocked bool) error {
 // PublishUpdateStatus publishes the update status to Redis
 func (r *RedisClient) PublishUpdateStatus(status string) error {
 	r.logger.Infof("Publishing update status: %s", status)
-	pipe := r.client.Pipeline()
 
-	pipe.HSet(r.ctx, "vehicle", "update:status", status)
-	pipe.Publish(r.ctx, "vehicle", "update:status")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	if err := r.publishHashSet("vehicle", "update:status", status, "vehicle", "update:status"); err != nil {
 		r.logger.Infof("Failed to publish update status: %v", err)
 		return err
 	}
@@ -688,13 +656,8 @@ func (r *RedisClient) PublishButtonEvent(event string) error {
 // PublishGovernorChange publishes a governor change event to Redis
 func (r *RedisClient) PublishGovernorChange(governor string) error {
 	r.logger.Infof("Publishing governor change: %s", governor)
-	pipe := r.client.Pipeline()
 
-	pipe.HSet(r.ctx, "system", "cpu:governor", governor)
-	pipe.Publish(r.ctx, "system", "cpu:governor")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	if err := r.publishHashSet("system", "cpu:governor", governor, "system", "cpu:governor"); err != nil {
 		r.logger.Infof("Failed to publish governor change: %v", err)
 		return err
 	}
@@ -706,12 +669,7 @@ func (r *RedisClient) PublishGovernorChange(governor string) error {
 func (r *RedisClient) DeleteDashboardReadyFlag() error {
 	r.logger.Infof("Deleting dashboard ready flag from Redis")
 
-	pipe := r.client.Pipeline()
-	pipe.HDel(r.ctx, "dashboard", "ready")
-	pipe.Publish(r.ctx, "dashboard", "ready")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	if err := r.publishHashDel("dashboard", "ready", "dashboard", "ready"); err != nil {
 		r.logger.Infof("Failed to delete dashboard ready flag: %v", err)
 		return err
 	}
@@ -724,12 +682,7 @@ func (r *RedisClient) PublishStandbyTimerStart() error {
 	r.logger.Infof("Setting standby timer start timestamp")
 	timestamp := fmt.Sprintf("%d", time.Now().Unix())
 
-	pipe := r.client.Pipeline()
-	pipe.HSet(r.ctx, "ota", "standby-timer-start", timestamp)
-	pipe.Publish(r.ctx, "ota", "standby-timer-start")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
+	if err := r.publishHashSet("ota", "standby-timer-start", timestamp, "ota", "standby-timer-start"); err != nil {
 		r.logger.Infof("Failed to set standby timer start: %v", err)
 		return err
 	}
