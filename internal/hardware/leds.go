@@ -140,7 +140,7 @@ func (l *ImxPwmLed) loadCues() error {
 			actionType := CueActionType((action >> 8) & 0x0F)
 			value := uint16(action >> 16)
 
-			l.logger.Printf("  Action %d: LED=%d, Type=%d, Value=%d", i/4, led, actionType, value)
+			l.logger.Debugf("  Action %d: LED=%d, Type=%d, Value=%d", i/4, led, actionType, value)
 		}
 
 		// Reset file position for actual writing
@@ -209,7 +209,7 @@ func (l *ImxPwmLed) Init() error {
 	// Initialize LED devices
 	for i := 0; i < PwmLedCount; i++ {
 		devPath := fmt.Sprintf("/dev/pwm_led%d", i)
-		l.logger.Printf("Opening LED device: %s", devPath)
+		l.logger.Debugf("Opening LED device: %s", devPath)
 		fd, err := unix.Open(devPath, unix.O_RDWR, 0)
 		if err != nil {
 			l.logger.Printf("Failed to open LED device %s: %v", devPath, err)
@@ -236,7 +236,7 @@ func (l *ImxPwmLed) Init() error {
 		isBlinker := i == 3 || i == 4 || i == 6 || i == 7
 		if !isBlinker {
 			device.isAdaptive = true
-			l.logger.Printf("Setting LED %d to adaptive mode", i)
+			l.logger.Debugf("Setting LED %d to adaptive mode", i)
 			err = unix.IoctlSetInt(fd, pwmLedSetAdapt, 1)
 			if err != nil {
 				l.logger.Printf("Failed to set adaptive mode for LED %d: %v", i, err)
@@ -251,7 +251,7 @@ func (l *ImxPwmLed) Init() error {
 		if err := l.setActive(i, true); err != nil {
 			l.logger.Printf("Failed to activate LED %d: %v", i, err)
 		} else {
-			l.logger.Printf("Successfully activated LED %d", i)
+			l.logger.Debugf("Successfully activated LED %d", i)
 		}
 		// Add delay after activation
 		time.Sleep(10 * time.Millisecond)
@@ -294,13 +294,13 @@ func (l *ImxPwmLed) PlayCue(idx int) error {
 	device.lock.Lock()
 	defer device.lock.Unlock()
 
-	l.logger.Printf("Playing LED cue %d", idx)
+	l.logger.Debugf("Playing LED cue %d", idx)
 	err := unix.IoctlSetInt(device.fd, pwmLedPlayCue, idx)
 	if err != nil {
 		l.logger.Printf("Failed to play cue %d: %v", idx, err)
 		return fmt.Errorf("failed to play cue %d: %v", idx, err)
 	}
-	l.logger.Printf("Successfully played LED cue %d", idx)
+	l.logger.Debugf("Successfully played LED cue %d", idx)
 	return nil
 }
 
@@ -364,7 +364,7 @@ func (l *ImxPwmLed) loadFades() error {
 				break
 			}
 			sample := binary.LittleEndian.Uint16(buf)
-			l.logger.Printf("  Sample %d: %d", i, sample)
+			l.logger.Debugf("  Sample %d: %d", i, sample)
 		}
 
 		// Reset file position for actual writing
@@ -481,7 +481,7 @@ func (l *ImxPwmLed) PlayFade(ch int, idx int) error {
 	}
 
 	// First open the fade
-	l.logger.Printf("Opening fade %d on LED %d (fd=%d)", idx, ch, device.fd)
+	l.logger.Debugf("Opening fade %d on LED %d (fd=%d)", idx, ch, device.fd)
 	err = unix.IoctlSetInt(device.fd, pwmLedOpenFade, idx)
 	if err != nil {
 		l.logger.Printf("Failed to open fade %d on LED %d: %v (errno=%d)", idx, ch, err, err.(*os.SyscallError).Err.(syscall.Errno))
@@ -489,7 +489,7 @@ func (l *ImxPwmLed) PlayFade(ch int, idx int) error {
 	}
 
 	// Then play it
-	l.logger.Printf("Playing fade %d on LED %d (fd=%d)", idx, ch, device.fd)
+	l.logger.Debugf("Playing fade %d on LED %d (fd=%d)", idx, ch, device.fd)
 	err = unix.IoctlSetInt(device.fd, pwmLedPlayFade, idx)
 	if err != nil {
 		l.logger.Printf("Failed to play fade %d on LED %d: %v (errno=%d)", idx, ch, err, err.(*os.SyscallError).Err.(syscall.Errno))
@@ -497,6 +497,6 @@ func (l *ImxPwmLed) PlayFade(ch int, idx int) error {
 	}
 
 	device.playingFade = idx
-	l.logger.Printf("Successfully started fade %d on LED %d", idx, ch)
+	l.logger.Debugf("Successfully started fade %d on LED %d", idx, ch)
 	return nil
 }
