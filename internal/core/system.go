@@ -35,9 +35,9 @@ const (
 	seatboxLockDuration   = 200 * time.Millisecond
 
 	// Hibernation timing constants
-	hibernationInitialHoldDuration = 20 * time.Second // Initial brake hold duration (overlay display)
-	hibernationConfirmationTimeout = 20 * time.Second // Timeout for confirmation after brake release
-	hibernationForceHoldDuration   = 40 * time.Second // Total hold time for auto-confirm hibernation
+	hibernationInitialHoldDuration = 15 * time.Second // Initial brake hold to enter waiting-hibernation
+	hibernationConfirmationTimeout = 30 * time.Second // Timeout when in waiting-hibernation with no brake activity
+	hibernationForceHoldDuration   = 30 * time.Second // Total continuous hold for auto-confirm hibernation
 )
 
 // Manual hibernation state machine
@@ -67,8 +67,10 @@ type HibernationManager struct {
 	mu                   sync.RWMutex
 	state                ManualHibernationState
 	startTime            time.Time   // When initial brake hold started
+	reholdStartTime      time.Time   // When brakes were pressed again after release
 	initialTimer         *time.Timer // Initial hold timer
 	confirmationTimer    *time.Timer // Confirmation timeout timer
+	reholdTimer          *time.Timer // Timer for re-hold force confirm (20s after re-press)
 	bothBrakesHeld       bool        // Current brake state
 	brakesReleased       bool        // Whether brakes were released during confirmation
 	logger               *logger.Logger
@@ -388,8 +390,11 @@ func (v *VehicleSystem) getCurrentState() types.SystemState {
 func (v *VehicleSystem) checkHibernationConditions() {
 	currentState := v.getCurrentState()
 
-	// Only check hibernation conditions in parked state
-	if currentState != types.StateParked {
+	// Only check hibernation conditions in parked or hibernation states
+	if currentState != types.StateParked &&
+	   currentState != types.StateWaitingHibernation &&
+	   currentState != types.StateWaitingHibernationSeatbox &&
+	   currentState != types.StateWaitingHibernationConfirm {
 		v.hibernationManager.cancelHibernation()
 		return
 	}
@@ -449,22 +454,20 @@ func (hm *HibernationManager) updateBrakeState(bothBrakesPressed bool) {
 	case HibernationConfirmation:
 		if previousBrakeState && !bothBrakesPressed {
 			// Brakes just released - start confirmation timeout
-			hm.logger.Infof("Brakes released - entering confirmation phase")
+			hm.logger.Infof("Brakes released - starting confirmation timeout")
 			hm.brakesReleased = true
 			hm.startConfirmationTimeout()
 		} else if !previousBrakeState && bothBrakesPressed {
-			// Brakes pressed again after release during confirmation
+			// Brakes pressed again after release
 			if hm.brakesReleased {
-				hm.logger.Infof("Both brakes pressed again during confirmation - manual confirm")
-				hm.confirmHibernation(false) // Manual confirmation - require seatbox closed
+				hm.logger.Infof("Both brakes pressed again - resetting timeout and starting rehold timer")
+				hm.startReholdTimer()
 			}
-		} else if bothBrakesPressed && !hm.brakesReleased {
-			// Still holding brakes continuously - check for force hibernation
-			if time.Since(hm.startTime) >= hibernationForceHoldDuration {
-				hm.logger.Infof("Force hibernation triggered - 40s continuous hold")
-				hm.confirmHibernation(true) // Auto-confirm - skip seatbox check
-			}
+		} else if previousBrakeState && bothBrakesPressed {
+			// Brakes still held or touched - reset timeout timer
+			hm.resetConfirmationTimeout()
 		}
+		// Force hibernation after continuous hold is handled by timer in transitionToConfirmation()
 	}
 }
 
@@ -474,14 +477,7 @@ func (hm *HibernationManager) startInitialHold() {
 	hm.startTime = time.Now()
 	hm.brakesReleased = false
 
-	hm.logger.Infof("Starting hibernation initial hold (%ds)", int(hibernationInitialHoldDuration.Seconds()))
-
-	// Transition vehicle to waiting-hibernation state
-	if hm.transitionTo != nil {
-		if err := hm.transitionTo(types.StateWaitingHibernation); err != nil {
-			hm.logger.Infof("Failed to transition to waiting-hibernation: %v", err)
-		}
-	}
+	hm.logger.Infof("Starting hibernation initial hold (%.0fs)", hibernationInitialHoldDuration.Seconds())
 
 	// Start timer for initial hold
 	hm.initialTimer = time.AfterFunc(hibernationInitialHoldDuration, func() {
@@ -489,7 +485,17 @@ func (hm *HibernationManager) startInitialHold() {
 		defer hm.mu.Unlock()
 
 		if hm.state == HibernationInitialHold && hm.bothBrakesHeld {
-			hm.logger.Infof("Initial hold completed - entering confirmation phase")
+			hm.logger.Infof("Initial hold completed - transitioning to waiting-hibernation")
+
+			// Transition vehicle to waiting-hibernation state after 20s hold
+			if hm.transitionTo != nil {
+				if err := hm.transitionTo(types.StateWaitingHibernation); err != nil {
+					hm.logger.Infof("Failed to transition to waiting-hibernation: %v", err)
+					return
+				}
+			}
+
+			// Enter confirmation phase
 			hm.transitionToConfirmation()
 		}
 	})
@@ -506,6 +512,21 @@ func (hm *HibernationManager) transitionToConfirmation() {
 	}
 
 	hm.logger.Infof("Hibernation confirmation phase started")
+
+	// Start a timer for force hibernation (remaining time to reach total duration)
+	remainingTime := hibernationForceHoldDuration - time.Since(hm.startTime)
+	if remainingTime > 0 {
+		hm.initialTimer = time.AfterFunc(remainingTime, func() {
+			hm.mu.Lock()
+			defer hm.mu.Unlock()
+
+			// If brakes are still held continuously (never released), trigger force hibernation
+			if hm.state == HibernationConfirmation && hm.bothBrakesHeld && !hm.brakesReleased {
+				hm.logger.Infof("Force hibernation triggered - %.0fs continuous hold", hibernationForceHoldDuration.Seconds())
+				hm.confirmHibernation(true) // Auto-confirm - skip seatbox check
+			}
+		})
+	}
 
 	// Check if seatbox is open - if so, transition to seatbox notification state
 	if hm.isSeatboxClosed != nil {
@@ -527,31 +548,91 @@ func (hm *HibernationManager) transitionToConfirmation() {
 	// (no separate state needed, waiting-hibernation covers this)
 }
 
-// startConfirmationTimeout starts the 15s timeout for confirmation after brake release
+// startConfirmationTimeout starts the 30s timeout for confirmation after brake release
 func (hm *HibernationManager) startConfirmationTimeout() {
 	// Stop any existing confirmation timer
 	if hm.confirmationTimer != nil {
 		hm.confirmationTimer.Stop()
 	}
 
+	// Stop the force hibernation timer since brakes were released
+	if hm.initialTimer != nil {
+		hm.initialTimer.Stop()
+		hm.initialTimer = nil
+	}
+
+	// Stop any rehold timer
+	if hm.reholdTimer != nil {
+		hm.reholdTimer.Stop()
+		hm.reholdTimer = nil
+	}
+
 	hm.confirmationTimer = time.AfterFunc(hibernationConfirmationTimeout, func() {
 		hm.mu.Lock()
 		defer hm.mu.Unlock()
 
-		if hm.state == HibernationConfirmation && hm.brakesReleased {
+		// Only timeout if brakes are NOT held
+		if hm.state == HibernationConfirmation && !hm.bothBrakesHeld {
 			hm.logger.Infof("Confirmation timeout - cancelling hibernation")
 			hm.resetToIdle()
 		}
 	})
 
-	hm.logger.Infof("Confirmation timeout started (15s)")
+	hm.logger.Infof("Confirmation timeout started (%.0fs)", hibernationConfirmationTimeout.Seconds())
+}
+
+// resetConfirmationTimeout resets the confirmation timeout (called when brakes touched)
+func (hm *HibernationManager) resetConfirmationTimeout() {
+	if hm.confirmationTimer != nil {
+		hm.confirmationTimer.Stop()
+		hm.confirmationTimer = time.AfterFunc(hibernationConfirmationTimeout, func() {
+			hm.mu.Lock()
+			defer hm.mu.Unlock()
+
+			// Only timeout if brakes are NOT held
+			if hm.state == HibernationConfirmation && !hm.bothBrakesHeld {
+				hm.logger.Infof("Confirmation timeout - cancelling hibernation")
+				hm.resetToIdle()
+			}
+		})
+		hm.logger.Infof("Confirmation timeout reset (%.0fs)", hibernationConfirmationTimeout.Seconds())
+	}
+}
+
+// startReholdTimer starts a timer for force confirmation after brakes are pressed again
+func (hm *HibernationManager) startReholdTimer() {
+	// Stop any existing rehold timer
+	if hm.reholdTimer != nil {
+		hm.reholdTimer.Stop()
+	}
+
+	// Stop confirmation timeout since user is actively holding brakes
+	if hm.confirmationTimer != nil {
+		hm.confirmationTimer.Stop()
+		hm.confirmationTimer = nil
+	}
+
+	hm.reholdStartTime = time.Now()
+	hm.reholdTimer = time.AfterFunc(hibernationInitialHoldDuration, func() {
+		hm.mu.Lock()
+		defer hm.mu.Unlock()
+
+		// If brakes still held, trigger force confirmation
+		if hm.state == HibernationConfirmation && hm.bothBrakesHeld {
+			hm.logger.Infof("Force hibernation triggered - %.0fs rehold", hibernationInitialHoldDuration.Seconds())
+			hm.confirmHibernation(true) // Auto-confirm - skip seatbox check
+		}
+	})
+
+	hm.logger.Infof("Rehold timer started (%.0fs)", hibernationInitialHoldDuration.Seconds())
 }
 
 // confirmHibernation executes the hibernation after checking safety conditions
-// autoConfirm: if true, skips seatbox check (for 40s continuous hold warehouse mode)
+// autoConfirm: if true, skips seatbox check (for continuous hold or rehold)
 func (hm *HibernationManager) confirmHibernation(autoConfirm bool) {
 	if autoConfirm {
-		hm.logger.Infof("Hibernation auto-confirmed (40s hold), checking safety conditions")
+		hm.logger.Infof("Hibernation auto-confirmed (%.0fs continuous or %.0fs rehold), checking safety conditions",
+			hibernationForceHoldDuration.Seconds(), hibernationInitialHoldDuration.Seconds())
 	} else {
 		hm.logger.Infof("Hibernation confirmed, checking safety conditions")
 	}
@@ -638,12 +719,17 @@ func (hm *HibernationManager) resetToIdle() {
 		hm.confirmationTimer.Stop()
 		hm.confirmationTimer = nil
 	}
+	if hm.reholdTimer != nil {
+		hm.reholdTimer.Stop()
+		hm.reholdTimer = nil
+	}
 
 	// Reset state
 	hm.state = HibernationIdle
 	hm.bothBrakesHeld = false
 	hm.brakesReleased = false
 	hm.startTime = time.Time{}
+	hm.reholdStartTime = time.Time{}
 
 	// Transition vehicle back to parked state
 	if hm.transitionTo != nil {
@@ -664,21 +750,6 @@ func (hm *HibernationManager) handleKeycardConfirmation() {
 	}
 }
 
-// handleBrakeConfirmation handles individual brake presses during confirmation
-func (hm *HibernationManager) handleBrakeConfirmation(leftPressed, rightPressed bool) {
-	hm.mu.Lock()
-	defer hm.mu.Unlock()
-
-	if hm.state == HibernationConfirmation && hm.brakesReleased {
-		if rightPressed && !leftPressed {
-			hm.logger.Infof("Right brake confirmation received")
-			hm.confirmHibernation(false) // Single brake confirmation - require seatbox closed
-		} else if leftPressed && !rightPressed {
-			hm.logger.Infof("Left brake cancellation received")
-			hm.resetToIdle()
-		}
-	}
-}
 
 // triggerShutdownTimeout handles the shutdown timer expiration and transitions to standby
 func (v *VehicleSystem) triggerShutdownTimeout() {
@@ -941,22 +1012,6 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		}
 		if err := v.redis.SetBrakeState(side, value); err != nil {
 			return fmt.Errorf("failed to set brake state in Redis: %w", err)
-		}
-
-		// Handle individual brake confirmation for hibernation
-		if value { // Only handle on brake press, not release
-			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-			if err != nil {
-				v.logger.Infof("Failed to read brake_left for hibernation confirmation: %v", err)
-			} else {
-				brakeRight, err := v.io.ReadDigitalInput("brake_right")
-				if err != nil {
-					v.logger.Infof("Failed to read brake_right for hibernation confirmation: %v", err)
-				} else {
-					// Handle individual brake confirmation
-					v.hibernationManager.handleBrakeConfirmation(brakeLeft, brakeRight)
-				}
-			}
 		}
 
 		// Check for hibernation conditions (both brakes pressed in parked state)
