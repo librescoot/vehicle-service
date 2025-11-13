@@ -1331,39 +1331,3 @@ func (v *VehicleSystem) Shutdown() {
 	}
 }
 
-// handleSettingsUpdate processes settings changes from Redis
-func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
-	v.logger.Infof("Handling settings update: %s", settingKey)
-
-	switch settingKey {
-	case "scooter.brake-hibernation":
-		// Read the new value from Redis
-		value, err := v.redis.GetHashField("settings", settingKey)
-		if err != nil {
-			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
-			return err
-		}
-
-		v.mu.Lock()
-		switch value {
-		case "enabled":
-			v.brakeHibernationEnabled = true
-			v.logger.Infof("Brake hibernation enabled via settings update")
-		case "disabled":
-			v.brakeHibernationEnabled = false
-			// Cancel any active hibernation sequence
-			if v.hibernationManager != nil {
-				v.hibernationManager.cancelHibernation()
-			}
-			v.logger.Infof("Brake hibernation disabled via settings update")
-		default:
-			v.logger.Warnf("Unknown brake hibernation setting value: '%s'", value)
-		}
-		v.mu.Unlock()
-
-	default:
-		v.logger.Infof("Unknown setting key: %s", settingKey)
-	}
-
-	return nil
-}
