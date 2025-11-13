@@ -106,7 +106,7 @@ func (io *LinuxHardwareIO) Initialize() error {
 	io.logger.Infof("Initializing hardware IO")
 
 	// Initialize PWM LED
-	io.pwmLed = NewImxPwmLed()
+	io.pwmLed = NewImxPwmLed(io.logger)
 	if err := io.pwmLed.Init(); err != nil {
 		return fmt.Errorf("failed to initialize PWM LED: %w", err)
 	}
