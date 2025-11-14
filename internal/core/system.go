@@ -30,9 +30,10 @@ const (
 	// Hardware timing constants
 	blinkerInterval       = 800 * time.Millisecond
 	handlebarLockDuration = 1100 * time.Millisecond
-	shutdownTimerDuration = 3500 * time.Millisecond
+	shutdownTimerDuration = 4000 * time.Millisecond
 	handlebarLockWindow   = 10 * time.Second
 	seatboxLockDuration   = 200 * time.Millisecond
+	parkDebounceTime      = 1 * time.Second
 
 	// Hibernation timing constants
 	hibernationInitialHoldDuration = 15 * time.Second // Initial brake hold to enter waiting-hibernation
@@ -96,6 +97,7 @@ type VehicleSystem struct {
 	handlebarUnlocked      bool        // Track if handlebar has been unlocked in this power cycle
 	handlebarTimer         *time.Timer // Timer for handlebar position window
 	shutdownTimer          *time.Timer // Timer for shutting-down to standby transition
+	readyToDriveEntryTime  time.Time   // Track when we entered ready-to-drive state for park debounce
 	keycardTapCount        int
 	lastKeycardTapTime     time.Time
 	forceStandbyNoLock     bool
@@ -947,7 +949,19 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			return err
 		}
 		if value {
-			// Kickstand down - always go to PARKED
+			// Kickstand down - check debounce if coming from ready-to-drive
+			if currentState == types.StateReadyToDrive {
+				v.mu.RLock()
+				entryTime := v.readyToDriveEntryTime
+				v.mu.RUnlock()
+
+				timeSinceEntry := time.Since(entryTime)
+				if timeSinceEntry < parkDebounceTime {
+					v.logger.Infof("Kickstand down ignored - debounce protection (%.2fs since entering ready-to-drive)", timeSinceEntry.Seconds())
+					return nil
+				}
+			}
+			// Kickstand down - go to PARKED
 			v.logger.Infof("Kickstand down, transitioning to PARKED")
 			return v.transitionTo(types.StateParked)
 		} else if v.isReadyToDrive() {

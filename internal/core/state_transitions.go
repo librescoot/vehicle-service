@@ -40,6 +40,11 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 	switch newState {
 
 	case types.StateReadyToDrive:
+		// Record entry time for park debounce protection
+		v.mu.Lock()
+		v.readyToDriveEntryTime = time.Now()
+		v.mu.Unlock()
+
 		if err := v.unlockHandlebarIfNeeded(); err != nil {
 			return err
 		}
@@ -240,7 +245,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		// The timer will handle transitioning to standby and turning off dashboard power
 
 		v.shutdownTimer = time.AfterFunc(shutdownTimerDuration, v.triggerShutdownTimeout)
-		v.logger.Infof("Started shutdown timer (3.5s)")
+		v.logger.Infof("Started shutdown timer (4.0s)")
 
 	}
 
