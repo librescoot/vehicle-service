@@ -249,6 +249,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	}
 
+	// Update engine brake based on new state
+	if err := v.updateEngineBrake(); err != nil {
+		v.logger.Errorf("Failed to update engine brake after state transition: %v", err)
+		return err
+	}
+
 	v.logger.Debugf("State transition completed successfully")
 	return nil
 }
@@ -387,6 +393,40 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 	// Only unlock if we haven't unlocked yet in this power cycle
 	if !unlocked && (state == types.StateParked || state == types.StateReadyToDrive) {
 		return v.unlockHandlebar()
+	}
+
+	return nil
+}
+
+// updateEngineBrake sets the engine brake based on current state and brake inputs
+// Called after every state transition to ensure motor is disabled outside READY_TO_DRIVE
+func (v *VehicleSystem) updateEngineBrake() error {
+	v.mu.RLock()
+	currentState := v.state
+	v.mu.RUnlock()
+
+	// Read current brake states
+	brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+	if err != nil {
+		return fmt.Errorf("failed to read brake_left: %w", err)
+	}
+	brakeRight, err := v.io.ReadDigitalInput("brake_right")
+	if err != nil {
+		return fmt.Errorf("failed to read brake_right: %w", err)
+	}
+
+	// Engine brake logic:
+	// - In READY_TO_DRIVE: follows brake levers (engaged when either pressed)
+	// - In all other states: always engaged (motor disabled)
+	var engineBrakeEngaged bool
+	if currentState == types.StateReadyToDrive {
+		engineBrakeEngaged = brakeLeft || brakeRight
+	} else {
+		engineBrakeEngaged = true
+	}
+
+	if err := v.io.WriteDigitalOutput("engine_brake", engineBrakeEngaged); err != nil {
+		return fmt.Errorf("failed to set engine brake: %w", err)
 	}
 
 	return nil
