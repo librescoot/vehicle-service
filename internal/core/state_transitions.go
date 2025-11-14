@@ -94,7 +94,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			return err
 		}
 
-		if err := v.setPower("engine_power", false); err != nil {
+		if err := v.setPower("engine_power", true); err != nil {
 			v.logger.Errorf("%v", err)
 			return err
 		}
