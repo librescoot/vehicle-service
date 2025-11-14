@@ -997,26 +997,33 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			}
 		}
 
-		// Control engine brake in drive mode
+		// Control engine brake based on state
 		v.mu.RLock()
-		inDriveMode := v.state == types.StateReadyToDrive
+		currentState := v.state
 		v.mu.RUnlock()
 
-		if inDriveMode {
-			// Check if either brake is pressed after this change
-			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-			if err != nil {
-				return fmt.Errorf("failed to read brake_left: %w", err)
-			}
-			brakeRight, err := v.io.ReadDigitalInput("brake_right")
-			if err != nil {
-				return fmt.Errorf("failed to read brake_right: %w", err)
-			}
+		// Check if either brake is pressed after this change
+		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+		if err != nil {
+			return fmt.Errorf("failed to read brake_left: %w", err)
+		}
+		brakeRight, err := v.io.ReadDigitalInput("brake_right")
+		if err != nil {
+			return fmt.Errorf("failed to read brake_right: %w", err)
+		}
 
-			// Enable engine brake if either brake is pressed, disable if both are released
-			if err := v.io.WriteDigitalOutput("engine_brake", brakeLeft || brakeRight); err != nil {
-				return fmt.Errorf("failed to control engine brake: %w", err)
-			}
+		// Engine brake logic:
+		// - In READY_TO_DRIVE: follows brake levers (enable if either pressed)
+		// - In all other states: always engaged (motor disabled)
+		var engineBrakeEngaged bool
+		if currentState == types.StateReadyToDrive {
+			engineBrakeEngaged = brakeLeft || brakeRight
+		} else {
+			engineBrakeEngaged = true // Always engaged (motor disabled) outside drive mode
+		}
+
+		if err := v.io.WriteDigitalOutput("engine_brake", engineBrakeEngaged); err != nil {
+			return fmt.Errorf("failed to control engine brake: %w", err)
 		}
 
 		// Update Redis state
