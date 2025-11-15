@@ -346,7 +346,11 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 		v.mu.Unlock()
 
 	default:
-		v.logger.Infof("Unknown setting key: %s", settingKey)
+		// Only log unknown settings if they're in the scooter namespace
+		// Silently ignore settings for other services (e.g., updates.*, battery.*, etc.)
+		if strings.HasPrefix(settingKey, "scooter.") {
+			v.logger.Infof("Unknown scooter setting key: %s", settingKey)
+		}
 	}
 
 	return nil
