@@ -883,6 +883,23 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		}
 	}
 
+	// Physical blinker switch only works in active states (parked, ready-to-drive, waiting states)
+	// In other states, blinker control comes from software commands only
+	if channel == "blinker_right" || channel == "blinker_left" {
+		isActive := currentState == types.StateParked ||
+			currentState == types.StateReadyToDrive ||
+			currentState == types.StateWaitingSeatbox ||
+			currentState == types.StateWaitingHibernation ||
+			currentState == types.StateWaitingHibernationAdvanced ||
+			currentState == types.StateWaitingHibernationSeatbox ||
+			currentState == types.StateWaitingHibernationConfirm
+
+		if !isActive {
+			v.logger.Infof("Ignoring physical blinker switch in %s state", currentState)
+			return nil
+		}
+	}
+
 	// Check for manual ready-to-drive activation when in parked state
 	if currentState == types.StateParked && channel == "seatbox_button" && value {
 		// Check if dashboard has not signaled readiness
