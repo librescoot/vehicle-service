@@ -381,6 +381,11 @@ func (v *VehicleSystem) unlockHandlebar() error {
 
 // handleHandlebarPosition is the callback for handlebar position sensor changes
 func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) error {
+	// Always update Redis state first
+	if err := v.redis.SetHandlebarPosition(value); err != nil {
+		v.logger.Warnf("Failed to update handlebar position in Redis: %v", err)
+	}
+
 	if !value {
 		return nil // Only care about activation
 	}
