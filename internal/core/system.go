@@ -235,14 +235,25 @@ func (v *VehicleSystem) Start() error {
 		v.mu.Lock()
 		v.state = savedState
 		v.mu.Unlock()
+	}
 
-		// Set initial GPIO values based on saved state
-		// If DBC update is in progress, dashboard must stay ON regardless of state
-		v.mu.RLock()
-		dashboardPower := savedState == types.StateReadyToDrive || savedState == types.StateParked || v.dbcUpdating
-		v.mu.RUnlock()
+	// Read dashboard power from Redis BEFORE hardware initialization
+	// This ensures GPIO starts with correct value (no power interruption)
+	if savedState != types.StateInit && savedState != types.StateShuttingDown {
+		dashboardPower, err := v.redis.GetDashboardPower()
+		if err != nil {
+			v.logger.Warnf("Failed to read dashboard power from Redis: %v", err)
+			// Fallback to state-based logic
+			v.mu.RLock()
+			dashboardPower = savedState == types.StateReadyToDrive || savedState == types.StateParked || v.dbcUpdating
+			v.mu.RUnlock()
+		}
+		v.logger.Infof("Setting initial dashboard power: %v", dashboardPower)
 		v.io.SetInitialValue("dashboard_power", dashboardPower)
-		v.io.SetInitialValue("engine_power", savedState == types.StateReadyToDrive)
+
+		// Also set engine power initial value
+		enginePower := (savedState == types.StateReadyToDrive || savedState == types.StateParked)
+		v.io.SetInitialValue("engine_power", enginePower)
 	}
 
 	// Reload PWM LED kernel module, log outcomes for diagnostics
@@ -265,7 +276,7 @@ func (v *VehicleSystem) Start() error {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Initialize hardware
+	// Initialize hardware (will use initial values set above)
 	if err := v.io.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize hardware: %w", err)
 	}
@@ -282,16 +293,9 @@ func (v *VehicleSystem) Start() error {
 		v.logger.Infof("Initial state: handlebar is unlocked")
 	}
 
-	// Read actual dashboard_power DO state and persist to Redis
-	dashboardPowerState, err := v.io.ReadDigitalOutput("dashboard_power")
-	if err != nil {
-		v.logger.Warnf("Warning: Failed to read initial dashboard power state: %v", err)
-	} else {
-		v.logger.Infof("Initial dashboard power state from hardware: %v", dashboardPowerState)
-		if err := v.redis.SetDashboardPower(dashboardPowerState); err != nil {
-			v.logger.Warnf("Failed to persist initial dashboard power state to Redis: %v", err)
-		}
-	}
+	// Note: We do NOT read/sync dashboard power to Redis here
+	// Dashboard power is preserved from Redis during power restoration later
+	// Only state transitions should change dashboard power in Redis
 
 	// Register input callbacks
 	channels := []string{
@@ -341,7 +345,31 @@ func (v *VehicleSystem) Start() error {
 		}
 	}
 
-	// Now that hardware is initialized, restore state and outputs
+	// Now that hardware is initialized, set engine brake based on state
+	if savedState != types.StateInit && savedState != types.StateShuttingDown {
+		// Apply engine brake based on state
+		var engineBrake bool
+		if savedState == types.StateReadyToDrive {
+			// In drive mode, brake follows physical brake levers
+			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+			if err != nil {
+				return fmt.Errorf("failed to read brake_left: %w", err)
+			}
+			brakeRight, err := v.io.ReadDigitalInput("brake_right")
+			if err != nil {
+				return fmt.Errorf("failed to read brake_right: %w", err)
+			}
+			engineBrake = brakeLeft || brakeRight
+		} else {
+			// In all other states, brake is always engaged (motor disabled)
+			engineBrake = true
+		}
+		if err := v.io.WriteDigitalOutput("engine_brake", engineBrake); err != nil {
+			return fmt.Errorf("failed to set engine brake: %w", err)
+		}
+	}
+
+	// Play LED cues based on restored state
 	if savedState == types.StateReadyToDrive || savedState == types.StateParked {
 		// Read brake states to determine which LED cue to play
 		brakeLeft, err := v.io.ReadDigitalInput("brake_left")

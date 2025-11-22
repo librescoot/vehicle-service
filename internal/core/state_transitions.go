@@ -99,16 +99,6 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			return err
 		}
 
-		if err := v.setPower("engine_power", true); err != nil {
-			v.logger.Errorf("%v", err)
-			return err
-		}
-
-		if err := v.setPower("dashboard_power", true); err != nil {
-			v.logger.Errorf("%v", err)
-			return err
-		}
-
 		if oldState == types.StateReadyToDrive {
 			v.playLedCue(6, "drive to parked")
 		}
@@ -217,10 +207,7 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			v.shutdownTimer = nil
 		}
 
-		// Turn off all outputs
-		if err := v.setPower("engine_power", false); err != nil {
-			v.logger.Errorf("%v during shutdown", err)
-		}
+		// Outputs will be set by applyStateOutputs() below
 
 		// Play shutdown LED cue based on brake state
 		brakeLeft, brakeRight, err := v.readBrakeStates()
@@ -249,9 +236,10 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 
 	}
 
-	// Update engine brake based on new state
-	if err := v.updateEngineBrake(); err != nil {
-		v.logger.Errorf("Failed to update engine brake after state transition: %v", err)
+	// Apply canonical state outputs (dashboard_power, engine_power, engine_brake)
+	// This is the single source of truth for what outputs should be set in each state
+	if err := v.applyStateOutputs(newState); err != nil {
+		v.logger.Errorf("Failed to apply state outputs after transition: %v", err)
 		return err
 	}
 
@@ -403,8 +391,70 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 	return nil
 }
 
-// updateEngineBrake sets the engine brake based on current state and brake inputs
-// Called after every state transition to ensure motor is disabled outside READY_TO_DRIVE
+// applyStateOutputs is the canonical function for setting all GPIO outputs based on vehicle state
+// Called during state transitions to apply state-based logic
+func (v *VehicleSystem) applyStateOutputs(state types.SystemState) error {
+	v.logger.Debugf("Applying outputs for state: %s", state)
+
+	// Dashboard power logic: state-based with DBC update override
+	var dashboardPower bool
+	v.mu.RLock()
+	dbcUpdating := v.dbcUpdating
+	v.mu.RUnlock()
+
+	switch state {
+	case types.StateReadyToDrive, types.StateParked, types.StateShuttingDown:
+		dashboardPower = true
+	case types.StateStandby, types.StateInit:
+		dashboardPower = false
+	default:
+		dashboardPower = false
+	}
+
+	// DBC update overrides: dashboard must stay ON during updates
+	if dbcUpdating {
+		dashboardPower = true
+	}
+
+	// Engine power logic
+	enginePower := (state == types.StateReadyToDrive || state == types.StateParked)
+
+	// Engine brake logic
+	var engineBrake bool
+	if state == types.StateReadyToDrive {
+		// In drive mode, brake follows physical brake levers
+		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+		if err != nil {
+			return fmt.Errorf("failed to read brake_left: %w", err)
+		}
+		brakeRight, err := v.io.ReadDigitalInput("brake_right")
+		if err != nil {
+			return fmt.Errorf("failed to read brake_right: %w", err)
+		}
+		engineBrake = brakeLeft || brakeRight
+	} else {
+		// In all other states, brake is always engaged (motor disabled)
+		engineBrake = true
+	}
+
+	// Apply all outputs
+	if err := v.setPower("dashboard_power", dashboardPower); err != nil {
+		return fmt.Errorf("failed to set dashboard power: %w", err)
+	}
+
+	if err := v.setPower("engine_power", enginePower); err != nil {
+		return fmt.Errorf("failed to set engine power: %w", err)
+	}
+
+	if err := v.io.WriteDigitalOutput("engine_brake", engineBrake); err != nil {
+		return fmt.Errorf("failed to set engine brake: %w", err)
+	}
+
+	return nil
+}
+
+// updateEngineBrake updates only the engine brake based on current state
+// Used when brake lever state changes but vehicle state hasn't
 func (v *VehicleSystem) updateEngineBrake() error {
 	v.mu.RLock()
 	currentState := v.state
