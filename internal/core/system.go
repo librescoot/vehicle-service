@@ -197,13 +197,31 @@ func (v *VehicleSystem) Start() error {
 	}
 
 	// Check if DBC update is in progress and restore dbcUpdating flag
+	// First check the explicit vehicle:dbc-updating flag
+	dbcUpdating, err := v.redis.GetDbcUpdating()
+	if err != nil {
+		v.logger.Warnf("Failed to get DBC updating flag on startup: %v", err)
+	} else if dbcUpdating {
+		v.logger.Infof("DBC updating flag set on startup, restoring dbcUpdating flag")
+		v.mu.Lock()
+		v.dbcUpdating = true
+		v.mu.Unlock()
+	}
+
+	// Also check OTA status as a fallback/secondary check
 	dbcStatus, err := v.redis.GetOtaStatus("dbc")
 	if err != nil {
 		v.logger.Warnf("Failed to get DBC OTA status on startup: %v", err)
 	} else if dbcStatus == "downloading" || dbcStatus == "installing" || dbcStatus == "rebooting" {
 		v.logger.Infof("DBC update in progress on startup (status=%s), restoring dbcUpdating flag", dbcStatus)
 		v.mu.Lock()
-		v.dbcUpdating = true
+		if !v.dbcUpdating {
+			v.dbcUpdating = true
+			// Sync the Redis flag if it wasn't already set
+			if err := v.redis.SetDbcUpdating(true); err != nil {
+				v.logger.Warnf("Failed to sync DBC updating flag to Redis: %v", err)
+			}
+		}
 		v.mu.Unlock()
 	}
 
@@ -262,6 +280,17 @@ func (v *VehicleSystem) Start() error {
 	} else {
 		v.handlebarUnlocked = true // Sensor is pressed (true), meaning it's unlocked
 		v.logger.Infof("Initial state: handlebar is unlocked")
+	}
+
+	// Read actual dashboard_power DO state and persist to Redis
+	dashboardPowerState, err := v.io.ReadDigitalOutput("dashboard_power")
+	if err != nil {
+		v.logger.Warnf("Warning: Failed to read initial dashboard power state: %v", err)
+	} else {
+		v.logger.Infof("Initial dashboard power state from hardware: %v", dashboardPowerState)
+		if err := v.redis.SetDashboardPower(dashboardPowerState); err != nil {
+			v.logger.Warnf("Failed to persist initial dashboard power state to Redis: %v", err)
+		}
 	}
 
 	// Register input callbacks
@@ -1297,6 +1326,14 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 			action = "disable"
 		}
 		return fmt.Errorf("failed to %s %s: %w", action, component, err)
+	}
+
+	// Persist dashboard_power state to Redis
+	if component == "dashboard_power" {
+		if err := v.redis.SetDashboardPower(enabled); err != nil {
+			v.logger.Warnf("Failed to persist dashboard power state to Redis: %v", err)
+			// Don't return error - hardware state was set successfully
+		}
 	}
 
 	state := "enabled"

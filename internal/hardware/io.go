@@ -343,6 +343,25 @@ func (io *LinuxHardwareIO) WriteDigitalOutput(channel string, value bool) error 
 	return nil
 }
 
+// ReadDigitalOutput reads the current state of a digital output
+func (io *LinuxHardwareIO) ReadDigitalOutput(channel string) (bool, error) {
+	io.mu.RLock()
+	line, ok := io.lines[channel]
+	io.mu.RUnlock()
+
+	if !ok {
+		return false, fmt.Errorf("unknown digital output channel: %s", channel)
+	}
+
+	val, err := line.Value()
+	if err != nil {
+		return false, fmt.Errorf("failed to read DO %s: %w", channel, err)
+	}
+
+	io.logger.Debugf("Read DO %s=%v", channel, val == 1)
+	return val == 1, nil
+}
+
 func (io *LinuxHardwareIO) PlayPwmCue(idx int) error {
 	return io.pwmLed.PlayCue(idx)
 }

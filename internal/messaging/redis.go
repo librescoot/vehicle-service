@@ -132,9 +132,9 @@ func (r *RedisClient) listCommandListener(key string, handler func(string) error
 			default:
 				if len(result) >= 2 { // BRPOP returns [key, value]
 					value := result[1]
-					r.logger.Infof("Received command from %s: %s", key, value)
+					r.logger.Debugf("Received command from %s: %s", key, value)
 					if err := handler(value); err != nil {
-						r.logger.Infof("Error handling %s command: %v", key, err)
+						r.logger.Warnf("Error handling %s command: %v", key, err)
 					}
 				}
 			}
@@ -628,6 +628,62 @@ func (r *RedisClient) SetHandlebarLockState(isLocked bool) error {
 	}
 	r.logger.Debugf("Successfully set handlebar lock state")
 	return nil
+}
+
+// SetDbcUpdating sets the DBC updating state in Redis
+func (r *RedisClient) SetDbcUpdating(updating bool) error {
+	r.logger.Debugf("Setting DBC updating state: %v", updating)
+	value := "false"
+	if updating {
+		value = "true"
+	}
+
+	if err := r.publishHashSet("vehicle", "dbc-updating", value, "vehicle", "dbc-updating"); err != nil {
+		r.logger.Warnf("Failed to set DBC updating state: %v", err)
+		return err
+	}
+	r.logger.Debugf("Successfully set DBC updating state")
+	return nil
+}
+
+// GetDbcUpdating gets the DBC updating state from Redis
+func (r *RedisClient) GetDbcUpdating() (bool, error) {
+	value, err := r.client.HGet(r.ctx, "vehicle", "dbc-updating").Result()
+	if err != nil {
+		if err == redis.Nil {
+			return false, nil // Field doesn't exist, default to false
+		}
+		return false, err
+	}
+	return value == "true", nil
+}
+
+// SetDashboardPower sets the dashboard power state in Redis
+func (r *RedisClient) SetDashboardPower(enabled bool) error {
+	r.logger.Debugf("Setting dashboard power state: %v", enabled)
+	value := "off"
+	if enabled {
+		value = "on"
+	}
+
+	if err := r.publishHashSet("vehicle", "dashboard:power", value, "vehicle", "dashboard:power"); err != nil {
+		r.logger.Warnf("Failed to set dashboard power state: %v", err)
+		return err
+	}
+	r.logger.Debugf("Successfully set dashboard power state")
+	return nil
+}
+
+// GetDashboardPower gets the dashboard power state from Redis
+func (r *RedisClient) GetDashboardPower() (bool, error) {
+	value, err := r.client.HGet(r.ctx, "vehicle", "dashboard:power").Result()
+	if err != nil {
+		if err == redis.Nil {
+			return false, nil // Field doesn't exist, default to false/off
+		}
+		return false, err
+	}
+	return value == "on", nil
 }
 
 // PublishUpdateStatus publishes the update status to Redis

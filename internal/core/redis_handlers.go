@@ -161,6 +161,12 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.mu.Lock()
 		v.dbcUpdating = true
 		v.mu.Unlock()
+
+		// Persist to Redis
+		if err := v.redis.SetDbcUpdating(true); err != nil {
+			v.logger.Warnf("Failed to persist DBC updating state to Redis: %v", err)
+		}
+
 		// Ensure dashboard is powered on
 		if err := v.setPower("dashboard_power", true); err != nil {
 			v.logger.Errorf("%v for DBC update", err)
@@ -174,8 +180,12 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.dbcUpdating = false
 		deferredPower := v.deferredDashboardPower
 		v.deferredDashboardPower = nil
-		currentState := v.state
 		v.mu.Unlock()
+
+		// Persist to Redis
+		if err := v.redis.SetDbcUpdating(false); err != nil {
+			v.logger.Warnf("Failed to persist DBC updating state to Redis: %v", err)
+		}
 
 		// Apply any deferred dashboard power state
 		if deferredPower != nil {
@@ -192,12 +202,20 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 					return err
 				}
 			}
-		} else if currentState == types.StateStandby {
-			// No deferred power state, but we're in standby - turn off dashboard power
-			v.logger.Debugf("DBC update complete and in standby state - turning off dashboard power")
-			if err := v.setPower("dashboard_power", false); err != nil {
-				v.logger.Errorf("%v", err)
-				return err
+		} else {
+			// No deferred power - check CURRENT state and turn off if in standby
+			v.mu.Lock()
+			currentState := v.state
+			v.mu.Unlock()
+
+			if currentState == types.StateStandby {
+				v.logger.Debugf("DBC update complete and in standby state - turning off dashboard power")
+				if err := v.setPower("dashboard_power", false); err != nil {
+					v.logger.Errorf("%v", err)
+					return err
+				}
+			} else {
+				v.logger.Debugf("DBC update complete but not in standby (state=%s) - leaving dashboard power on", currentState)
 			}
 		}
 		return nil
@@ -248,12 +266,13 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 	v.logger.Debugf("Handling hardware request: %s", command)
 
 	parts := strings.Split(command, ":")
-	if len(parts) != 2 {
+	if len(parts) < 2 || len(parts) > 3 {
 		return fmt.Errorf("invalid hardware command format: %s", command)
 	}
 
 	component := parts[0]
 	action := parts[1]
+	force := len(parts) == 3 && parts[2] == "force"
 
 	switch component {
 	case "dashboard":
@@ -265,11 +284,27 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 			}
 			v.logger.Infof("Dashboard power enabled")
 		case "off":
+			// Check if DBC update is in progress (unless force is specified)
+			if !force {
+				v.mu.RLock()
+				dbcUpdating := v.dbcUpdating
+				v.mu.RUnlock()
+
+				if dbcUpdating {
+					v.logger.Warnf("Rejecting dashboard:off command - DBC update in progress (use :force to override)")
+					return fmt.Errorf("DBC update in progress, cannot turn off dashboard (use dashboard:off:force to override)")
+				}
+			}
+
 			if err := v.setPower("dashboard_power", false); err != nil {
 				v.logger.Errorf("%v", err)
 				return err
 			}
-			v.logger.Infof("Dashboard power disabled")
+			if force {
+				v.logger.Infof("Dashboard power disabled (forced)")
+			} else {
+				v.logger.Infof("Dashboard power disabled")
+			}
 		default:
 			return fmt.Errorf("invalid dashboard action: %s", action)
 		}
