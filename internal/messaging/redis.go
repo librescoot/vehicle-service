@@ -282,7 +282,7 @@ func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 				r.logger.Fatalf("Redis connection lost, exiting to allow systemd restart")
 			}
 
-			r.logger.Infof("Received Redis message: channel=%s payload=%s", msg.Channel, msg.Payload)
+			r.logger.Debugf("Received Redis message: channel=%s payload=%s", msg.Channel, msg.Payload)
 
 			switch msg.Channel {
 			case "dashboard":
@@ -440,15 +440,15 @@ func (r *RedisClient) PublishVehicleState(state types.SystemState) error {
 	stateStr := string(state)
 
 	if err := r.publishHashSet("vehicle", "state", stateStr, "vehicle", "state"); err != nil {
-		r.logger.Infof("Failed to publish vehicle state: %v", err)
+		r.logger.Warnf("Failed to publish vehicle state: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully published vehicle state")
+	r.logger.Debugf("Successfully published vehicle state")
 	return nil
 }
 
 func (r *RedisClient) SetBlinkerSwitch(state string) error {
-	r.logger.Infof("Setting blinker switch: %s", state)
+	r.logger.Debugf("Setting blinker switch: %s", state)
 
 	var blinkerStr string
 	switch state {
@@ -465,15 +465,15 @@ func (r *RedisClient) SetBlinkerSwitch(state string) error {
 	}
 
 	if err := r.publishHashSet("vehicle", "blinker:switch", blinkerStr, "vehicle", "blinker:switch"); err != nil {
-		r.logger.Infof("Failed to set blinker switch: %v", err)
+		r.logger.Warnf("Failed to set blinker switch: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully set blinker switch")
+	r.logger.Debugf("Successfully set blinker switch")
 	return nil
 }
 
 func (r *RedisClient) SetBlinkerState(state string) error {
-	r.logger.Infof("Setting blinker state: %s", state)
+	r.logger.Debugf("Setting blinker state: %s", state)
 
 	var blinkerStr string
 	switch state {
@@ -490,10 +490,10 @@ func (r *RedisClient) SetBlinkerState(state string) error {
 	}
 
 	if err := r.publishHashSet("vehicle", "blinker:state", blinkerStr, "vehicle", "blinker:state"); err != nil {
-		r.logger.Infof("Failed to set blinker state: %v", err)
+		r.logger.Warnf("Failed to set blinker state: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully set blinker state")
+	r.logger.Debugf("Successfully set blinker state")
 	return nil
 }
 
@@ -513,7 +513,7 @@ func (r *RedisClient) GetVehicleState() (types.SystemState, error) {
 }
 
 func (r *RedisClient) SetBrakeState(side string, isPressed bool) error {
-	r.logger.Infof("Setting brake state: %s=%v", side, isPressed)
+	r.logger.Debugf("Setting brake state: %s=%v", side, isPressed)
 	state := "off"
 	if isPressed {
 		state = "on"
@@ -521,15 +521,15 @@ func (r *RedisClient) SetBrakeState(side string, isPressed bool) error {
 
 	field := fmt.Sprintf("brake:%s", side)
 	if err := r.publishHashSet("vehicle", field, state, "vehicle", field); err != nil {
-		r.logger.Infof("Failed to set brake state: %v", err)
+		r.logger.Warnf("Failed to set brake state: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully set brake state")
+	r.logger.Debugf("Successfully set brake state")
 	return nil
 }
 
 func (r *RedisClient) SetHornButton(isPressed bool) error {
-	r.logger.Infof("Setting horn button state: %v", isPressed)
+	r.logger.Debugf("Setting horn button state: %v", isPressed)
 	state := "off"
 	if isPressed {
 		state = "on"
@@ -537,15 +537,15 @@ func (r *RedisClient) SetHornButton(isPressed bool) error {
 
 	// Publish to buttons channel for immediate event handling
 	if err := r.publishHashSet("vehicle", "horn:button", state, "buttons", fmt.Sprintf("horn:%s", state)); err != nil {
-		r.logger.Infof("Failed to set horn button state: %v", err)
+		r.logger.Warnf("Failed to set horn button state: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully set horn button state")
+	r.logger.Debugf("Successfully set horn button state")
 	return nil
 }
 
 func (r *RedisClient) SetSeatboxButton(isPressed bool) error {
-	r.logger.Infof("Setting seatbox button state: %v", isPressed)
+	r.logger.Debugf("Setting seatbox button state: %v", isPressed)
 	state := "off"
 	if isPressed {
 		state = "on"
@@ -553,25 +553,25 @@ func (r *RedisClient) SetSeatboxButton(isPressed bool) error {
 
 	// Publish to buttons channel for immediate event handling
 	if err := r.publishHashSet("vehicle", "seatbox:button", state, "buttons", fmt.Sprintf("seatbox:%s", state)); err != nil {
-		r.logger.Infof("Failed to set seatbox button state: %v", err)
+		r.logger.Warnf("Failed to set seatbox button state: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully set seatbox button state")
+	r.logger.Debugf("Successfully set seatbox button state")
 	return nil
 }
 
 func (r *RedisClient) SetSeatboxLockState(isLocked bool) error {
-	r.logger.Infof("Setting seatbox lock state: %v", isLocked)
+	r.logger.Debugf("Setting seatbox lock state: %v", isLocked)
 	state := "open"
 	if isLocked {
 		state = "closed"
 	}
 
 	if err := r.publishHashSet("vehicle", "seatbox:lock", state, "vehicle", "seatbox:lock"); err != nil {
-		r.logger.Infof("Failed to set seatbox lock state: %v", err)
+		r.logger.Warnf("Failed to set seatbox lock state: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully set seatbox lock state")
+	r.logger.Debugf("Successfully set seatbox lock state")
 	return nil
 }
 
@@ -585,22 +585,22 @@ func (r *RedisClient) PublishSeatboxOpened() error {
 }
 
 func (r *RedisClient) SetKickstandState(isDown bool) error {
-	r.logger.Infof("Setting kickstand state: %v", isDown)
+	r.logger.Debugf("Setting kickstand state: %v", isDown)
 	state := "up"
 	if isDown {
 		state = "down"
 	}
 
 	if err := r.publishHashSet("vehicle", "kickstand", state, "vehicle", "kickstand"); err != nil {
-		r.logger.Infof("Failed to set kickstand state: %v", err)
+		r.logger.Warnf("Failed to set kickstand state: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully set kickstand state")
+	r.logger.Debugf("Successfully set kickstand state")
 	return nil
 }
 
 func (r *RedisClient) SetHandlebarPosition(isOnPlace bool) error {
-	r.logger.Infof("Setting handlebar position: %v", isOnPlace)
+	r.logger.Debugf("Setting handlebar position: %v", isOnPlace)
 	state := "off-place"
 	if isOnPlace {
 		state = "on-place"
@@ -608,60 +608,60 @@ func (r *RedisClient) SetHandlebarPosition(isOnPlace bool) error {
 
 	_, err := r.client.HSet(r.ctx, "vehicle", "handlebar:position", state).Result()
 	if err != nil {
-		r.logger.Infof("Failed to set handlebar position: %v", err)
+		r.logger.Warnf("Failed to set handlebar position: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully set handlebar position")
+	r.logger.Debugf("Successfully set handlebar position")
 	return nil
 }
 
 func (r *RedisClient) SetHandlebarLockState(isLocked bool) error {
-	r.logger.Infof("Setting handlebar lock state: %v", isLocked)
+	r.logger.Debugf("Setting handlebar lock state: %v", isLocked)
 	state := "unlocked"
 	if isLocked {
 		state = "locked"
 	}
 
 	if err := r.publishHashSet("vehicle", "handlebar:lock-sensor", state, "vehicle", "handlebar:lock-sensor"); err != nil {
-		r.logger.Infof("Failed to set handlebar lock state: %v", err)
+		r.logger.Warnf("Failed to set handlebar lock state: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully set handlebar lock state")
+	r.logger.Debugf("Successfully set handlebar lock state")
 	return nil
 }
 
 // PublishUpdateStatus publishes the update status to Redis
 func (r *RedisClient) PublishUpdateStatus(status string) error {
-	r.logger.Infof("Publishing update status: %s", status)
+	r.logger.Debugf("Publishing update status: %s", status)
 
 	if err := r.publishHashSet("vehicle", "update:status", status, "vehicle", "update:status"); err != nil {
-		r.logger.Infof("Failed to publish update status: %v", err)
+		r.logger.Warnf("Failed to publish update status: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully published update status")
+	r.logger.Debugf("Successfully published update status")
 	return nil
 }
 
 // PublishButtonEvent publishes a button event to the "buttons" channel
 func (r *RedisClient) PublishButtonEvent(event string) error {
-	r.logger.Infof("Publishing button event: %s", event)
+	r.logger.Debugf("Publishing button event: %s", event)
 	if err := r.client.Publish(r.ctx, "buttons", event).Err(); err != nil {
-		r.logger.Infof("Failed to publish button event: %v", err)
+		r.logger.Warnf("Failed to publish button event: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully published button event")
+	r.logger.Debugf("Successfully published button event")
 	return nil
 }
 
 // PublishGovernorChange publishes a governor change event to Redis
 func (r *RedisClient) PublishGovernorChange(governor string) error {
-	r.logger.Infof("Publishing governor change: %s", governor)
+	r.logger.Debugf("Publishing governor change: %s", governor)
 
 	if err := r.publishHashSet("system", "cpu:governor", governor, "system", "cpu:governor"); err != nil {
-		r.logger.Infof("Failed to publish governor change: %v", err)
+		r.logger.Warnf("Failed to publish governor change: %v", err)
 		return err
 	}
-	r.logger.Infof("Successfully published governor change")
+	r.logger.Debugf("Successfully published governor change")
 	return nil
 }
 

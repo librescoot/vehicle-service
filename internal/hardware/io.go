@@ -228,7 +228,7 @@ func (io *LinuxHardwareIO) monitorInputs() {
 			code := binary.LittleEndian.Uint16(buffer[10:12])
 			val := int32(binary.LittleEndian.Uint32(buffer[12:16]))
 
-			io.logger.Infof("Event: type=%d code=%d value=%d time=%d.%d",
+			io.logger.Debugf("Event: type=%d code=%d value=%d time=%d.%d",
 				typ, code, val, sec, usec)
 
 			if typ == EV_KEY {
@@ -246,28 +246,28 @@ func (io *LinuxHardwareIO) monitorInputs() {
 
 func (io *LinuxHardwareIO) handleKeyEvent(event *InputEvent) {
 	channel := io.mapKeycode(event.Code)
-	io.logger.Infof("Key event: code=%d channel=%q value=%d",
+	io.logger.Debugf("Key event: code=%d channel=%q value=%d",
 		event.Code, channel, event.Value)
 
 	// Update active keys map
 	io.mu.Lock()
 	if event.Value == 0 {
 		delete(io.activeKeys, event.Code)
-		io.logger.Infof("Key released: code=%d", event.Code)
+		io.logger.Debugf("Key released: code=%d", event.Code)
 	} else {
 		io.activeKeys[event.Code] = true
-		io.logger.Infof("Key pressed: code=%d", event.Code)
+		io.logger.Debugf("Key pressed: code=%d", event.Code)
 	}
 	io.mu.Unlock()
 
 	// Only process key press (1) and release (0)
 	if event.Value > 1 {
-		io.logger.Infof("Ignoring repeat event")
+		io.logger.Debugf("Ignoring repeat event")
 		return
 	}
 
 	if channel == "" {
-		io.logger.Infof("Unknown key code: %d", event.Code)
+		io.logger.Debugf("Unknown key code: %d", event.Code)
 		return
 	}
 
@@ -276,13 +276,13 @@ func (io *LinuxHardwareIO) handleKeyEvent(event *InputEvent) {
 	io.mu.RUnlock()
 
 	if exists {
-		io.logger.Infof("Executing callback for channel %s (value=%v)",
+		io.logger.Debugf("Executing callback for channel %s (value=%v)",
 			channel, event.Value == 1)
 		if err := callback(channel, event.Value == 1); err != nil {
-			io.logger.Infof("Error in callback for %s: %v", channel, err)
+			io.logger.Warnf("Error in callback for %s: %v", channel, err)
 		}
 	} else {
-		io.logger.Infof("No callback registered for channel: %s", channel)
+		io.logger.Debugf("No callback registered for channel: %s", channel)
 	}
 }
 
@@ -306,7 +306,7 @@ func (io *LinuxHardwareIO) ReadDigitalInput(channel string) (bool, error) {
 	state := io.activeKeys[keycode]
 	io.mu.RUnlock()
 
-	io.logger.Infof("Reading digital input for channel %s (keycode %d) -> %v (cached)", channel, keycode, state)
+	io.logger.Debugf("Reading digital input for channel %s (keycode %d) -> %v (cached)", channel, keycode, state)
 	return state, nil
 }
 
@@ -318,7 +318,7 @@ func (io *LinuxHardwareIO) RegisterInputCallback(channel string, callback InputC
 	io.mu.Lock()
 	defer io.mu.Unlock()
 	io.inputCallbacks[channel] = callback
-	io.logger.Infof("Registered callback for channel: %s", channel)
+	io.logger.Debugf("Registered callback for channel: %s", channel)
 }
 
 func (io *LinuxHardwareIO) WriteDigitalOutput(channel string, value bool) error {
@@ -339,7 +339,7 @@ func (io *LinuxHardwareIO) WriteDigitalOutput(channel string, value bool) error 
 		return fmt.Errorf("failed to set DO %s=%v: %w", channel, value, err)
 	}
 
-	io.logger.Infof("Set DO %s=%v", channel, value)
+	io.logger.Debugf("Set DO %s=%v", channel, value)
 	return nil
 }
 

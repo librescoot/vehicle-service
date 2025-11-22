@@ -834,7 +834,7 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 }
 
 func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
-	v.logger.Infof("Input %s => %v", channel, value)
+	v.logger.Debugf("Input %s => %v", channel, value)
 
 	// Publish button event via PUBSUB for immediate response in UI
 	// This happens regardless of vehicle state, letting the UI decide what to do with it
