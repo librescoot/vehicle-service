@@ -120,15 +120,38 @@ func (io *LinuxHardwareIO) Initialize() error {
 
 		io.chips[mapping.Chip] = chip
 
-		// Get initial value for this output
+		// Read current hardware state first to preserve it across restarts
+		currentLine, err := chip.RequestLine(mapping.Line,
+			gpiocdev.AsInput,
+			gpiocdev.WithConsumer("vehicle-service-probe"))
+		if err != nil {
+			return fmt.Errorf("failed to probe GPIO line %d: %w", mapping.Line, err)
+		}
+		currentVal, err := currentLine.Value()
+		currentLine.Close()
+		if err != nil {
+			return fmt.Errorf("failed to read GPIO line %d: %w", mapping.Line, err)
+		}
+
+		// Use saved initial value if provided, otherwise preserve hardware state
 		io.mu.RLock()
-		val := 0
-		if value, exists := io.initialValues[name]; exists && value {
-			val = 1
+		val := currentVal
+		if value, exists := io.initialValues[name]; exists {
+			if value {
+				val = 1
+			} else {
+				val = 0
+			}
 		}
 		io.mu.RUnlock()
 
-		// Request line as output with initial value
+		if val != currentVal {
+			io.logger.Infof("Overriding DO %s: hardware=%d, setting=%d", name, currentVal, val)
+		} else {
+			io.logger.Infof("Preserving DO %s: hardware=%d", name, currentVal)
+		}
+
+		// Request line as output with determined value
 		line, err := chip.RequestLine(mapping.Line,
 			gpiocdev.AsOutput(val),
 			gpiocdev.WithConsumer("vehicle-service"))
