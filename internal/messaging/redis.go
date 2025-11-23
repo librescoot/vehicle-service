@@ -438,12 +438,20 @@ func (r *RedisClient) publishHashDel(hash, field, channel, payload string) error
 func (r *RedisClient) PublishVehicleState(state types.SystemState) error {
 	r.logger.Infof("Publishing vehicle state: %s", state)
 	stateStr := string(state)
+	timestamp := time.Now().Format(time.RFC3339)
 
-	if err := r.publishHashSet("vehicle", "state", stateStr, "vehicle", "state"); err != nil {
+	// Atomically set both state and timestamp fields
+	pipe := r.client.Pipeline()
+	pipe.HSet(r.ctx, "vehicle", "state", stateStr)
+	pipe.HSet(r.ctx, "vehicle", "state:timestamp", timestamp)
+	pipe.Publish(r.ctx, "vehicle", "state")
+	_, err := pipe.Exec(r.ctx)
+
+	if err != nil {
 		r.logger.Warnf("Failed to publish vehicle state: %v", err)
 		return err
 	}
-	r.logger.Debugf("Successfully published vehicle state")
+	r.logger.Debugf("Successfully published vehicle state with timestamp: %s", timestamp)
 	return nil
 }
 
