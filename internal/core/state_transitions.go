@@ -138,20 +138,6 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		}
 
 		isFromParked := (oldState == types.StateParked)
-		isFromDrive := (oldState == types.StateReadyToDrive)
-
-		// Clear dashboard ready flag (both local and Redis) when entering standby
-		if isFromParked || isFromDrive {
-			v.mu.Lock()
-			v.dashboardReady = false
-			v.mu.Unlock()
-			v.logger.Debugf("Cleared local dashboard ready flag")
-
-			if err := v.redis.DeleteDashboardReadyFlag(); err != nil {
-				v.logger.Warnf("Warning: Failed to delete dashboard ready flag: %v", err)
-				// Not returning an error here as it's not critical for state transition
-			}
-		}
 
 		if forcedStandby {
 			v.logger.Debugf("Forced standby: skipping handlebar lock.")

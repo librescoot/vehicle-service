@@ -1346,8 +1346,41 @@ func (v *VehicleSystem) readBrakeStates() (left, right bool, err error) {
 	return left, right, nil
 }
 
+// handleDashboardPowerChange manages the dashboard ready flag when dashboard power changes.
+// If we're cutting power to the dashboard, clear the ready flag immediately since the
+// dashboard won't have a chance to clear it itself before losing power.
+func (v *VehicleSystem) handleDashboardPowerChange(enabled bool) error {
+	if !enabled {
+		v.mu.RLock()
+		currentlyReady := v.dashboardReady
+		v.mu.RUnlock()
+
+		if currentlyReady {
+			v.logger.Debugf("Clearing dashboard ready flag before power cut")
+
+			v.mu.Lock()
+			v.dashboardReady = false
+			v.mu.Unlock()
+
+			if err := v.redis.DeleteDashboardReadyFlag(); err != nil {
+				v.logger.Warnf("Failed to clear dashboard ready flag: %v", err)
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // setPower controls a power output (dashboard_power or engine_power) with consistent logging
 func (v *VehicleSystem) setPower(component string, enabled bool) error {
+	// Handle dashboard ready clearing BEFORE changing power state
+	if component == "dashboard_power" {
+		if err := v.handleDashboardPowerChange(enabled); err != nil {
+			v.logger.Warnf("Failed to handle dashboard power change: %v", err)
+			// Continue anyway - don't block power change
+		}
+	}
+
 	if err := v.io.WriteDigitalOutput(component, enabled); err != nil {
 		action := "enable"
 		if !enabled {
