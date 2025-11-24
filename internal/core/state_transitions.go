@@ -99,6 +99,12 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			return err
 		}
 
+		// Always turn on dashboard power when entering parked state
+		if err := v.setPower("dashboard_power", true); err != nil {
+			v.logger.Errorf("%v", err)
+			return err
+		}
+
 		if oldState == types.StateReadyToDrive {
 			v.playLedCue(6, "drive to parked")
 		}
