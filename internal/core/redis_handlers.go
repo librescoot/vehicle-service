@@ -187,7 +187,8 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 			v.logger.Warnf("Failed to persist DBC updating state to Redis: %v", err)
 		}
 
-		// Apply any deferred dashboard power state
+		// Determine what power action to take (if any)
+		var powerOff bool
 		if deferredPower != nil {
 			if *deferredPower {
 				v.logger.Debugf("Applying deferred dashboard power: ON")
@@ -196,27 +197,29 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 					return err
 				}
 			} else {
-				v.logger.Debugf("Applying deferred dashboard power: OFF")
-				if err := v.setPower("dashboard_power", false); err != nil {
-					v.logger.Errorf("%v (deferred)", err)
-					return err
-				}
+				v.logger.Debugf("Scheduling deferred dashboard power OFF (5s delay)")
+				powerOff = true
 			}
 		} else {
-			// No deferred power - check CURRENT state and turn off if in standby
 			v.mu.Lock()
 			currentState := v.state
 			v.mu.Unlock()
 
 			if currentState == types.StateStandby {
-				v.logger.Debugf("DBC update complete and in standby state - turning off dashboard power")
-				if err := v.setPower("dashboard_power", false); err != nil {
-					v.logger.Errorf("%v", err)
-					return err
-				}
+				v.logger.Debugf("DBC update complete in standby - scheduling dashboard power OFF (5s delay)")
+				powerOff = true
 			} else {
 				v.logger.Debugf("DBC update complete but not in standby (state=%s) - leaving dashboard power on", currentState)
 			}
+		}
+
+		// Delay power-off to allow DBC to poweroff gracefully
+		if powerOff {
+			time.AfterFunc(5*time.Second, func() {
+				if err := v.setPower("dashboard_power", false); err != nil {
+					v.logger.Errorf("Failed to turn off dashboard power: %v", err)
+				}
+			})
 		}
 		return nil
 
