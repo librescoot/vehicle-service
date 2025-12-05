@@ -105,6 +105,18 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 			return err
 		}
 
+		// Engage engine brake BEFORE powering ECU to prevent movement
+		if err := v.io.WriteDigitalOutput("engine_brake", true); err != nil {
+			v.logger.Errorf("Failed to engage engine brake: %v", err)
+			return err
+		}
+
+		// Keep ECU powered in parked state
+		if err := v.setPower("engine_power", true); err != nil {
+			v.logger.Errorf("%v", err)
+			return err
+		}
+
 		if oldState == types.StateReadyToDrive {
 			v.playLedCue(6, "drive to parked")
 		}
