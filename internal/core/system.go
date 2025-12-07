@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"time"
 
@@ -107,6 +108,11 @@ type VehicleSystem struct {
 	deferredDashboardPower  *bool               // Deferred dashboard power state (nil = no change needed)
 	brakeHibernationEnabled bool                // Track if brake lever hibernation is enabled (default: true)
 	hibernationManager      *HibernationManager // Manual hibernation state machine
+	autoStandbySeconds      int                 // Auto-standby timeout in seconds (0 = disabled)
+	autoStandbyTimer        *time.Timer         // Timer for auto-standby
+	autoStandbyTicker       *time.Ticker        // Ticker for countdown updates
+	autoStandbyStopChan     chan struct{}       // Channel to stop countdown updates
+	parkedEntryTime         time.Time           // Track when we entered parked state
 }
 
 func NewVehicleSystem(redisHost string, redisPort int, l *logger.Logger) *VehicleSystem {
@@ -194,6 +200,32 @@ func (v *VehicleSystem) Start() error {
 		v.mu.Unlock()
 	} else {
 		v.logger.Infof("No brake hibernation setting found on startup, using default (enabled)")
+	}
+
+	// Read initial auto-standby setting from Redis
+	autoStandbySetting, err := v.redis.GetHashField("settings", "scooter.auto-standby-seconds")
+	if err != nil {
+		v.logger.Warnf("Failed to read auto-standby setting on startup: %v", err)
+		// Continue with default (0 = disabled)
+	} else if autoStandbySetting != "" {
+		seconds, parseErr := strconv.Atoi(autoStandbySetting)
+		if parseErr != nil {
+			v.logger.Warnf("Invalid auto-standby setting value on startup: '%s', using default (0)", autoStandbySetting)
+			v.mu.Lock()
+			v.autoStandbySeconds = 0
+			v.mu.Unlock()
+		} else {
+			v.mu.Lock()
+			v.autoStandbySeconds = seconds
+			v.mu.Unlock()
+			if seconds > 0 {
+				v.logger.Infof("Auto-standby setting on startup: %d seconds", seconds)
+			} else {
+				v.logger.Infof("Auto-standby setting on startup: disabled")
+			}
+		}
+	} else {
+		v.logger.Infof("No auto-standby setting found on startup, using default (disabled)")
 	}
 
 	// Check if DBC update is in progress and restore dbcUpdating flag
@@ -839,6 +871,108 @@ func (v *VehicleSystem) triggerShutdownTimeout() {
 	v.mu.Unlock()
 }
 
+func (v *VehicleSystem) startAutoStandbyTimer() {
+	v.mu.Lock()
+	seconds := v.autoStandbySeconds
+	v.mu.Unlock()
+
+	if seconds <= 0 {
+		return
+	}
+
+	v.logger.Infof("Starting auto-standby timer: %d seconds", seconds)
+
+	// Record entry time
+	v.mu.Lock()
+	v.parkedEntryTime = time.Now()
+	v.mu.Unlock()
+
+	// Start main timer
+	v.autoStandbyTimer = time.AfterFunc(time.Duration(seconds)*time.Second, v.triggerAutoStandby)
+
+	// Start countdown ticker goroutine
+	v.autoStandbyTicker = time.NewTicker(1 * time.Second)
+	v.autoStandbyStopChan = make(chan struct{})
+
+	go func() {
+		remainingSeconds := seconds
+		for {
+			select {
+			case <-v.autoStandbyTicker.C:
+				elapsed := time.Since(v.parkedEntryTime)
+				remainingSeconds = seconds - int(elapsed.Seconds())
+				if remainingSeconds < 0 {
+					remainingSeconds = 0
+				}
+				if err := v.redis.PublishAutoStandbyCountdown(remainingSeconds); err != nil {
+					v.logger.Warnf("Failed to publish auto-standby countdown: %v", err)
+				}
+			case <-v.autoStandbyStopChan:
+				return
+			}
+		}
+	}()
+
+	v.logger.Infof("Auto-standby timer started successfully")
+}
+
+func (v *VehicleSystem) cancelAutoStandbyTimer() {
+	v.logger.Debugf("Canceling auto-standby timer")
+
+	if v.autoStandbyTimer != nil {
+		v.autoStandbyTimer.Stop()
+		v.autoStandbyTimer = nil
+	}
+
+	if v.autoStandbyTicker != nil {
+		v.autoStandbyTicker.Stop()
+		v.autoStandbyTicker = nil
+	}
+
+	if v.autoStandbyStopChan != nil {
+		close(v.autoStandbyStopChan)
+		v.autoStandbyStopChan = nil
+	}
+
+	// Clear countdown from Redis
+	if err := v.redis.ClearAutoStandbyCountdown(); err != nil {
+		v.logger.Warnf("Failed to clear auto-standby countdown: %v", err)
+	}
+
+	v.logger.Debugf("Auto-standby timer canceled")
+}
+
+func (v *VehicleSystem) resetAutoStandbyTimer() {
+	v.mu.RLock()
+	currentState := v.state
+	autoStandbySeconds := v.autoStandbySeconds
+	v.mu.RUnlock()
+
+	// Only reset if in parked state and auto-standby is enabled
+	if currentState != types.StateParked || autoStandbySeconds <= 0 {
+		return
+	}
+
+	v.logger.Debugf("Resetting auto-standby timer")
+	v.cancelAutoStandbyTimer()
+	v.startAutoStandbyTimer()
+}
+
+func (v *VehicleSystem) triggerAutoStandby() {
+	v.logger.Infof("Auto-standby timer expired, transitioning to shutting-down...")
+
+	// Transition to shutting-down, which will eventually go to standby
+	if err := v.transitionTo(types.StateShuttingDown); err != nil {
+		v.logger.Infof("Failed to transition to shutting-down after auto-standby: %v", err)
+		return
+	}
+
+	// Reset the timer field after it has fired
+	v.mu.Lock()
+	v.autoStandbyTimer = nil
+	v.mu.Unlock()
+}
+
 func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 	v.logger.Infof("Handling dashboard ready state: %v", ready)
 
@@ -1010,6 +1144,9 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 	case "kickstand":
 		v.logger.Infof("Kickstand changed: %v, current state: %s", value, currentState)
 
+		// Reset auto-standby timer on kickstand movement
+		v.resetAutoStandbyTimer()
+
 		// Cancel hibernation if kickstand is raised
 		if !value {
 			v.hibernationManager.cancelHibernation()
@@ -1045,8 +1182,9 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		}
 
 	case "seatbox_button":
-		// Cancel hibernation on seatbox button press
 		if value {
+			// Reset auto-standby timer and cancel hibernation on seatbox press
+			v.resetAutoStandbyTimer()
 			v.hibernationManager.cancelHibernation()
 		}
 
@@ -1060,6 +1198,9 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 	case "brake_right", "brake_left":
 		if value {
+			// Reset auto-standby timer on brake press
+			v.resetAutoStandbyTimer()
+
 			// Play brake on cue
 			if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
 				return err

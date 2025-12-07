@@ -717,6 +717,22 @@ func (r *RedisClient) PublishButtonEvent(event string) error {
 	return nil
 }
 
+// PublishAutoStandbyCountdown publishes the auto-standby countdown to Redis
+func (r *RedisClient) PublishAutoStandbyCountdown(remaining int) error {
+	if err := r.publishHashSet("vehicle", "auto-standby-remaining", remaining, "vehicle", "auto-standby-remaining"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ClearAutoStandbyCountdown removes the auto-standby countdown from Redis
+func (r *RedisClient) ClearAutoStandbyCountdown() error {
+	if err := r.publishHashDel("vehicle", "auto-standby-remaining", "vehicle", "auto-standby-remaining"); err != nil {
+		return err
+	}
+	return nil
+}
+
 // PublishGovernorChange publishes a governor change event to Redis
 func (r *RedisClient) PublishGovernorChange(governor string) error {
 	r.logger.Debugf("Publishing governor change: %s", governor)

@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -382,6 +383,44 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 			v.logger.Warnf("Unknown brake hibernation setting value: '%s'", value)
 		}
 		v.mu.Unlock()
+
+	case "scooter.auto-standby-seconds":
+		// Read the new value from Redis
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+
+		seconds, parseErr := strconv.Atoi(value)
+		if parseErr != nil {
+			v.logger.Warnf("Invalid auto-standby setting value: '%s'", value)
+			return fmt.Errorf("invalid auto-standby value: %s", value)
+		}
+
+		v.mu.Lock()
+		oldSeconds := v.autoStandbySeconds
+		v.autoStandbySeconds = seconds
+		currentState := v.state
+		v.mu.Unlock()
+
+		if seconds > 0 {
+			v.logger.Infof("Auto-standby enabled via settings update: %d seconds", seconds)
+		} else {
+			v.logger.Infof("Auto-standby disabled via settings update")
+		}
+
+		// If currently in parked state and setting changed, restart or cancel timer
+		if currentState == types.StateParked {
+			if seconds > 0 && oldSeconds != seconds {
+				v.logger.Infof("Auto-standby setting changed while parked, restarting timer")
+				v.cancelAutoStandbyTimer()
+				v.startAutoStandbyTimer()
+			} else if seconds == 0 {
+				v.logger.Infof("Auto-standby disabled while parked, canceling timer")
+				v.cancelAutoStandbyTimer()
+			}
+		}
 
 	default:
 		// Only log unknown settings if they're in the scooter namespace

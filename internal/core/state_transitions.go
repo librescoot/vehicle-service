@@ -36,6 +36,11 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 		return fmt.Errorf("failed to publish state: %w", err)
 	}
 
+	// Cancel auto-standby timer when leaving parked state
+	if oldState == types.StateParked && newState != types.StateParked {
+		v.cancelAutoStandbyTimer()
+	}
+
 	v.logger.Debugf("Applying state transition effects for %s", newState)
 	switch newState {
 
@@ -123,6 +128,9 @@ func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
 				v.playLedCue(1, "standby to parked brake off")
 			}
 		}
+
+	// Start auto-standby timer when entering parked state
+	v.startAutoStandbyTimer()
 
 	case types.StateStandby:
 		v.mu.Lock()
