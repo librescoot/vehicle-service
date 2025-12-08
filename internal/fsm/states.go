@@ -23,14 +23,15 @@ const (
 // Vehicle events
 const (
 	// External commands (from Redis)
-	EvUnlock          librefsm.EventID = "unlock"
-	EvLock            librefsm.EventID = "lock"
-	EvLockHibernate   librefsm.EventID = "lock-hibernate"
-	EvForceLock       librefsm.EventID = "force-lock"
-	EvDashboardReady  librefsm.EventID = "dashboard-ready"
-	EvKeycardAuth     librefsm.EventID = "keycard-auth"
-	EvUpdateStart     librefsm.EventID = "update-start"
-	EvUpdateComplete  librefsm.EventID = "update-complete"
+	EvUnlock            librefsm.EventID = "unlock"
+	EvLock              librefsm.EventID = "lock"
+	EvLockHibernate     librefsm.EventID = "lock-hibernate"
+	EvForceLock         librefsm.EventID = "force-lock"
+	EvDashboardReady    librefsm.EventID = "dashboard-ready"
+	EvDashboardNotReady librefsm.EventID = "dashboard-not-ready"
+	EvKeycardAuth       librefsm.EventID = "keycard-auth"
+	EvUpdateStart       librefsm.EventID = "update-start"
+	EvUpdateComplete    librefsm.EventID = "update-complete"
 
 	// Physical inputs
 	EvKickstandDown   librefsm.EventID = "kickstand-down"

@@ -942,38 +942,15 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 
 	v.mu.Lock()
 	v.dashboardReady = ready
-	currentState := v.state
 	v.mu.Unlock()
 
-	v.logger.Infof("Current state: %s, Dashboard ready: %v", currentState, ready)
-
-	if !ready && currentState == types.StateReadyToDrive {
-		v.logger.Infof("Dashboard not ready, transitioning to PARKED")
-		return v.transitionTo(types.StateParked)
-	}
-
-	// Only try to transition to READY_TO_DRIVE if dashboard is ready
+	// Send appropriate event - FSM handles transitions based on current state and guards
 	if ready {
-		// Don't process kickstand state in STANDBY state
-		if currentState == types.StateStandby {
-			v.logger.Infof("Skipping kickstand check in %s state", currentState)
-			return nil
-		}
-
-		kickstandValue, err := v.io.ReadDigitalInput("kickstand")
-		if err != nil {
-			v.logger.Infof("Failed to read kickstand: %v", err)
-			return err
-		}
-
-		v.logger.Infof("Kickstand state: %v", kickstandValue)
-		if !kickstandValue && v.isReadyToDrive() {
-			v.logger.Infof("Dashboard ready and kickstand up, transitioning to READY_TO_DRIVE")
-			return v.transitionTo(types.StateReadyToDrive)
-		} else if kickstandValue {
-			v.logger.Infof("Kickstand down, staying in/transitioning to PARKED")
-			return v.transitionTo(types.StateParked)
-		}
+		v.logger.Infof("Dashboard ready, sending EvDashboardReady")
+		v.machine.Send(librefsm.Event{ID: fsm.EvDashboardReady})
+	} else {
+		v.logger.Infof("Dashboard not ready, sending EvDashboardNotReady")
+		v.machine.Send(librefsm.Event{ID: fsm.EvDashboardNotReady})
 	}
 
 	return nil
@@ -1127,13 +1104,13 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 					return nil
 				}
 			}
-			// Kickstand down - go to PARKED
-			v.logger.Infof("Kickstand down, transitioning to PARKED")
-			return v.transitionTo(types.StateParked)
-		} else if v.isReadyToDrive() {
-			// Kickstand up and dashboard ready - go to READY_TO_DRIVE
-			v.logger.Infof("Kickstand up and dashboard ready, transitioning to READY_TO_DRIVE")
-			return v.transitionTo(types.StateReadyToDrive)
+			// Kickstand down - send event (FSM handles transition from ReadyToDrive to Parked)
+			v.logger.Infof("Kickstand down, sending EvKickstandDown")
+			v.machine.Send(librefsm.Event{ID: fsm.EvKickstandDown})
+		} else {
+			// Kickstand up - send event (FSM handles transition from Parked to ReadyToDrive if dashboard ready)
+			v.logger.Infof("Kickstand up, sending EvKickstandUp")
+			v.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
 		}
 
 	case "seatbox_button":

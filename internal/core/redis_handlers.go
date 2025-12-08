@@ -6,6 +6,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/librescoot/librefsm"
+
+	"vehicle-service/internal/fsm"
 	"vehicle-service/internal/types"
 )
 
@@ -76,49 +79,27 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 
 	switch state {
 	case "unlock":
-		kickstandValue, err := v.io.ReadDigitalInput("kickstand")
-		if err != nil {
-			v.logger.Errorf("Failed to read kickstand: %v", err)
-			if currentState == types.StateStandby {
-				return v.transitionTo(types.StateParked)
-			} else {
-				return nil
-			}
+		// Send EvUnlock - FSM handles the logic:
+		// - From Standby: goes to Parked (dashboard booting)
+		// - From Parked: goes to ReadyToDrive if kickstand is up (via guard)
+		// - From ShuttingDown: goes to Parked (cancel shutdown)
+		return v.machine.SendSync(librefsm.Event{ID: fsm.EvUnlock})
 
-		}
-		if v.isReadyToDrive() && !kickstandValue {
-			return v.transitionTo(types.StateReadyToDrive)
-		} else {
-			if currentState == types.StateStandby {
-				return v.transitionTo(types.StateParked)
-			} else {
-				return nil
-			}
-		}
 	case "lock":
-		if currentState == types.StateParked {
-			v.logger.Infof("Transitioning to SHUTTING_DOWN")
-			return v.transitionTo(types.StateShuttingDown)
-		} else {
-			return fmt.Errorf("vehicle must be parked to lock")
+		if currentState != types.StateParked && currentState != types.StateReadyToDrive {
+			return fmt.Errorf("vehicle must be parked or ready-to-drive to lock")
 		}
-	case "lock-hibernate":
-		if currentState == types.StateParked {
-			v.logger.Infof("Transitioning to SHUTTING_DOWN for lock-hibernate")
-			v.mu.Lock()
-			v.hibernationRequest = true // Set hibernation request for lock-hibernate
-			v.mu.Unlock()
-			if err := v.transitionTo(types.StateShuttingDown); err != nil {
-				return err
-			}
+		v.logger.Infof("Sending EvLock")
+		return v.machine.SendSync(librefsm.Event{ID: fsm.EvLock})
 
-			if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-				v.logger.Errorf("Failed to send hibernate command: %v", err)
-			}
-			return nil
-		} else {
-			return fmt.Errorf("vehicle must be parked to lock")
+	case "lock-hibernate":
+		if currentState != types.StateParked {
+			return fmt.Errorf("vehicle must be parked to lock-hibernate")
 		}
+		v.logger.Infof("Sending EvLockHibernate")
+		// The OnLockHibernate action handles setting the hibernation flag and sending the command
+		return v.machine.SendSync(librefsm.Event{ID: fsm.EvLockHibernate})
+
 	default:
 		return fmt.Errorf("invalid state request: %s", state)
 	}
@@ -139,13 +120,9 @@ func (v *VehicleSystem) handleLedFadeRequest(ledChannel int, fadeIndex int) erro
 // handleForceLockRequest handles force-lock requests from Redis
 // It initiates a forced transition to standby state, skipping the handlebar lock
 func (v *VehicleSystem) handleForceLockRequest() error {
-	v.mu.Lock()
-	v.forceStandbyNoLock = true
-	v.mu.Unlock()
-
-	// Always transition to STANDBY, the dbcUpdating flag is checked in the transition function
-	v.logger.Infof("Handling force-lock request: transitioning to STANDBY (no lock).")
-	return v.transitionTo(types.StateStandby)
+	// Send EvForceLock - the OnForceLock action sets the forceStandbyNoLock flag
+	v.logger.Infof("Sending EvForceLock: transitioning to STANDBY (no lock)")
+	return v.machine.SendSync(librefsm.Event{ID: fsm.EvForceLock})
 }
 
 // handleUpdateRequest handles update requests from the update-service

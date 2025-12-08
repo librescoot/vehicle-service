@@ -71,17 +71,27 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// From Init
 		Transition(StateInit, EvDashboardReady, StateParked).
 
-		// From Standby
+		// From Standby - always go to Parked first (dashboard is booting)
 		Transition(StateStandby, EvUnlock, StateParked).
 		Transition(StateStandby, EvDashboardReady, StateParked).
 
-		// From Parked
+		// From Parked - unlock/kickstand-up/dashboard-ready to ReadyToDrive if conditions met
 		Transition(StateParked, EvUnlock, StateReadyToDrive,
-			librefsm.WithGuard(actions.CanEnterReadyToDrive),
+			librefsm.WithGuard(actions.CanEnterReadyToDrive), // Requires both kickstand up AND dashboard ready
+		).
+		Transition(StateParked, EvKickstandUp, StateReadyToDrive,
+			librefsm.WithGuard(actions.IsDashboardReady),
+		).
+		Transition(StateParked, EvDashboardReady, StateReadyToDrive,
+			librefsm.WithGuard(actions.IsKickstandUp),
 		).
 		Transition(StateParked, EvLock, StateShuttingDown).
-		Transition(StateParked, EvLockHibernate, StateShuttingDown).
-		Transition(StateParked, EvForceLock, StateStandby).
+		Transition(StateParked, EvLockHibernate, StateShuttingDown,
+			librefsm.WithAction(actions.OnLockHibernate),
+		).
+		Transition(StateParked, EvForceLock, StateStandby,
+			librefsm.WithAction(actions.OnForceLock),
+		).
 		Transition(StateParked, EvAutoStandbyTimeout, StateShuttingDown).
 		Transition(StateParked, EvHibernationStart, StateHibernationInitialHold,
 			librefsm.WithGuard(actions.AreBrakesPressed),
@@ -89,6 +99,7 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 
 		// From ReadyToDrive
 		Transition(StateReadyToDrive, EvKickstandDown, StateParked).
+		Transition(StateReadyToDrive, EvDashboardNotReady, StateParked). // Safety: dashboard disconnect
 		Transition(StateReadyToDrive, EvLock, StateShuttingDown).
 
 		// From ShuttingDown

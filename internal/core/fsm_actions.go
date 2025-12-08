@@ -445,6 +445,12 @@ func (v *VehicleSystem) CanUnlock(c *librefsm.Context) bool {
 	return true
 }
 
+func (v *VehicleSystem) IsDashboardReady(c *librefsm.Context) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.dashboardReady
+}
+
 func (v *VehicleSystem) CanEnterReadyToDrive(c *librefsm.Context) bool {
 	kickstandDown, err := v.io.ReadDigitalInput("kickstand")
 	if err != nil {
@@ -462,6 +468,15 @@ func (v *VehicleSystem) IsKickstandDown(c *librefsm.Context) bool {
 		return true
 	}
 	return kickstandDown
+}
+
+func (v *VehicleSystem) IsKickstandUp(c *librefsm.Context) bool {
+	kickstandDown, err := v.io.ReadDigitalInput("kickstand")
+	if err != nil {
+		v.logger.Errorf("Failed to read kickstand: %v", err)
+		return false // Fail closed - don't allow ready-to-drive if can't read
+	}
+	return !kickstandDown
 }
 
 func (v *VehicleSystem) IsSeatboxClosed(c *librefsm.Context) bool {
@@ -509,6 +524,27 @@ func (v *VehicleSystem) OnHibernationComplete(c *librefsm.Context) error {
 	v.logger.Infof("FSM: Hibernation complete - triggering hibernation")
 	v.mu.Lock()
 	v.hibernationRequest = true
+	v.mu.Unlock()
+	return nil
+}
+
+func (v *VehicleSystem) OnLockHibernate(c *librefsm.Context) error {
+	v.logger.Infof("FSM: Lock-hibernate - setting hibernation request")
+	v.mu.Lock()
+	v.hibernationRequest = true
+	v.mu.Unlock()
+
+	// Send hibernate command immediately (will execute after shutdown completes)
+	if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
+		v.logger.Errorf("Failed to send hibernate command: %v", err)
+	}
+	return nil
+}
+
+func (v *VehicleSystem) OnForceLock(c *librefsm.Context) error {
+	v.logger.Infof("FSM: Force-lock - setting force-standby flag")
+	v.mu.Lock()
+	v.forceStandbyNoLock = true
 	v.mu.Unlock()
 	return nil
 }

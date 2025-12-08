@@ -25,8 +25,10 @@ type Actions interface {
 
 	// Guards for conditional transitions
 	CanUnlock(c *librefsm.Context) bool
-	CanEnterReadyToDrive(c *librefsm.Context) bool
-	IsKickstandDown(c *librefsm.Context) bool
+	CanEnterReadyToDrive(c *librefsm.Context) bool // True when both kickstand up AND dashboard ready
+	IsDashboardReady(c *librefsm.Context) bool     // True when dashboard has booted
+	IsKickstandUp(c *librefsm.Context) bool        // True when kickstand is up (riding position)
+	IsKickstandDown(c *librefsm.Context) bool      // True when kickstand is down (parked position)
 	IsSeatboxClosed(c *librefsm.Context) bool
 	AreBrakesPressed(c *librefsm.Context) bool
 
@@ -34,6 +36,8 @@ type Actions interface {
 	OnShutdownTimeout(c *librefsm.Context) error
 	OnAutoStandbyTimeout(c *librefsm.Context) error
 	OnHibernationComplete(c *librefsm.Context) error
+	OnLockHibernate(c *librefsm.Context) error // Sets hibernation flag before shutdown
+	OnForceLock(c *librefsm.Context) error     // Sets force-standby flag
 }
 
 // FSMData holds data passed through the FSM context.
