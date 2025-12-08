@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -187,7 +188,8 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 			v.logger.Warnf("Failed to persist DBC updating state to Redis: %v", err)
 		}
 
-		// Apply any deferred dashboard power state
+		// Determine what power action to take (if any)
+		var powerOff bool
 		if deferredPower != nil {
 			if *deferredPower {
 				v.logger.Debugf("Applying deferred dashboard power: ON")
@@ -196,27 +198,29 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 					return err
 				}
 			} else {
-				v.logger.Debugf("Applying deferred dashboard power: OFF")
-				if err := v.setPower("dashboard_power", false); err != nil {
-					v.logger.Errorf("%v (deferred)", err)
-					return err
-				}
+				v.logger.Debugf("Scheduling deferred dashboard power OFF (5s delay)")
+				powerOff = true
 			}
 		} else {
-			// No deferred power - check CURRENT state and turn off if in standby
 			v.mu.Lock()
 			currentState := v.state
 			v.mu.Unlock()
 
 			if currentState == types.StateStandby {
-				v.logger.Debugf("DBC update complete and in standby state - turning off dashboard power")
-				if err := v.setPower("dashboard_power", false); err != nil {
-					v.logger.Errorf("%v", err)
-					return err
-				}
+				v.logger.Debugf("DBC update complete in standby - scheduling dashboard power OFF (5s delay)")
+				powerOff = true
 			} else {
 				v.logger.Debugf("DBC update complete but not in standby (state=%s) - leaving dashboard power on", currentState)
 			}
+		}
+
+		// Delay power-off to allow DBC to poweroff gracefully
+		if powerOff {
+			time.AfterFunc(5*time.Second, func() {
+				if err := v.setPower("dashboard_power", false); err != nil {
+					v.logger.Errorf("Failed to turn off dashboard power: %v", err)
+				}
+			})
 		}
 		return nil
 
@@ -379,6 +383,44 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 			v.logger.Warnf("Unknown brake hibernation setting value: '%s'", value)
 		}
 		v.mu.Unlock()
+
+	case "scooter.auto-standby-seconds":
+		// Read the new value from Redis
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+
+		seconds, parseErr := strconv.Atoi(value)
+		if parseErr != nil {
+			v.logger.Warnf("Invalid auto-standby setting value: '%s'", value)
+			return fmt.Errorf("invalid auto-standby value: %s", value)
+		}
+
+		v.mu.Lock()
+		oldSeconds := v.autoStandbySeconds
+		v.autoStandbySeconds = seconds
+		currentState := v.state
+		v.mu.Unlock()
+
+		if seconds > 0 {
+			v.logger.Infof("Auto-standby enabled via settings update: %d seconds", seconds)
+		} else {
+			v.logger.Infof("Auto-standby disabled via settings update")
+		}
+
+		// If currently in parked state and setting changed, restart or cancel timer
+		if currentState == types.StateParked {
+			if seconds > 0 && oldSeconds != seconds {
+				v.logger.Infof("Auto-standby setting changed while parked, restarting timer")
+				v.cancelAutoStandbyTimer()
+				v.startAutoStandbyTimer()
+			} else if seconds == 0 {
+				v.logger.Infof("Auto-standby disabled while parked, canceling timer")
+				v.cancelAutoStandbyTimer()
+			}
+		}
 
 	default:
 		// Only log unknown settings if they're in the scooter namespace
