@@ -1,0 +1,52 @@
+package fsm
+
+import "github.com/librescoot/librefsm"
+
+// Actions defines the interface for vehicle state machine actions.
+// VehicleSystem implements this interface to handle state entry/exit
+// and provide guards for conditional transitions.
+type Actions interface {
+	// State entry actions
+	EnterReadyToDrive(c *librefsm.Context) error
+	EnterParked(c *librefsm.Context) error
+	EnterStandby(c *librefsm.Context) error
+	EnterShuttingDown(c *librefsm.Context) error
+
+	// State exit actions
+	ExitParked(c *librefsm.Context) error
+
+	// Hibernation state actions
+	EnterHibernation(c *librefsm.Context) error
+	ExitHibernation(c *librefsm.Context) error
+	EnterHibernationInitialHold(c *librefsm.Context) error
+	EnterHibernationAwaitingConfirm(c *librefsm.Context) error
+	EnterHibernationSeatbox(c *librefsm.Context) error
+	EnterHibernationConfirm(c *librefsm.Context) error
+
+	// Guards for conditional transitions
+	CanUnlock(c *librefsm.Context) bool
+	CanEnterReadyToDrive(c *librefsm.Context) bool
+	IsKickstandDown(c *librefsm.Context) bool
+	IsSeatboxClosed(c *librefsm.Context) bool
+	AreBrakesPressed(c *librefsm.Context) bool
+
+	// Transition actions
+	OnShutdownTimeout(c *librefsm.Context) error
+	OnAutoStandbyTimeout(c *librefsm.Context) error
+	OnHibernationComplete(c *librefsm.Context) error
+}
+
+// FSMData holds data passed through the FSM context.
+// Stored in librefsm.Context.Data for access in callbacks.
+type FSMData struct {
+	// PreviousState tracks the state we came from for conditional logic
+	PreviousState librefsm.StateID
+
+	// Flags for special transition behaviors
+	ForcedStandby      bool // Skip handlebar lock on standby entry
+	HibernationRequest bool // Request hibernation after shutdown
+	ShutdownFromParked bool // Track if shutdown was initiated from parked
+
+	// Additional context for guards
+	DashboardReady bool
+}

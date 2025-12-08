@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/librescoot/librefsm"
+
+	"vehicle-service/internal/fsm"
 	"vehicle-service/internal/hardware"
 	"vehicle-service/internal/logger"
 	"vehicle-service/internal/messaging"
@@ -109,10 +113,7 @@ type VehicleSystem struct {
 	brakeHibernationEnabled bool                // Track if brake lever hibernation is enabled (default: true)
 	hibernationManager      *HibernationManager // Manual hibernation state machine
 	autoStandbySeconds      int                 // Auto-standby timeout in seconds (0 = disabled)
-	autoStandbyTimer        *time.Timer         // Timer for auto-standby
-	autoStandbyTicker       *time.Ticker        // Ticker for countdown updates
-	autoStandbyStopChan     chan struct{}       // Channel to stop countdown updates
-	parkedEntryTime         time.Time           // Track when we entered parked state
+	machine                 *librefsm.Machine   // librefsm state machine
 }
 
 func NewVehicleSystem(redisHost string, redisPort int, l *logger.Logger) *VehicleSystem {
@@ -149,6 +150,11 @@ func (v *VehicleSystem) Start() error {
 		HardwareCallback:  v.handleHardwareRequest,
 		SettingsCallback:  v.handleSettingsUpdate,
 	})
+
+	// Initialize and start librefsm state machine
+	if err := v.initFSM(context.Background()); err != nil {
+		return fmt.Errorf("failed to initialize FSM: %w", err)
+	}
 
 	// Initialize hibernation manager
 	v.hibernationManager = &HibernationManager{
@@ -468,13 +474,6 @@ func (v *VehicleSystem) Start() error {
 
 	v.logger.Infof("System started successfully")
 	return nil
-}
-
-// getCurrentState returns the current system state in a thread-safe manner
-func (v *VehicleSystem) getCurrentState() types.SystemState {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return v.state
 }
 
 // checkHibernationConditions checks if hibernation should be triggered using state machine
@@ -871,80 +870,51 @@ func (v *VehicleSystem) triggerShutdownTimeout() {
 	v.mu.Unlock()
 }
 
+// startAutoStandbyTimer starts the auto-standby timer using librefsm
 func (v *VehicleSystem) startAutoStandbyTimer() {
-	v.mu.Lock()
+	v.mu.RLock()
 	seconds := v.autoStandbySeconds
-	v.mu.Unlock()
+	v.mu.RUnlock()
 
-	if seconds <= 0 {
+	if seconds <= 0 || v.machine == nil {
 		return
 	}
 
 	v.logger.Infof("Starting auto-standby timer: %d seconds", seconds)
 
-	// Record entry time
-	v.mu.Lock()
-	v.parkedEntryTime = time.Now()
-	v.mu.Unlock()
+	duration := time.Duration(seconds) * time.Second
+	v.machine.StartTimer(fsm.TimerAutoStandby, duration, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
 
-	// Start main timer
-	v.autoStandbyTimer = time.AfterFunc(time.Duration(seconds)*time.Second, v.triggerAutoStandby)
-
-	// Start countdown ticker goroutine
-	v.autoStandbyTicker = time.NewTicker(1 * time.Second)
-	v.autoStandbyStopChan = make(chan struct{})
-
-	go func() {
-		remainingSeconds := seconds
-		for {
-			select {
-			case <-v.autoStandbyTicker.C:
-				elapsed := time.Since(v.parkedEntryTime)
-				remainingSeconds = seconds - int(elapsed.Seconds())
-				if remainingSeconds < 0 {
-					remainingSeconds = 0
-				}
-				if err := v.redis.PublishAutoStandbyCountdown(remainingSeconds); err != nil {
-					v.logger.Warnf("Failed to publish auto-standby countdown: %v", err)
-				}
-			case <-v.autoStandbyStopChan:
-				return
-			}
-		}
-	}()
+	// Publish the deadline time so UI can display countdown
+	deadline := time.Now().Add(duration)
+	if err := v.redis.PublishAutoStandbyDeadline(deadline); err != nil {
+		v.logger.Warnf("Failed to publish auto-standby deadline: %v", err)
+	}
 
 	v.logger.Infof("Auto-standby timer started successfully")
 }
 
+// cancelAutoStandbyTimer cancels the auto-standby timer
 func (v *VehicleSystem) cancelAutoStandbyTimer() {
 	v.logger.Debugf("Canceling auto-standby timer")
 
-	if v.autoStandbyTimer != nil {
-		v.autoStandbyTimer.Stop()
-		v.autoStandbyTimer = nil
+	if v.machine != nil {
+		v.machine.StopTimer(fsm.TimerAutoStandby)
 	}
 
-	if v.autoStandbyTicker != nil {
-		v.autoStandbyTicker.Stop()
-		v.autoStandbyTicker = nil
-	}
-
-	if v.autoStandbyStopChan != nil {
-		close(v.autoStandbyStopChan)
-		v.autoStandbyStopChan = nil
-	}
-
-	// Clear countdown from Redis
-	if err := v.redis.ClearAutoStandbyCountdown(); err != nil {
-		v.logger.Warnf("Failed to clear auto-standby countdown: %v", err)
+	// Clear deadline from Redis
+	if err := v.redis.ClearAutoStandbyDeadline(); err != nil {
+		v.logger.Warnf("Failed to clear auto-standby deadline: %v", err)
 	}
 
 	v.logger.Debugf("Auto-standby timer canceled")
 }
 
+// resetAutoStandbyTimer resets the auto-standby timer
 func (v *VehicleSystem) resetAutoStandbyTimer() {
+	currentState := v.getCurrentState()
+
 	v.mu.RLock()
-	currentState := v.state
 	autoStandbySeconds := v.autoStandbySeconds
 	v.mu.RUnlock()
 
@@ -956,21 +926,6 @@ func (v *VehicleSystem) resetAutoStandbyTimer() {
 	v.logger.Debugf("Resetting auto-standby timer")
 	v.cancelAutoStandbyTimer()
 	v.startAutoStandbyTimer()
-}
-
-func (v *VehicleSystem) triggerAutoStandby() {
-	v.logger.Infof("Auto-standby timer expired, transitioning to shutting-down...")
-
-	// Transition to shutting-down, which will eventually go to standby
-	if err := v.transitionTo(types.StateShuttingDown); err != nil {
-		v.logger.Infof("Failed to transition to shutting-down after auto-standby: %v", err)
-		return
-	}
-
-	// Reset the timer field after it has fired
-	v.mu.Lock()
-	v.autoStandbyTimer = nil
-	v.mu.Unlock()
 }
 
 func (v *VehicleSystem) handleDashboardReady(ready bool) error {
