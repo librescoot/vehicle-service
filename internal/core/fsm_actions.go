@@ -453,8 +453,8 @@ func (v *VehicleSystem) CanEnterReadyToDrive(c *librefsm.Context) bool {
 		v.logger.Errorf("Failed to read kickstand in guard: %v", err)
 		return false
 	}
-	// Kickstand must be UP (value false) to enter ready-to-drive
-	return !kickstandDown && v.isReadyToDrive()
+	// Kickstand must be UP (value false) AND dashboard ready to enter ready-to-drive
+	return !kickstandDown && v.IsDashboardReady(c)
 }
 
 func (v *VehicleSystem) IsKickstandDown(c *librefsm.Context) bool {

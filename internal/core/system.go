@@ -375,7 +375,10 @@ func (v *VehicleSystem) Start() error {
 			}
 		}
 	} else if savedState == types.StateShuttingDown {
-		v.transitionTo(types.StateStandby)
+		// Restore to ShuttingDown - the FSM timeout will complete the shutdown normally
+		if err := v.machine.SetState(fsm.StateShuttingDown); err != nil {
+			v.logger.Errorf("Failed to restore shutting-down state: %v", err)
+		}
 	}
 
 	// Mark system as initialized
@@ -879,12 +882,6 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 
 	v.logger.Infof("Sending EvKeycardAuth")
 	return v.machine.SendSync(librefsm.Event{ID: fsm.EvKeycardAuth})
-}
-
-func (v *VehicleSystem) isReadyToDrive() bool {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return v.dashboardReady
 }
 
 // readBrakeStates reads both brake states and returns them

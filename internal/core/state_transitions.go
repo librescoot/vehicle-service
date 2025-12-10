@@ -9,20 +9,6 @@ import (
 	"vehicle-service/internal/types"
 )
 
-// transitionTo handles state transitions by delegating to the librefsm state machine.
-// The FSM callbacks handle all entry/exit actions.
-func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
-	// Convert to FSM state ID
-	fsmState := systemStateToStateID(newState)
-
-	// Use FSM's SetState which handles exit/entry callbacks
-	if err := v.machine.SetState(fsmState); err != nil {
-		return fmt.Errorf("FSM SetState failed: %w", err)
-	}
-
-	return nil
-}
-
 // unlockHandlebarIfNeeded checks if the handlebar needs unlocking and unlocks it
 // Also cancels any ongoing handlebar locking attempt
 func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
