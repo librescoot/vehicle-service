@@ -24,7 +24,6 @@ type Actions interface {
 	EnterHibernationConfirm(c *librefsm.Context) error
 
 	// Guards for conditional transitions
-	CanUnlock(c *librefsm.Context) bool
 	CanEnterReadyToDrive(c *librefsm.Context) bool // True when both kickstand up AND dashboard ready
 	IsDashboardReady(c *librefsm.Context) bool     // True when dashboard has booted
 	IsKickstandUp(c *librefsm.Context) bool        // True when kickstand is up (riding position)

@@ -441,10 +441,6 @@ func (v *VehicleSystem) EnterHibernationConfirm(c *librefsm.Context) error {
 
 // === Guards ===
 
-func (v *VehicleSystem) CanUnlock(c *librefsm.Context) bool {
-	return true
-}
-
 func (v *VehicleSystem) IsDashboardReady(c *librefsm.Context) bool {
 	v.mu.RLock()
 	defer v.mu.RUnlock()

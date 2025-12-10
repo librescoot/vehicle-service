@@ -35,57 +35,12 @@ const (
 	// Hardware timing constants
 	blinkerInterval       = 800 * time.Millisecond
 	handlebarLockDuration = 1100 * time.Millisecond
-	shutdownTimerDuration = 4000 * time.Millisecond
 	handlebarLockWindow   = 10 * time.Second
 	seatboxLockDuration   = 200 * time.Millisecond
 	parkDebounceTime      = 1 * time.Second
 
-	// Hibernation timing constants
-	hibernationInitialHoldDuration = 15 * time.Second // Initial brake hold to enter waiting-hibernation
-	hibernationConfirmationTimeout = 30 * time.Second // Timeout when in waiting-hibernation with no brake activity
-	hibernationForceHoldDuration   = 30 * time.Second // Total continuous hold for auto-confirm hibernation
 )
 
-// Manual hibernation state machine
-type ManualHibernationState int
-
-const (
-	HibernationIdle         ManualHibernationState = iota
-	HibernationInitialHold                         // 0-15s: both brakes held
-	HibernationConfirmation                        // 15s+: awaiting confirmation
-)
-
-func (s ManualHibernationState) String() string {
-	switch s {
-	case HibernationIdle:
-		return "idle"
-	case HibernationInitialHold:
-		return "initial-hold"
-	case HibernationConfirmation:
-		return "confirmation"
-	default:
-		return "unknown"
-	}
-}
-
-// HibernationManager manages the manual hibernation state machine
-type HibernationManager struct {
-	mu                   sync.RWMutex
-	state                ManualHibernationState
-	startTime            time.Time   // When initial brake hold started
-	reholdStartTime      time.Time   // When brakes were pressed again after release
-	initialTimer         *time.Timer // Initial hold timer
-	confirmationTimer    *time.Timer // Confirmation timeout timer
-	reholdTimer          *time.Timer // Timer for re-hold force confirm (20s after re-press)
-	bothBrakesHeld       bool        // Current brake state
-	brakesReleased       bool        // Whether brakes were released during confirmation
-	logger               *logger.Logger
-	redis                *messaging.RedisClient
-	onHibernationConfirm func()                        // Callback to execute hibernation
-	transitionTo         func(types.SystemState) error // Callback to transition vehicle state
-	isKickstandDown      func() (bool, error)          // Callback to check if kickstand is down (true = down)
-	isSeatboxClosed      func() (bool, error)          // Callback to check if seatbox is closed (true = closed)
-}
 
 type VehicleSystem struct {
 	state                  types.SystemState
@@ -101,7 +56,6 @@ type VehicleSystem struct {
 	initialized            bool
 	handlebarUnlocked      bool        // Track if handlebar has been unlocked in this power cycle
 	handlebarTimer         *time.Timer // Timer for handlebar position window
-	shutdownTimer          *time.Timer // Timer for shutting-down to standby transition
 	readyToDriveEntryTime  time.Time   // Track when we entered ready-to-drive state for park debounce
 	keycardTapCount        int
 	lastKeycardTapTime     time.Time
@@ -110,9 +64,8 @@ type VehicleSystem struct {
 	shutdownFromParked      bool                // Track if shutdown was initiated from parked state
 	dbcUpdating             bool                // Track if DBC update is in progress
 	deferredDashboardPower  *bool               // Deferred dashboard power state (nil = no change needed)
-	brakeHibernationEnabled bool                // Track if brake lever hibernation is enabled (default: true)
-	hibernationManager      *HibernationManager // Manual hibernation state machine
-	autoStandbySeconds      int                 // Auto-standby timeout in seconds (0 = disabled)
+	brakeHibernationEnabled bool // Track if brake lever hibernation is enabled (default: true)
+	autoStandbySeconds      int  // Auto-standby timeout in seconds (0 = disabled)
 	machine                 *librefsm.Machine   // librefsm state machine
 }
 
@@ -154,31 +107,6 @@ func (v *VehicleSystem) Start() error {
 	// Initialize and start librefsm state machine
 	if err := v.initFSM(context.Background()); err != nil {
 		return fmt.Errorf("failed to initialize FSM: %w", err)
-	}
-
-	// Initialize hibernation manager
-	v.hibernationManager = &HibernationManager{
-		state:  HibernationIdle,
-		logger: v.logger.WithTag("Hibernation"),
-		redis:  v.redis,
-		onHibernationConfirm: func() {
-			v.logger.Infof("Hibernation confirmed, initiating proper shutdown sequence")
-			v.mu.Lock()
-			v.hibernationRequest = true
-			v.mu.Unlock()
-			if err := v.transitionTo(types.StateShuttingDown); err != nil {
-				v.logger.Infof("Failed to transition to shutdown for hibernation: %v", err)
-			}
-		},
-		transitionTo: v.transitionTo,
-		isKickstandDown: func() (bool, error) {
-			// kickstand input: true = down, false = up
-			return v.io.ReadDigitalInput("kickstand")
-		},
-		isSeatboxClosed: func() (bool, error) {
-			// seatbox_lock_sensor: true = closed, false = open
-			return v.io.ReadDigitalInput("seatbox_lock_sensor")
-		},
 	}
 
 	if err := v.redis.Connect(); err != nil {
@@ -349,7 +277,16 @@ func (v *VehicleSystem) Start() error {
 			v.io.RegisterInputCallback(ch, v.handleHandlebarPosition)
 		case "seatbox_lock_sensor":
 			v.io.RegisterInputCallback(ch, func(channel string, value bool) error {
-				return v.redis.SetSeatboxLockState(value)
+				// Update Redis
+				if err := v.redis.SetSeatboxLockState(value); err != nil {
+					return err
+				}
+				// Send physical event - FSM decides transitions based on current state
+				if value {
+					v.logger.Infof("Seatbox closed - sending EvSeatboxClosed")
+					v.machine.Send(librefsm.Event{ID: fsm.EvSeatboxClosed})
+				}
+				return nil
 			})
 		default:
 			v.io.RegisterInputCallback(ch, v.handleInputChange)
@@ -458,14 +395,8 @@ func (v *VehicleSystem) Start() error {
 		return fmt.Errorf("failed to publish initial state: %w", err)
 	}
 
-	// If we are still in Init state after initialization, transition to Standby
-	if v.getCurrentState() == types.StateInit {
-		v.logger.Infof("Initial state is Init, transitioning to Standby")
-		if err := v.transitionTo(types.StateStandby); err != nil {
-			// Log the error but continue startup, as standby is a safe default
-			v.logger.Infof("Warning: failed to transition to Standby from Init: %v", err)
-		}
-	}
+	// FSM's Init state has a 2-second timeout that transitions to Standby
+	// if no other event (like EvDashboardReady) triggers first
 
 	// Start Redis listeners now that everything is initialized
 	if err := v.redis.StartListening(); err != nil {
@@ -476,27 +407,14 @@ func (v *VehicleSystem) Start() error {
 	return nil
 }
 
-// checkHibernationConditions checks if hibernation should be triggered using state machine
+// checkHibernationConditions sends brake events - FSM decides what to do based on state
 func (v *VehicleSystem) checkHibernationConditions() {
-	currentState := v.getCurrentState()
-
-	// Only check hibernation conditions in parked or hibernation states
-	if currentState != types.StateParked &&
-	   currentState != types.StateWaitingHibernation &&
-	   currentState != types.StateWaitingHibernationSeatbox &&
-	   currentState != types.StateWaitingHibernationConfirm {
-		v.hibernationManager.cancelHibernation()
-		return
-	}
-
 	// Check if brake hibernation is enabled
 	v.mu.RLock()
 	hibernationEnabled := v.brakeHibernationEnabled
 	v.mu.RUnlock()
 
 	if !hibernationEnabled {
-		v.logger.Infof("Brake hibernation is disabled, skipping hibernation check")
-		v.hibernationManager.cancelHibernation()
 		return
 	}
 
@@ -510,364 +428,16 @@ func (v *VehicleSystem) checkHibernationConditions() {
 		v.logger.Infof("Failed to read brake_right for hibernation check: %v", err)
 		return
 	}
+	bothBrakesPressed := brakeLeft && brakeRight
 
-	// Update hibernation manager with current brake state
-	v.hibernationManager.updateBrakeState(brakeLeft && brakeRight)
-}
-
-
-// Hibernation Manager Methods
-
-// updateBrakeState updates the hibernation state machine based on brake input
-func (hm *HibernationManager) updateBrakeState(bothBrakesPressed bool) {
-	hm.mu.Lock()
-	defer hm.mu.Unlock()
-
-	previousBrakeState := hm.bothBrakesHeld
-	hm.bothBrakesHeld = bothBrakesPressed
-
-	switch hm.state {
-	case HibernationIdle:
-		if bothBrakesPressed {
-			// Start hibernation sequence
-			hm.startInitialHold()
-		}
-
-	case HibernationInitialHold:
-		if !bothBrakesPressed {
-			// Brakes released during initial hold - cancel
-			hm.logger.Infof("Brakes released during initial hold - cancelling hibernation")
-			hm.resetToIdle()
-		}
-		// If brakes still held, timer will handle transition to confirmation
-
-	case HibernationConfirmation:
-		if previousBrakeState && !bothBrakesPressed {
-			// Brakes just released - start confirmation timeout
-			hm.logger.Infof("Brakes released - starting confirmation timeout")
-			hm.brakesReleased = true
-			hm.startConfirmationTimeout()
-		} else if !previousBrakeState && bothBrakesPressed {
-			// Brakes pressed again after release
-			if hm.brakesReleased {
-				hm.logger.Infof("Both brakes pressed again - resetting timeout and starting rehold timer")
-				hm.startReholdTimer()
-			}
-		} else if previousBrakeState && bothBrakesPressed {
-			// Brakes still held or touched - reset timeout timer
-			hm.resetConfirmationTimeout()
-		}
-		// Force hibernation after continuous hold is handled by timer in transitionToConfirmation()
-	}
-}
-
-// startInitialHold begins the initial brake hold phase
-func (hm *HibernationManager) startInitialHold() {
-	hm.state = HibernationInitialHold
-	hm.startTime = time.Now()
-	hm.brakesReleased = false
-
-	hm.logger.Infof("Starting hibernation initial hold (%.0fs)", hibernationInitialHoldDuration.Seconds())
-
-	// Start timer for initial hold
-	hm.initialTimer = time.AfterFunc(hibernationInitialHoldDuration, func() {
-		hm.mu.Lock()
-		defer hm.mu.Unlock()
-
-		if hm.state == HibernationInitialHold && hm.bothBrakesHeld {
-			hm.logger.Infof("Initial hold completed - transitioning to waiting-hibernation")
-
-			// Transition vehicle to waiting-hibernation state after 20s hold
-			if hm.transitionTo != nil {
-				if err := hm.transitionTo(types.StateWaitingHibernation); err != nil {
-					hm.logger.Infof("Failed to transition to waiting-hibernation: %v", err)
-					return
-				}
-			}
-
-			// Enter confirmation phase
-			hm.transitionToConfirmation()
-		}
-	})
-}
-
-// transitionToConfirmation moves to the confirmation phase
-func (hm *HibernationManager) transitionToConfirmation() {
-	hm.state = HibernationConfirmation
-
-	// Stop initial timer if running
-	if hm.initialTimer != nil {
-		hm.initialTimer.Stop()
-		hm.initialTimer = nil
-	}
-
-	hm.logger.Infof("Hibernation confirmation phase started")
-
-	// Start a timer for force hibernation (remaining time to reach total duration)
-	remainingTime := hibernationForceHoldDuration - time.Since(hm.startTime)
-	if remainingTime > 0 {
-		hm.initialTimer = time.AfterFunc(remainingTime, func() {
-			hm.mu.Lock()
-			defer hm.mu.Unlock()
-
-			// If brakes are still held continuously (never released), trigger force hibernation
-			if hm.state == HibernationConfirmation && hm.bothBrakesHeld && !hm.brakesReleased {
-				hm.logger.Infof("Force hibernation triggered - %.0fs continuous hold", hibernationForceHoldDuration.Seconds())
-				hm.confirmHibernation(true) // Auto-confirm - skip seatbox check
-			}
-		})
-	}
-
-	// Check if seatbox is open - if so, transition to seatbox notification state
-	if hm.isSeatboxClosed != nil {
-		seatboxClosed, err := hm.isSeatboxClosed()
-		if err != nil {
-			hm.logger.Infof("Failed to read seatbox state: %v", err)
-		} else if !seatboxClosed {
-			hm.logger.Infof("Seatbox is open - showing seatbox notification")
-			if hm.transitionTo != nil {
-				if err := hm.transitionTo(types.StateWaitingHibernationSeatbox); err != nil {
-					hm.logger.Infof("Failed to transition to waiting-hibernation-seatbox: %v", err)
-				}
-			}
-			return
-		}
-	}
-
-	// Seatbox is closed, stay in standard confirmation state
-	// (no separate state needed, waiting-hibernation covers this)
-}
-
-// startConfirmationTimeout starts the 30s timeout for confirmation after brake release
-func (hm *HibernationManager) startConfirmationTimeout() {
-	// Stop any existing confirmation timer
-	if hm.confirmationTimer != nil {
-		hm.confirmationTimer.Stop()
-	}
-
-	// Stop the force hibernation timer since brakes were released
-	if hm.initialTimer != nil {
-		hm.initialTimer.Stop()
-		hm.initialTimer = nil
-	}
-
-	// Stop any rehold timer
-	if hm.reholdTimer != nil {
-		hm.reholdTimer.Stop()
-		hm.reholdTimer = nil
-	}
-
-	hm.confirmationTimer = time.AfterFunc(hibernationConfirmationTimeout, func() {
-		hm.mu.Lock()
-		defer hm.mu.Unlock()
-
-		// Only timeout if brakes are NOT held
-		if hm.state == HibernationConfirmation && !hm.bothBrakesHeld {
-			hm.logger.Infof("Confirmation timeout - cancelling hibernation")
-			hm.resetToIdle()
-		}
-	})
-
-	hm.logger.Infof("Confirmation timeout started (%.0fs)", hibernationConfirmationTimeout.Seconds())
-}
-
-// resetConfirmationTimeout resets the confirmation timeout (called when brakes touched)
-func (hm *HibernationManager) resetConfirmationTimeout() {
-	if hm.confirmationTimer != nil {
-		hm.confirmationTimer.Stop()
-		hm.confirmationTimer = time.AfterFunc(hibernationConfirmationTimeout, func() {
-			hm.mu.Lock()
-			defer hm.mu.Unlock()
-
-			// Only timeout if brakes are NOT held
-			if hm.state == HibernationConfirmation && !hm.bothBrakesHeld {
-				hm.logger.Infof("Confirmation timeout - cancelling hibernation")
-				hm.resetToIdle()
-			}
-		})
-		hm.logger.Infof("Confirmation timeout reset (%.0fs)", hibernationConfirmationTimeout.Seconds())
-	}
-}
-
-// startReholdTimer starts a timer for force confirmation after brakes are pressed again
-func (hm *HibernationManager) startReholdTimer() {
-	// Stop any existing rehold timer
-	if hm.reholdTimer != nil {
-		hm.reholdTimer.Stop()
-	}
-
-	// Stop confirmation timeout since user is actively holding brakes
-	if hm.confirmationTimer != nil {
-		hm.confirmationTimer.Stop()
-		hm.confirmationTimer = nil
-	}
-
-	hm.reholdStartTime = time.Now()
-	hm.reholdTimer = time.AfterFunc(hibernationInitialHoldDuration, func() {
-		hm.mu.Lock()
-		defer hm.mu.Unlock()
-
-		// If brakes still held, trigger force confirmation
-		if hm.state == HibernationConfirmation && hm.bothBrakesHeld {
-			hm.logger.Infof("Force hibernation triggered - %.0fs rehold", hibernationInitialHoldDuration.Seconds())
-			hm.confirmHibernation(true) // Auto-confirm - skip seatbox check
-		}
-	})
-
-	hm.logger.Infof("Rehold timer started (%.0fs)", hibernationInitialHoldDuration.Seconds())
-}
-
-// confirmHibernation executes the hibernation after checking safety conditions
-// autoConfirm: if true, skips seatbox check (for continuous hold or rehold)
-func (hm *HibernationManager) confirmHibernation(autoConfirm bool) {
-	if autoConfirm {
-		hm.logger.Infof("Hibernation auto-confirmed (%.0fs continuous or %.0fs rehold), checking safety conditions",
-			hibernationForceHoldDuration.Seconds(), hibernationInitialHoldDuration.Seconds())
+	// Send pure physical events - FSM decides transitions based on current state
+	if bothBrakesPressed {
+		v.logger.Debugf("Both brakes pressed - sending EvBrakesPressed")
+		v.machine.Send(librefsm.Event{ID: fsm.EvBrakesPressed})
 	} else {
-		hm.logger.Infof("Hibernation confirmed, checking safety conditions")
+		v.logger.Debugf("Brakes released - sending EvBrakesReleased")
+		v.machine.Send(librefsm.Event{ID: fsm.EvBrakesReleased})
 	}
-
-	// Check kickstand state - must be down (always required)
-	if hm.isKickstandDown != nil {
-		kickstandDown, err := hm.isKickstandDown()
-		if err != nil {
-			hm.logger.Infof("Failed to read kickstand state: %v, aborting hibernation", err)
-			hm.resetToIdle()
-			return
-		}
-		if !kickstandDown {
-			hm.logger.Infof("Kickstand is up, aborting hibernation")
-			hm.resetToIdle()
-			return
-		}
-	}
-
-	// Check seatbox state - must be closed (skip for auto-confirm)
-	if !autoConfirm && hm.isSeatboxClosed != nil {
-		seatboxClosed, err := hm.isSeatboxClosed()
-		if err != nil {
-			hm.logger.Infof("Failed to read seatbox state: %v, aborting hibernation", err)
-			hm.resetToIdle()
-			return
-		}
-		if !seatboxClosed {
-			hm.logger.Infof("Seatbox is open, transitioning to seatbox notification state")
-			if hm.transitionTo != nil {
-				if err := hm.transitionTo(types.StateWaitingHibernationSeatbox); err != nil {
-					hm.logger.Infof("Failed to transition to waiting-hibernation-seatbox: %v", err)
-				}
-			}
-			// Don't reset to idle - stay in confirmation waiting for seatbox to close
-			return
-		}
-	} else if autoConfirm {
-		hm.logger.Infof("Auto-confirm mode: skipping seatbox check (warehouse mode)")
-	}
-
-	hm.logger.Infof("Safety checks passed, transitioning to confirmation state")
-
-	// Transition to 3-second confirmation state
-	if hm.transitionTo != nil {
-		if err := hm.transitionTo(types.StateWaitingHibernationConfirm); err != nil {
-			hm.logger.Infof("Failed to transition to waiting-hibernation-confirm: %v", err)
-			hm.resetToIdle()
-			return
-		}
-	}
-
-	// Start 3-second non-abortable confirmation timer
-	time.AfterFunc(3*time.Second, func() {
-		hm.logger.Infof("Confirmation timer complete, executing hibernation")
-		// Execute hibernation callback
-		if hm.onHibernationConfirm != nil {
-			hm.onHibernationConfirm()
-		}
-		// Reset to idle
-		hm.resetToIdle()
-	})
-}
-
-// cancelHibernation cancels the hibernation sequence
-func (hm *HibernationManager) cancelHibernation() {
-	hm.mu.Lock()
-	defer hm.mu.Unlock()
-
-	if hm.state != HibernationIdle {
-		hm.logger.Infof("Hibernation cancelled")
-		hm.resetToIdle()
-	}
-}
-
-// resetToIdle resets the hibernation manager to idle state
-func (hm *HibernationManager) resetToIdle() {
-	// Stop all timers
-	if hm.initialTimer != nil {
-		hm.initialTimer.Stop()
-		hm.initialTimer = nil
-	}
-	if hm.confirmationTimer != nil {
-		hm.confirmationTimer.Stop()
-		hm.confirmationTimer = nil
-	}
-	if hm.reholdTimer != nil {
-		hm.reholdTimer.Stop()
-		hm.reholdTimer = nil
-	}
-
-	// Reset state
-	hm.state = HibernationIdle
-	hm.bothBrakesHeld = false
-	hm.brakesReleased = false
-	hm.startTime = time.Time{}
-	hm.reholdStartTime = time.Time{}
-
-	// Transition vehicle back to parked state
-	if hm.transitionTo != nil {
-		if err := hm.transitionTo(types.StateParked); err != nil {
-			hm.logger.Infof("Failed to transition back to parked: %v", err)
-		}
-	}
-}
-
-// handleKeycardConfirmation handles keycard tap during confirmation phase
-func (hm *HibernationManager) handleKeycardConfirmation() {
-	hm.mu.Lock()
-	defer hm.mu.Unlock()
-
-	if hm.state == HibernationConfirmation && hm.brakesReleased {
-		hm.logger.Infof("Keycard confirmation received")
-		hm.confirmHibernation(false) // Keycard confirmation - require seatbox closed
-	}
-}
-
-
-// triggerShutdownTimeout handles the shutdown timer expiration and transitions to standby
-func (v *VehicleSystem) triggerShutdownTimeout() {
-	v.logger.Infof("Shutdown timer expired, transitioning to standby...")
-
-	v.mu.RLock()
-	hibernationRequested := v.hibernationRequest
-	v.mu.RUnlock()
-
-	// Transition to standby
-	if err := v.transitionTo(types.StateStandby); err != nil {
-		v.logger.Infof("Failed to transition to standby after shutdown timeout: %v", err)
-		return
-	}
-
-	// If hibernation was requested, execute it after the state transition
-	if hibernationRequested {
-		v.logger.Infof("Hibernation was requested, executing hibernation...")
-		if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-			v.logger.Infof("Failed to send hibernate command after shutdown: %v", err)
-		}
-	}
-
-	// Reset the timer field after it has fired
-	v.mu.Lock()
-	v.shutdownTimer = nil
-	v.hibernationRequest = false
-	v.mu.Unlock()
 }
 
 // startAutoStandbyTimer starts the auto-standby timer using librefsm
@@ -1023,49 +593,6 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		}
 	}
 
-	// Check for manual ready-to-drive activation when in parked state
-	if currentState == types.StateParked && channel == "seatbox_button" && value {
-		// Check if dashboard has not signaled readiness
-		v.mu.RLock()
-		dashboardReady := v.dashboardReady
-		v.mu.RUnlock()
-
-		if !dashboardReady {
-			// Check if kickstand is up
-			kickstandValue, err := v.io.ReadDigitalInput("kickstand")
-			if err != nil {
-				v.logger.Infof("Failed to read kickstand: %v", err)
-				return err
-			}
-
-			if !kickstandValue {
-				// Check if both brakes are held
-				brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-				if err != nil {
-					v.logger.Infof("Failed to read brake_left: %v", err)
-					return err
-				}
-				brakeRight, err := v.io.ReadDigitalInput("brake_right")
-				if err != nil {
-					v.logger.Infof("Failed to read brake_right: %v", err)
-					return err
-				}
-
-				if brakeLeft && brakeRight {
-					v.logger.Infof("Manual ready-to-drive activation: kickstand up, both brakes held, seatbox button pressed")
-
-					// Blink the main light once for confirmation
-					if err := v.io.PlayPwmCue(3); err != nil { // LED_PARKED_TO_DRIVE
-						v.logger.Infof("Failed to play LED cue: %v", err)
-					}
-
-					// Set the scooter to ready-to-drive
-					return v.transitionTo(types.StateReadyToDrive)
-				}
-			}
-		}
-	}
-
 	switch channel {
 	case "horn_button":
 		if err := v.io.WriteDigitalOutput("horn", value); err != nil {
@@ -1074,50 +601,46 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		return v.redis.SetHornButton(value)
 
 	case "kickstand":
-		v.logger.Infof("Kickstand changed: %v, current state: %s", value, currentState)
+		v.logger.Infof("Kickstand changed: %v", value)
 
 		// Reset auto-standby timer on kickstand movement
 		v.resetAutoStandbyTimer()
 
-		// Cancel hibernation if kickstand is raised
-		if !value {
-			v.hibernationManager.cancelHibernation()
-		}
-
-		if currentState == types.StateStandby {
-			v.logger.Infof("Ignoring kickstand change in %s state", currentState)
-			return nil
-		}
-		if err := v.redis.SetKickstandState(value); err != nil {
-			return err
-		}
-		if value {
-			// Kickstand down - check debounce if coming from ready-to-drive
-			if currentState == types.StateReadyToDrive {
-				v.mu.RLock()
-				entryTime := v.readyToDriveEntryTime
-				v.mu.RUnlock()
-
-				timeSinceEntry := time.Since(entryTime)
-				if timeSinceEntry < parkDebounceTime {
-					v.logger.Infof("Kickstand down ignored - debounce protection (%.2fs since entering ready-to-drive)", timeSinceEntry.Seconds())
-					return nil
-				}
+		// Update Redis (skip in standby to avoid noise)
+		if currentState != types.StateStandby {
+			if err := v.redis.SetKickstandState(value); err != nil {
+				return err
 			}
-			// Kickstand down - send event (FSM handles transition from ReadyToDrive to Parked)
-			v.logger.Infof("Kickstand down, sending EvKickstandDown")
+		}
+
+		// Debounce protection for kickstand down from ready-to-drive
+		if value && currentState == types.StateReadyToDrive {
+			v.mu.RLock()
+			entryTime := v.readyToDriveEntryTime
+			v.mu.RUnlock()
+
+			if time.Since(entryTime) < parkDebounceTime {
+				v.logger.Infof("Kickstand down ignored - debounce protection")
+				return nil
+			}
+		}
+
+		// Send FSM event - FSM handles all transitions based on current state
+		if value {
+			v.logger.Infof("Sending EvKickstandDown")
 			v.machine.Send(librefsm.Event{ID: fsm.EvKickstandDown})
 		} else {
-			// Kickstand up - send event (FSM handles transition from Parked to ReadyToDrive if dashboard ready)
-			v.logger.Infof("Kickstand up, sending EvKickstandUp")
+			v.logger.Infof("Sending EvKickstandUp")
 			v.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
 		}
 
 	case "seatbox_button":
 		if value {
-			// Reset auto-standby timer and cancel hibernation on seatbox press
+			// Reset auto-standby timer on seatbox press
 			v.resetAutoStandbyTimer()
-			v.hibernationManager.cancelHibernation()
+			// Send physical event - FSM decides transitions based on current state
+			v.logger.Infof("Seatbox button pressed - sending EvSeatboxButton")
+			v.machine.Send(librefsm.Event{ID: fsm.EvSeatboxButton})
 		}
 
 		if err := v.redis.SetSeatboxButton(value); err != nil {
@@ -1311,93 +834,51 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}
 func (v *VehicleSystem) keycardAuthPassed() error {
 	v.logger.Infof("Processing keycard authentication tap")
 
-	// --- Force Standby Check ---
+	// --- Force Standby Check (3 taps + brake) ---
 	brakeLeft, errL := v.io.ReadDigitalInput("brake_left")
 	if errL != nil {
-		v.logger.Infof("Warning: Failed to read brake_left for keycard auth, assuming not pressed: %v", errL)
+		v.logger.Debugf("Warning: Failed to read brake_left for keycard auth, assuming not pressed: %v", errL)
 		brakeLeft = false
 	}
 	brakeRight, errR := v.io.ReadDigitalInput("brake_right")
 	if errR != nil {
-		v.logger.Infof("Warning: Failed to read brake_right for keycard auth, assuming not pressed: %v", errR)
+		v.logger.Debugf("Warning: Failed to read brake_right for keycard auth, assuming not pressed: %v", errR)
 		brakeRight = false
 	}
 	brakePressed := brakeLeft || brakeRight
 
 	currentTime := time.Now()
-	performForcedStandby := false
+	sendForceLock := false
 
 	v.mu.Lock()
 	if v.lastKeycardTapTime.IsZero() || currentTime.Sub(v.lastKeycardTapTime) > keycardTapMaxInterval {
 		v.keycardTapCount = 1
-		v.logger.Infof("Keycard tap sequence: Start/Reset. Count: 1")
+		v.logger.Debugf("Keycard tap sequence: Start/Reset. Count: 1")
 	} else {
 		v.keycardTapCount++
-		v.logger.Infof("Keycard tap sequence: Incremented. Count: %d", v.keycardTapCount)
+		v.logger.Debugf("Keycard tap sequence: Incremented. Count: %d", v.keycardTapCount)
 	}
 	v.lastKeycardTapTime = currentTime
 
 	if v.keycardTapCount >= keycardForceStandbyTaps {
 		if brakePressed {
-			v.logger.Infof("Force standby condition met: %d taps, brake pressed.", v.keycardTapCount)
-			v.forceStandbyNoLock = true
-			performForcedStandby = true
+			v.logger.Infof("Force standby condition met: %d taps, brake pressed", v.keycardTapCount)
+			sendForceLock = true
 		} else {
-			v.logger.Infof("Force standby condition NOT met: %d taps, but brake not pressed. Resetting count.", v.keycardTapCount)
+			v.logger.Debugf("Force standby condition NOT met: %d taps, but brake not pressed", v.keycardTapCount)
 		}
-		v.keycardTapCount = 0 // Reset after 3 taps, regardless of brake, for the next sequence
+		v.keycardTapCount = 0
 	}
 	v.mu.Unlock()
 
-	if performForcedStandby {
-		v.logger.Infof("Transitioning to STANDBY (forced, no lock).")
-		// The forceStandbyNoLock flag will be read and reset by transitionTo
-		return v.transitionTo(types.StateStandby)
-	}
-	// --- End Force Standby Check ---
-
-	// --- Hibernation Confirmation Check ---
-	// Check if this keycard tap should confirm hibernation
-	v.hibernationManager.handleKeycardConfirmation()
-
-	// ----- Original keycardAuthPassed logic continues if not forced standby -----
-	currentState := v.getCurrentState()
-
-	v.logger.Infof("Current state during keycard auth (normal flow): %s", currentState)
-
-	if currentState == types.StateStandby {
-		v.logger.Infof("Reading kickstand state")
-		kickstandValue, err := v.io.ReadDigitalInput("kickstand")
-		if err != nil {
-			v.logger.Infof("Failed to read kickstand: %v", err)
-			return fmt.Errorf("failed to read kickstand: %w", err)
-		}
-
-		newState := types.StateReadyToDrive
-		if kickstandValue {
-			newState = types.StateParked
-		}
-		v.logger.Infof("Transitioning from STANDBY to %s (kickstand=%v)", newState, kickstandValue)
-		return v.transitionTo(newState)
+	// Send the appropriate event - FSM handles all transition logic
+	if sendForceLock {
+		v.logger.Infof("Sending EvForceLock")
+		return v.machine.SendSync(librefsm.Event{ID: fsm.EvForceLock})
 	}
 
-	// Check kickstand before going to STANDBY
-	kickstandValue, err := v.io.ReadDigitalInput("kickstand")
-	if err != nil {
-		v.logger.Infof("Failed to read kickstand: %v", err)
-		return fmt.Errorf("failed to read kickstand: %w", err)
-	}
-	if !kickstandValue {
-		v.logger.Infof("Cannot transition to STANDBY: kickstand not down")
-		return fmt.Errorf("cannot transition to STANDBY: kickstand not down")
-	}
-
-	v.logger.Infof("Transitioning to SHUTTING_DOWN from %s", currentState)
-	if err := v.transitionTo(types.StateShuttingDown); err != nil {
-		return err
-	}
-
-	return nil
+	v.logger.Infof("Sending EvKeycardAuth")
+	return v.machine.SendSync(librefsm.Event{ID: fsm.EvKeycardAuth})
 }
 
 func (v *VehicleSystem) isReadyToDrive() bool {
@@ -1526,10 +1007,6 @@ func (v *VehicleSystem) Shutdown() {
 	if v.handlebarTimer != nil {
 		v.handlebarTimer.Stop()
 		v.handlebarTimer = nil
-	}
-	if v.shutdownTimer != nil {
-		v.shutdownTimer.Stop()
-		v.shutdownTimer = nil
 	}
 
 	if v.redis != nil {

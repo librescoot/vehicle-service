@@ -41,6 +41,7 @@ const (
 	EvSeatboxButton   librefsm.EventID = "seatbox-button"
 
 	// Timer events
+	EvInitTimeout               librefsm.EventID = "init-timeout"
 	EvShutdownTimeout           librefsm.EventID = "shutdown-timeout"
 	EvAutoStandbyTimeout        librefsm.EventID = "auto-standby-timeout"
 	EvHibernationInitialTimeout librefsm.EventID = "hibernation-initial-timeout"
@@ -48,11 +49,8 @@ const (
 	EvHibernationForceTimeout   librefsm.EventID = "hibernation-force-timeout"
 	EvHibernationFinalTimeout   librefsm.EventID = "hibernation-final-timeout"
 
-	// Hibernation control
-	EvHibernationStart   librefsm.EventID = "hibernation-start"
-	EvHibernationCancel  librefsm.EventID = "hibernation-cancel"
-	EvHibernationConfirm librefsm.EventID = "hibernation-confirm"
-	EvSeatboxClosed      librefsm.EventID = "seatbox-closed"
+	// Seatbox events
+	EvSeatboxClosed librefsm.EventID = "seatbox-closed"
 )
 
 // Timer names for imperative timers

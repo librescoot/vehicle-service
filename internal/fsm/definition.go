@@ -8,6 +8,7 @@ import (
 
 // Timing constants
 const (
+	InitTimeout               = 2 * time.Second
 	ShutdownTimeout           = 4 * time.Second
 	HibernationInitialTimeout = 15 * time.Second
 	HibernationConfirmTimeout = 30 * time.Second
@@ -21,7 +22,9 @@ const (
 func NewDefinition(actions Actions) *librefsm.Definition {
 	return librefsm.NewDefinition().
 		// Basic states
-		State(StateInit).
+		State(StateInit,
+			librefsm.WithTimeout(InitTimeout, EvInitTimeout),
+		).
 		State(StateStandby,
 			librefsm.WithOnEnter(actions.EnterStandby),
 		).
@@ -70,9 +73,11 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 
 		// From Init
 		Transition(StateInit, EvDashboardReady, StateParked).
+		Transition(StateInit, EvInitTimeout, StateStandby).
 
 		// From Standby - always go to Parked first (dashboard is booting)
 		Transition(StateStandby, EvUnlock, StateParked).
+		Transition(StateStandby, EvKeycardAuth, StateParked). // Keycard tap unlocks from standby
 		Transition(StateStandby, EvDashboardReady, StateParked).
 
 		// From Parked - unlock/kickstand-up/dashboard-ready to ReadyToDrive if conditions met
@@ -92,8 +97,16 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateParked, EvForceLock, StateStandby,
 			librefsm.WithAction(actions.OnForceLock),
 		).
+		Transition(StateParked, EvKeycardAuth, StateShuttingDown, // Keycard tap locks from parked
+			librefsm.WithGuard(actions.IsKickstandDown),
+		).
 		Transition(StateParked, EvAutoStandbyTimeout, StateShuttingDown).
-		Transition(StateParked, EvHibernationStart, StateHibernationInitialHold,
+		// Manual ready-to-drive: seatbox button with kickstand up and both brakes pressed
+		Transition(StateParked, EvSeatboxButton, StateReadyToDrive,
+			librefsm.WithGuards(actions.IsKickstandUp, actions.AreBrakesPressed),
+		).
+		// Hibernation entry: both brakes pressed in parked state
+		Transition(StateParked, EvBrakesPressed, StateHibernationInitialHold,
 			librefsm.WithGuard(actions.AreBrakesPressed),
 		).
 
@@ -101,6 +114,12 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateReadyToDrive, EvKickstandDown, StateParked).
 		Transition(StateReadyToDrive, EvDashboardNotReady, StateParked). // Safety: dashboard disconnect
 		Transition(StateReadyToDrive, EvLock, StateShuttingDown).
+		Transition(StateReadyToDrive, EvForceLock, StateStandby,
+			librefsm.WithAction(actions.OnForceLock),
+		).
+		Transition(StateReadyToDrive, EvKeycardAuth, StateShuttingDown, // Requires kickstand down (never true in RTD)
+			librefsm.WithGuard(actions.IsKickstandDown),
+		).
 
 		// From ShuttingDown
 		Transition(StateShuttingDown, EvShutdownTimeout, StateStandby,
@@ -108,35 +127,34 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		).
 		Transition(StateShuttingDown, EvUnlock, StateParked).
 
-		// Hibernation flow
-		// Initial hold -> either advance or cancel
+		// Hibernation flow - all events are physical inputs
+		// Initial hold -> either advance (timeout) or cancel (brakes released)
 		Transition(StateHibernationInitialHold, EvHibernationInitialTimeout, StateHibernationAwaitingConfirm).
-		Transition(StateHibernationInitialHold, EvBrakesReleased, StateParked). // Cancel if brakes released early
-		Transition(StateHibernationInitialHold, EvHibernationCancel, StateParked).
+		Transition(StateHibernationInitialHold, EvBrakesReleased, StateParked).
 
-		// Awaiting confirm -> confirm, seatbox check, or timeout/cancel
-		Transition(StateHibernationAwaitingConfirm, EvHibernationConfirm, StateHibernationConfirm,
+		// Awaiting confirm -> keycard tap confirms, seatbox button cancels
+		Transition(StateHibernationAwaitingConfirm, EvKeycardAuth, StateHibernationConfirm,
 			librefsm.WithGuard(actions.IsSeatboxClosed),
 		).
-		Transition(StateHibernationAwaitingConfirm, EvHibernationConfirm, StateHibernationSeatbox,
-			// If seatbox not closed, go to seatbox state
-		).
+		Transition(StateHibernationAwaitingConfirm, EvKeycardAuth, StateHibernationSeatbox).
+		Transition(StateHibernationAwaitingConfirm, EvSeatboxButton, StateParked).
 		Transition(StateHibernationAwaitingConfirm, EvHibernationForceTimeout, StateHibernationConfirm).
 		Transition(StateHibernationAwaitingConfirm, EvHibernationConfirmTimeout, StateParked).
-		Transition(StateHibernationAwaitingConfirm, EvHibernationCancel, StateParked).
 
-		// Seatbox state -> wait for seatbox to close
+		// Seatbox state -> wait for seatbox to close, button cancels
 		Transition(StateHibernationSeatbox, EvSeatboxClosed, StateHibernationConfirm).
-		Transition(StateHibernationSeatbox, EvHibernationCancel, StateParked).
+		Transition(StateHibernationSeatbox, EvSeatboxButton, StateParked).
 
-		// Final confirm -> execute hibernation
+		// Final confirm -> execute hibernation after timeout, button cancels
 		Transition(StateHibernationConfirm, EvHibernationFinalTimeout, StateShuttingDown,
 			librefsm.WithAction(actions.OnHibernationComplete),
 		).
-		Transition(StateHibernationConfirm, EvHibernationCancel, StateParked).
+		Transition(StateHibernationConfirm, EvSeatboxButton, StateParked).
 
-		// Global cancel from any hibernation state (handled by parent exit)
+		// Global transitions from any hibernation state (via parent)
+		// Physical events that cancel hibernation from any substate
 		Transition(StateHibernation, EvUnlock, StateParked).
+		Transition(StateHibernation, EvKickstandUp, StateParked).
 
 		// Initial state
 		Initial(StateInit)
