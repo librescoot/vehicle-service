@@ -72,13 +72,11 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// === Transitions ===
 
 		// From Init
-		Transition(StateInit, EvDashboardReady, StateParked).
 		Transition(StateInit, EvInitTimeout, StateStandby).
 
-		// From Standby - always go to Parked first (dashboard is booting)
+		// From Standby - unlock events transition to Parked
 		Transition(StateStandby, EvUnlock, StateParked).
 		Transition(StateStandby, EvKeycardAuth, StateParked). // Keycard tap unlocks from standby
-		Transition(StateStandby, EvDashboardReady, StateParked).
 
 		// From Parked - unlock/kickstand-up/dashboard-ready to ReadyToDrive if conditions met
 		Transition(StateParked, EvUnlock, StateReadyToDrive,
