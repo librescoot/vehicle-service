@@ -104,13 +104,21 @@ func (v *VehicleSystem) Start() error {
 		SettingsCallback:  v.handleSettingsUpdate,
 	})
 
-	// Initialize and start librefsm state machine
-	if err := v.initFSM(context.Background()); err != nil {
-		return fmt.Errorf("failed to initialize FSM: %w", err)
-	}
-
+	// Connect to Redis first so we can retrieve saved state
 	if err := v.redis.Connect(); err != nil {
 		return fmt.Errorf("failed to connect to Redis: %w", err)
+	}
+
+	// Load initial state from Redis for restoration after FSM starts
+	savedState, err := v.redis.GetVehicleState()
+	if err != nil {
+		v.logger.Infof("Failed to get saved state from Redis: %v", err)
+		savedState = types.StateInit // Default to init if not found
+	}
+
+	// Initialize and start librefsm state machine (starts from init state)
+	if err := v.initFSM(context.Background()); err != nil {
+		return fmt.Errorf("failed to initialize FSM: %w", err)
 	}
 
 	// Read initial brake hibernation setting from Redis
@@ -191,18 +199,6 @@ func (v *VehicleSystem) Start() error {
 		v.mu.Unlock()
 	}
 
-	// Load initial state from Redis
-	savedState, err := v.redis.GetVehicleState()
-	if err != nil {
-		v.logger.Infof("Failed to get saved state from Redis: %v", err)
-		// Continue with default state
-	} else if savedState != types.StateInit && savedState != types.StateShuttingDown {
-		v.logger.Infof("Restoring saved state from Redis: %s", savedState)
-		v.mu.Lock()
-		v.state = savedState
-		v.mu.Unlock()
-	}
-
 	// Read dashboard power from Redis BEFORE hardware initialization
 	// This ensures GPIO starts with correct value (no power interruption)
 	if savedState != types.StateInit && savedState != types.StateShuttingDown {
@@ -245,6 +241,11 @@ func (v *VehicleSystem) Start() error {
 	// Initialize hardware (will use initial values set above)
 	if err := v.io.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize hardware: %w", err)
+	}
+
+	// Restore saved FSM state now that hardware is initialized
+	if err := v.restoreFSMState(savedState); err != nil {
+		return fmt.Errorf("failed to restore FSM state: %w", err)
 	}
 
 	// Check initial handlebar lock sensor state

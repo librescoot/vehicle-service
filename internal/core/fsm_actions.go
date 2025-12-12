@@ -116,6 +116,18 @@ func (v *VehicleSystem) initFSM(ctx context.Context) error {
 	return nil
 }
 
+// restoreFSMState restores the FSM to a saved state (must be called after hardware init)
+func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) error {
+	if savedState != types.StateInit && savedState != types.StateShuttingDown {
+		v.logger.Infof("Restoring FSM to saved state: %s", savedState)
+		if err := v.machine.SetState(systemStateToStateID(savedState)); err != nil {
+			v.logger.Errorf("Failed to restore FSM state: %v", err)
+			return err
+		}
+	}
+	return nil
+}
+
 // sendEvent sends an event to the FSM
 func (v *VehicleSystem) sendEvent(event librefsm.EventID) error {
 	return v.machine.SendSync(librefsm.Event{ID: event})
