@@ -166,6 +166,10 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		}
 
 		// Determine what power action to take (if any)
+		v.mu.Lock()
+		currentState := v.state
+		v.mu.Unlock()
+
 		var powerOff bool
 		if deferredPower != nil {
 			if *deferredPower {
@@ -175,14 +179,15 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 					return err
 				}
 			} else {
-				v.logger.Debugf("Scheduling deferred dashboard power OFF (5s delay)")
-				powerOff = true
+				// Deferred power-off: only execute if still in standby
+				if currentState == types.StateStandby {
+					v.logger.Debugf("Scheduling deferred dashboard power OFF (5s delay)")
+					powerOff = true
+				} else {
+					v.logger.Debugf("Deferred dashboard power OFF cancelled - no longer in standby (state=%s)", currentState)
+				}
 			}
 		} else {
-			v.mu.Lock()
-			currentState := v.state
-			v.mu.Unlock()
-
 			if currentState == types.StateStandby {
 				v.logger.Debugf("DBC update complete in standby - scheduling dashboard power OFF (5s delay)")
 				powerOff = true
