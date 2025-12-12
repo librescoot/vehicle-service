@@ -120,9 +120,7 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		).
 
 		// From ShuttingDown
-		Transition(StateShuttingDown, EvShutdownTimeout, StateStandby,
-			librefsm.WithAction(actions.OnShutdownTimeout),
-		).
+		Transition(StateShuttingDown, EvShutdownTimeout, StateStandby).
 		Transition(StateShuttingDown, EvUnlock, StateParked).
 
 		// Hibernation flow - all events are physical inputs
