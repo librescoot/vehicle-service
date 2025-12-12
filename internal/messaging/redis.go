@@ -249,14 +249,7 @@ func (r *RedisClient) handleHardwareCommand(value string) error {
 
 	r.logger.Infof("Processing hardware command: %s", value)
 
-	// Validate command format (component:action)
-	switch value {
-	case "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock":
-		return r.callbacks.HardwareCallback(value)
-	default:
-		r.logger.Infof("Invalid hardware command value: %s", value)
-		return fmt.Errorf("invalid hardware command: %s", value)
-	}
+	return r.callbacks.HardwareCallback(value)
 }
 
 
