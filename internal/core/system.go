@@ -66,6 +66,7 @@ type VehicleSystem struct {
 	deferredDashboardPower  *bool               // Deferred dashboard power state (nil = no change needed)
 	brakeHibernationEnabled bool // Track if brake lever hibernation is enabled (default: true)
 	autoStandbySeconds      int  // Auto-standby timeout in seconds (0 = disabled)
+	hibernationForceTimer   *time.Timer         // Timer for forcing hibernation after 15s of brake hold
 	machine                 *librefsm.Machine   // librefsm state machine
 }
 

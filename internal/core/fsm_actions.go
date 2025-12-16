@@ -29,10 +29,12 @@ func stateIDToSystemState(id librefsm.StateID) types.SystemState {
 		return types.StateShuttingDown
 	case fsm.StateUpdating:
 		return types.StateUpdating
-	case fsm.StateHibernation, fsm.StateHibernationInitialHold:
+	case fsm.StateHibernationInitialHold:
+		return types.StateParked // Keep parked state during silent 15s wait
+	case fsm.StateHibernation:
 		return types.StateWaitingHibernation
 	case fsm.StateHibernationAwaitingConfirm:
-		return types.StateWaitingHibernationAdvanced
+		return types.StateWaitingHibernation
 	case fsm.StateHibernationSeatbox:
 		return types.StateWaitingHibernationSeatbox
 	case fsm.StateHibernationConfirm:
@@ -413,41 +415,60 @@ func (v *VehicleSystem) EnterHibernation(c *librefsm.Context) error {
 func (v *VehicleSystem) ExitHibernation(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: ExitHibernation (parent state)")
 	// Cancel any hibernation-related timers
+	v.mu.Lock()
+	if v.hibernationForceTimer != nil {
+		v.hibernationForceTimer.Stop()
+		v.hibernationForceTimer = nil
+	}
+	v.mu.Unlock()
 	return nil
 }
 
 func (v *VehicleSystem) EnterHibernationInitialHold(c *librefsm.Context) error {
 	v.logger.Infof("FSM: EnterHibernationInitialHold - both brakes held, starting 15s timer")
-	// The 15s timer is handled by librefsm WithTimeout
-	// Transition to waiting-hibernation state for Redis publish
-	if err := v.redis.PublishVehicleState(types.StateWaitingHibernation); err != nil {
-		v.logger.Warnf("Failed to publish hibernation state: %v", err)
-	}
 	return nil
 }
 
 func (v *VehicleSystem) EnterHibernationAwaitingConfirm(c *librefsm.Context) error {
 	v.logger.Infof("FSM: EnterHibernationAwaitingConfirm - initial hold complete, awaiting confirmation")
-	// Play notification sound/LED
-	if err := v.redis.PublishVehicleState(types.StateWaitingHibernationAdvanced); err != nil {
-		v.logger.Warnf("Failed to publish hibernation state: %v", err)
+
+	// Start 15s timer to force hibernation if brakes still held
+	v.mu.Lock()
+	if v.hibernationForceTimer != nil {
+		v.hibernationForceTimer.Stop()
 	}
+	v.hibernationForceTimer = time.AfterFunc(15*time.Second, func() {
+		// Check if brakes are still pressed
+		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+		if err != nil {
+			v.logger.Warnf("Failed to read brake_left for force hibernation: %v", err)
+			return
+		}
+		brakeRight, err := v.io.ReadDigitalInput("brake_right")
+		if err != nil {
+			v.logger.Warnf("Failed to read brake_right for force hibernation: %v", err)
+			return
+		}
+
+		if brakeLeft && brakeRight {
+			v.logger.Infof("FSM: Force hibernation - brakes held for 15s")
+			v.machine.Send(librefsm.Event{ID: fsm.EvHibernationForceTimeout})
+		} else {
+			v.logger.Debugf("FSM: Force hibernation cancelled - brakes released")
+		}
+	})
+	v.mu.Unlock()
+
 	return nil
 }
 
 func (v *VehicleSystem) EnterHibernationSeatbox(c *librefsm.Context) error {
 	v.logger.Infof("FSM: EnterHibernationSeatbox - please close seatbox")
-	if err := v.redis.PublishVehicleState(types.StateWaitingHibernationSeatbox); err != nil {
-		v.logger.Warnf("Failed to publish hibernation state: %v", err)
-	}
 	return nil
 }
 
 func (v *VehicleSystem) EnterHibernationConfirm(c *librefsm.Context) error {
 	v.logger.Infof("FSM: EnterHibernationConfirm - final 3s confirmation")
-	if err := v.redis.PublishVehicleState(types.StateWaitingHibernationConfirm); err != nil {
-		v.logger.Warnf("Failed to publish hibernation state: %v", err)
-	}
 	return nil
 }
 
