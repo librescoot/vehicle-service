@@ -4,13 +4,13 @@ import "github.com/librescoot/librefsm"
 
 // Vehicle states
 const (
-	StateInit                       librefsm.StateID = "init"
-	StateStandby                    librefsm.StateID = "stand-by"
-	StateParked                     librefsm.StateID = "parked"
-	StateReadyToDrive               librefsm.StateID = "ready-to-drive"
-	StateWaitingSeatbox             librefsm.StateID = "waiting-seatbox"
-	StateShuttingDown               librefsm.StateID = "shutting-down"
-	StateUpdating                   librefsm.StateID = "updating"
+	StateInit           librefsm.StateID = "init"
+	StateStandby        librefsm.StateID = "stand-by"
+	StateParked         librefsm.StateID = "parked"
+	StateReadyToDrive   librefsm.StateID = "ready-to-drive"
+	StateWaitingSeatbox librefsm.StateID = "waiting-seatbox"
+	StateShuttingDown   librefsm.StateID = "shutting-down"
+	StateUpdating       librefsm.StateID = "updating"
 
 	// Hibernation parent state and substates (hierarchical)
 	StateHibernation                librefsm.StateID = "hibernation"
@@ -34,16 +34,17 @@ const (
 	EvUpdateComplete    librefsm.EventID = "update-complete"
 
 	// Physical inputs
-	EvKickstandDown   librefsm.EventID = "kickstand-down"
-	EvKickstandUp     librefsm.EventID = "kickstand-up"
-	EvBrakesPressed   librefsm.EventID = "brakes-pressed"
-	EvBrakesReleased  librefsm.EventID = "brakes-released"
-	EvSeatboxButton   librefsm.EventID = "seatbox-button"
+	EvKickstandDown  librefsm.EventID = "kickstand-down"
+	EvKickstandUp    librefsm.EventID = "kickstand-up"
+	EvBrakesPressed  librefsm.EventID = "brakes-pressed"
+	EvBrakesReleased librefsm.EventID = "brakes-released"
+	EvSeatboxButton  librefsm.EventID = "seatbox-button"
 
 	// Timer events
 	EvInitTimeout               librefsm.EventID = "init-timeout"
 	EvShutdownTimeout           librefsm.EventID = "shutdown-timeout"
 	EvAutoStandbyTimeout        librefsm.EventID = "auto-standby-timeout"
+	EvWaitingSeatboxTimeout     librefsm.EventID = "waiting-seatbox-timeout"
 	EvHibernationInitialTimeout librefsm.EventID = "hibernation-initial-timeout"
 	EvHibernationConfirmTimeout librefsm.EventID = "hibernation-confirm-timeout"
 	EvHibernationForceTimeout   librefsm.EventID = "hibernation-force-timeout"

@@ -252,7 +252,6 @@ func (r *RedisClient) handleHardwareCommand(value string) error {
 	return r.callbacks.HardwareCallback(value)
 }
 
-
 func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 	defer r.wg.Done()
 	defer pubsub.Close()
@@ -378,7 +377,7 @@ func (r *RedisClient) processVehicleMessage(payload string) {
 	case "scooter:update":
 		handler = r.handleUpdateCommand
 	case "seatbox:lock", "brake:left", "brake:right", "blinker:switch", "blinker:state",
-	     "kickstand", "handlebar:lock-sensor", "state", "update:status", "fault":
+		"kickstand", "handlebar:lock-sensor", "state", "update:status", "fault":
 		// These are state updates published by vehicle-service itself, ignore silently
 		return
 	default:

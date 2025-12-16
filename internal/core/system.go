@@ -38,36 +38,34 @@ const (
 	handlebarLockWindow   = 10 * time.Second
 	seatboxLockDuration   = 200 * time.Millisecond
 	parkDebounceTime      = 1 * time.Second
-
 )
 
-
 type VehicleSystem struct {
-	state                  types.SystemState
-	dashboardReady         bool
-	logger                 *logger.Logger
-	io                     *hardware.LinuxHardwareIO
-	redis                  *messaging.RedisClient
-	mu                     sync.RWMutex
-	redisHost              string
-	redisPort              int
-	blinkerState           BlinkerState
-	blinkerStopChan        chan struct{}
-	initialized            bool
-	handlebarUnlocked      bool        // Track if handlebar has been unlocked in this power cycle
-	handlebarTimer         *time.Timer // Timer for handlebar position window
-	readyToDriveEntryTime  time.Time   // Track when we entered ready-to-drive state for park debounce
-	keycardTapCount        int
-	lastKeycardTapTime     time.Time
-	forceStandbyNoLock     bool
-	hibernationRequest      bool                // Track if hibernation was requested during shutdown
-	shutdownFromParked      bool                // Track if shutdown was initiated from parked state
-	dbcUpdating             bool                // Track if DBC update is in progress
-	deferredDashboardPower  *bool               // Deferred dashboard power state (nil = no change needed)
-	brakeHibernationEnabled bool // Track if brake lever hibernation is enabled (default: true)
-	autoStandbySeconds      int  // Auto-standby timeout in seconds (0 = disabled)
-	hibernationForceTimer   *time.Timer         // Timer for forcing hibernation after 15s of brake hold
-	machine                 *librefsm.Machine   // librefsm state machine
+	state                   types.SystemState
+	dashboardReady          bool
+	logger                  *logger.Logger
+	io                      *hardware.LinuxHardwareIO
+	redis                   *messaging.RedisClient
+	mu                      sync.RWMutex
+	redisHost               string
+	redisPort               int
+	blinkerState            BlinkerState
+	blinkerStopChan         chan struct{}
+	initialized             bool
+	handlebarUnlocked       bool        // Track if handlebar has been unlocked in this power cycle
+	handlebarTimer          *time.Timer // Timer for handlebar position window
+	readyToDriveEntryTime   time.Time   // Track when we entered ready-to-drive state for park debounce
+	keycardTapCount         int
+	lastKeycardTapTime      time.Time
+	forceStandbyNoLock      bool
+	hibernationRequest      bool              // Track if hibernation was requested during shutdown
+	shutdownFromParked      bool              // Track if shutdown was initiated from parked state
+	dbcUpdating             bool              // Track if DBC update is in progress
+	deferredDashboardPower  *bool             // Deferred dashboard power state (nil = no change needed)
+	brakeHibernationEnabled bool              // Track if brake lever hibernation is enabled (default: true)
+	autoStandbySeconds      int               // Auto-standby timeout in seconds (0 = disabled)
+	hibernationForceTimer   *time.Timer       // Timer for forcing hibernation after 15s of brake hold
+	machine                 *librefsm.Machine // librefsm state machine
 }
 
 func NewVehicleSystem(redisHost string, redisPort int, l *logger.Logger) *VehicleSystem {
@@ -1015,4 +1013,3 @@ func (v *VehicleSystem) Shutdown() {
 		v.io.Cleanup()
 	}
 }
-

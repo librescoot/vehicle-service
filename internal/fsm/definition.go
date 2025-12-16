@@ -10,6 +10,7 @@ import (
 const (
 	InitTimeout               = 2 * time.Second
 	ShutdownTimeout           = 4 * time.Second
+	WaitingSeatboxTimeout     = 30 * time.Second
 	HibernationInitialTimeout = 15 * time.Second
 	HibernationConfirmTimeout = 30 * time.Second
 	HibernationForceTimeout   = 30 * time.Second
@@ -35,7 +36,10 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		State(StateReadyToDrive,
 			librefsm.WithOnEnter(actions.EnterReadyToDrive),
 		).
-		State(StateWaitingSeatbox).
+		State(StateWaitingSeatbox,
+			librefsm.WithTimeout(WaitingSeatboxTimeout, EvWaitingSeatboxTimeout),
+			librefsm.WithOnEnter(actions.EnterWaitingSeatbox),
+		).
 		State(StateUpdating).
 		State(StateShuttingDown,
 			librefsm.WithTimeout(ShutdownTimeout, EvShutdownTimeout, actions.OnShutdownTimeout),
@@ -88,7 +92,10 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateParked, EvDashboardReady, StateReadyToDrive,
 			librefsm.WithGuard(actions.IsKickstandUp),
 		).
-		Transition(StateParked, EvLock, StateShuttingDown).
+		Transition(StateParked, EvLock, StateShuttingDown,
+			librefsm.WithGuard(actions.IsSeatboxClosed),
+		).
+		Transition(StateParked, EvLock, StateWaitingSeatbox). // Fallback if seatbox open
 		Transition(StateParked, EvLockHibernate, StateShuttingDown,
 			librefsm.WithAction(actions.OnLockHibernate),
 		).
@@ -96,7 +103,10 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 			librefsm.WithAction(actions.OnForceLock),
 		).
 		Transition(StateParked, EvKeycardAuth, StateShuttingDown, // Keycard tap locks from parked
-			librefsm.WithGuard(actions.IsKickstandDown),
+			librefsm.WithGuards(actions.IsKickstandDown, actions.IsSeatboxClosed),
+		).
+		Transition(StateParked, EvKeycardAuth, StateWaitingSeatbox,
+			librefsm.WithGuard(actions.IsKickstandDown), // Seatbox open, kickstand down
 		).
 		Transition(StateParked, EvAutoStandbyTimeout, StateShuttingDown).
 		// Manual ready-to-drive: seatbox button with kickstand up and both brakes pressed
@@ -111,7 +121,10 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// From ReadyToDrive
 		Transition(StateReadyToDrive, EvKickstandDown, StateParked).
 		Transition(StateReadyToDrive, EvDashboardNotReady, StateParked). // Safety: dashboard disconnect
-		Transition(StateReadyToDrive, EvLock, StateShuttingDown).
+		Transition(StateReadyToDrive, EvLock, StateShuttingDown,
+			librefsm.WithGuard(actions.IsSeatboxClosed),
+		).
+		Transition(StateReadyToDrive, EvLock, StateWaitingSeatbox). // Fallback if seatbox open
 		Transition(StateReadyToDrive, EvForceLock, StateStandby,
 			librefsm.WithAction(actions.OnForceLock),
 		).
@@ -122,6 +135,16 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// From ShuttingDown
 		Transition(StateShuttingDown, EvShutdownTimeout, StateStandby).
 		Transition(StateShuttingDown, EvUnlock, StateParked).
+
+		// From WaitingSeatbox - timeout or seatbox closed proceeds with lock
+		Transition(StateWaitingSeatbox, EvWaitingSeatboxTimeout, StateShuttingDown).
+		Transition(StateWaitingSeatbox, EvSeatboxClosed, StateShuttingDown).
+		Transition(StateWaitingSeatbox, EvKeycardAuth, StateShuttingDown). // Second tap forces lock
+		Transition(StateWaitingSeatbox, EvLock, StateShuttingDown).        // Explicit lock command forces lock
+		Transition(StateWaitingSeatbox, EvUnlock, StateParked).            // Unlock cancels
+		Transition(StateWaitingSeatbox, EvForceLock, StateStandby,
+			librefsm.WithAction(actions.OnForceLock),
+		).
 
 		// Hibernation flow - all events are physical inputs
 		// Initial hold -> either advance (timeout) or cancel (brakes released)

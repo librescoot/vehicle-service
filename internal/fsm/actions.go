@@ -11,6 +11,7 @@ type Actions interface {
 	EnterParked(c *librefsm.Context) error
 	EnterStandby(c *librefsm.Context) error
 	EnterShuttingDown(c *librefsm.Context) error
+	EnterWaitingSeatbox(c *librefsm.Context) error
 
 	// State exit actions
 	ExitParked(c *librefsm.Context) error

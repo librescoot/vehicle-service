@@ -389,6 +389,11 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 	return nil
 }
 
+func (v *VehicleSystem) EnterWaitingSeatbox(c *librefsm.Context) error {
+	v.logger.Infof("FSM: EnterWaitingSeatbox - please close seatbox to lock (30s timeout)")
+	return nil
+}
+
 // === State Exit Actions ===
 
 func (v *VehicleSystem) ExitParked(c *librefsm.Context) error {
