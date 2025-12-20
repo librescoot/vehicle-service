@@ -249,16 +249,8 @@ func (r *RedisClient) handleHardwareCommand(value string) error {
 
 	r.logger.Infof("Processing hardware command: %s", value)
 
-	// Validate command format (component:action)
-	switch value {
-	case "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock":
-		return r.callbacks.HardwareCallback(value)
-	default:
-		r.logger.Infof("Invalid hardware command value: %s", value)
-		return fmt.Errorf("invalid hardware command: %s", value)
-	}
+	return r.callbacks.HardwareCallback(value)
 }
-
 
 func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
 	defer r.wg.Done()
@@ -385,7 +377,7 @@ func (r *RedisClient) processVehicleMessage(payload string) {
 	case "scooter:update":
 		handler = r.handleUpdateCommand
 	case "seatbox:lock", "brake:left", "brake:right", "blinker:switch", "blinker:state",
-	     "kickstand", "handlebar:lock-sensor", "state", "update:status", "fault":
+		"kickstand", "handlebar:lock-sensor", "state", "update:status", "fault":
 		// These are state updates published by vehicle-service itself, ignore silently
 		return
 	default:
@@ -718,6 +710,7 @@ func (r *RedisClient) PublishButtonEvent(event string) error {
 }
 
 // PublishAutoStandbyCountdown publishes the auto-standby countdown to Redis
+// Deprecated: Use PublishAutoStandbyDeadline instead
 func (r *RedisClient) PublishAutoStandbyCountdown(remaining int) error {
 	if err := r.publishHashSet("vehicle", "auto-standby-remaining", remaining, "vehicle", "auto-standby-remaining"); err != nil {
 		return err
@@ -726,8 +719,26 @@ func (r *RedisClient) PublishAutoStandbyCountdown(remaining int) error {
 }
 
 // ClearAutoStandbyCountdown removes the auto-standby countdown from Redis
+// Deprecated: Use ClearAutoStandbyDeadline instead
 func (r *RedisClient) ClearAutoStandbyCountdown() error {
 	if err := r.publishHashDel("vehicle", "auto-standby-remaining", "vehicle", "auto-standby-remaining"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// PublishAutoStandbyDeadline publishes when auto-standby will trigger as Unix timestamp
+func (r *RedisClient) PublishAutoStandbyDeadline(deadline time.Time) error {
+	unixTs := deadline.Unix()
+	if err := r.publishHashSet("vehicle", "auto-standby-deadline", unixTs, "vehicle", "auto-standby-deadline"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ClearAutoStandbyDeadline removes the auto-standby deadline from Redis
+func (r *RedisClient) ClearAutoStandbyDeadline() error {
+	if err := r.publishHashDel("vehicle", "auto-standby-deadline", "vehicle", "auto-standby-deadline"); err != nil {
 		return err
 	}
 	return nil

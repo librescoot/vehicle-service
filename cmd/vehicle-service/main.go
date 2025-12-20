@@ -11,6 +11,8 @@ import (
 	"vehicle-service/internal/logger"
 )
 
+var version = "dev"
+
 func main() {
 	// Service log level
 	var serviceLogLevel int
@@ -31,7 +33,7 @@ func main() {
 	// Create leveled logger
 	l := logger.NewLogger(stdLogger, logger.LogLevel(serviceLogLevel))
 
-	l.Infof("Starting vehicle service...")
+	l.Infof("librescoot-vehicle %s starting", version)
 
 	system := core.NewVehicleSystem("127.0.0.1", 6379, l)
 	if err := system.Start(); err != nil {

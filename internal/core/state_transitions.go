@@ -4,262 +4,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/librescoot/librefsm"
+
 	"vehicle-service/internal/types"
 )
-
-// transitionTo handles state transitions and their side effects
-func (v *VehicleSystem) transitionTo(newState types.SystemState) error {
-	v.mu.Lock()
-	if newState == v.state {
-		v.logger.Debugf("State transition skipped - already in state %s", newState)
-		v.mu.Unlock()
-		return nil
-	}
-
-	oldState := v.state
-	v.state = newState
-
-	v.mu.Unlock()
-
-	// Request CPU governor change when leaving standby
-	if oldState == types.StateStandby && newState != types.StateStandby {
-		v.logger.Debugf("Leaving Standby: Requesting CPU governor change to ondemand")
-		if err := v.redis.SendCommand("scooter:governor", "ondemand"); err != nil {
-			v.logger.Warnf("Warning: Failed to request CPU governor change to ondemand: %v", err)
-		}
-	}
-
-	v.logger.Infof("State transition: %s -> %s", oldState, newState)
-
-	if err := v.publishState(); err != nil {
-		v.logger.Errorf("Failed to publish state: %v", err)
-		return fmt.Errorf("failed to publish state: %w", err)
-	}
-
-	// Cancel auto-standby timer when leaving parked state
-	if oldState == types.StateParked && newState != types.StateParked {
-		v.cancelAutoStandbyTimer()
-	}
-
-	v.logger.Debugf("Applying state transition effects for %s", newState)
-	switch newState {
-
-	case types.StateReadyToDrive:
-		// Record entry time for park debounce protection
-		v.mu.Lock()
-		v.readyToDriveEntryTime = time.Now()
-		v.mu.Unlock()
-
-		if err := v.unlockHandlebarIfNeeded(); err != nil {
-			return err
-		}
-
-		if err := v.setPower("engine_power", true); err != nil {
-			v.logger.Errorf("%v", err)
-			return err
-		}
-
-		if err := v.setPower("dashboard_power", true); err != nil {
-			v.logger.Errorf("%v", err)
-			return err
-		}
-
-		// Check current brake state and set engine brake pin accordingly
-		brakeLeft, brakeRight, err := v.readBrakeStates()
-		if err != nil {
-			v.logger.Errorf("%v during transition", err)
-			return err
-		}
-		if err := v.io.WriteDigitalOutput("engine_brake", brakeLeft || brakeRight); err != nil {
-			v.logger.Errorf("Failed to set engine brake during transition: %v", err)
-			return err
-		}
-		v.logger.Debugf("Engine brake set to %v during transition (left: %v, right: %v)", brakeLeft || brakeRight, brakeLeft, brakeRight)
-
-		// Always play parked-to-drive cue when entering ready-to-drive
-		v.playLedCue(3, "parked to drive")
-
-		// When coming from standby, synchronize brake states since brake inputs were ignored
-		if oldState == types.StateStandby {
-			brakeLeft, brakeRight, err := v.readBrakeStates()
-			if err != nil {
-				v.logger.Errorf("%v after Standby->Ready transition", err)
-			}
-
-			if err := v.redis.SetBrakeState("left", brakeLeft); err != nil {
-				v.logger.Warnf("Warning: failed to publish brake_left state after Standby->Ready transition: %v", err)
-			}
-			if err := v.redis.SetBrakeState("right", brakeRight); err != nil {
-				v.logger.Warnf("Warning: failed to publish brake_right state after Standby->Ready transition: %v", err)
-			}
-
-			// Play brake cue if either brake is pressed
-			if brakeLeft || brakeRight {
-				v.playLedCue(4, "brake off to on")
-			}
-		}
-
-	case types.StateParked:
-		if err := v.unlockHandlebarIfNeeded(); err != nil {
-			return err
-		}
-
-		// Always turn on dashboard power when entering parked state
-		if err := v.setPower("dashboard_power", true); err != nil {
-			v.logger.Errorf("%v", err)
-			return err
-		}
-
-		// Engage engine brake BEFORE powering ECU to prevent movement
-		if err := v.io.WriteDigitalOutput("engine_brake", true); err != nil {
-			v.logger.Errorf("Failed to engage engine brake: %v", err)
-			return err
-		}
-
-		// Keep ECU powered in parked state
-		if err := v.setPower("engine_power", true); err != nil {
-			v.logger.Errorf("%v", err)
-			return err
-		}
-
-		if oldState == types.StateReadyToDrive {
-			v.playLedCue(6, "drive to parked")
-		}
-
-		if oldState == types.StateStandby {
-			brakeLeft, brakeRight, err := v.readBrakeStates()
-			if err != nil {
-				v.logger.Errorf("%v", err)
-				return err
-			}
-			brakesPressed := brakeLeft || brakeRight
-
-			if brakesPressed {
-				v.playLedCue(2, "standby to parked brake on")
-			} else {
-				v.playLedCue(1, "standby to parked brake off")
-			}
-		}
-
-	// Start auto-standby timer when entering parked state
-	v.startAutoStandbyTimer()
-
-	case types.StateStandby:
-		v.mu.Lock()
-		forcedStandby := v.forceStandbyNoLock
-		shutdownFromParked := v.shutdownFromParked
-		if forcedStandby {
-			v.forceStandbyNoLock = false // Reset the flag
-		}
-		if shutdownFromParked {
-			v.shutdownFromParked = false // Reset the flag
-		}
-		v.mu.Unlock()
-
-		// Track standby entry time for MDB reboot timer (3-minute requirement)
-		v.logger.Debugf("Setting standby timer start for MDB reboot coordination")
-		if err := v.redis.PublishStandbyTimerStart(); err != nil {
-			v.logger.Warnf("Warning: Failed to set standby timer start: %v", err)
-			// Not critical for state transition
-		}
-
-		isFromParked := (oldState == types.StateParked)
-
-		if forcedStandby {
-			v.logger.Debugf("Forced standby: skipping handlebar lock.")
-		} else if isFromParked {
-			v.logger.Infof("Locking handlebar (direct transition from parked)")
-			v.lockHandlebar()
-
-			// Play shutdown LED cue (only for direct parked→standby without shutting-down)
-			brakeLeft, brakeRight, err := v.readBrakeStates()
-			if err != nil {
-				v.logger.Infof("%v for standby cue", err)
-			}
-			brakesPressed := brakeLeft || brakeRight
-
-			if brakesPressed {
-				v.playLedCue(8, "parked brake on to standby")
-			} else {
-				v.playLedCue(7, "parked brake off to standby")
-			}
-		}
-
-		// Turn off dashboard power when entering standby, unless DBC update is in progress
-		v.mu.Lock()
-		if v.dbcUpdating {
-			v.logger.Debugf("DBC update in progress, deferring dashboard power OFF until update completes")
-			powerOff := false
-			v.deferredDashboardPower = &powerOff
-			v.mu.Unlock()
-		} else {
-			v.mu.Unlock()
-			if err := v.setPower("dashboard_power", false); err != nil {
-				v.logger.Errorf("%v", err)
-			}
-		}
-
-		// Final "all off" cue for standby.
-		v.playLedCue(0, "all off")
-
-	case types.StateShuttingDown:
-		v.logger.Infof("Entering shutting down state from %s", oldState)
-
-		// Track if we're coming from parked state
-		if oldState == types.StateParked {
-			v.mu.Lock()
-			v.shutdownFromParked = true
-			v.mu.Unlock()
-			v.logger.Debugf("Shutdown initiated from parked state")
-		}
-
-		// Stop any existing shutdown timer
-		if v.shutdownTimer != nil {
-			v.shutdownTimer.Stop()
-			v.shutdownTimer = nil
-		}
-
-		// Turn off all outputs
-		if err := v.setPower("engine_power", false); err != nil {
-			v.logger.Errorf("%v during shutdown", err)
-		}
-
-		// Play shutdown LED cue based on brake state
-		brakeLeft, brakeRight, err := v.readBrakeStates()
-		if err != nil {
-			v.logger.Infof("%v for shutdown cue", err)
-		}
-		brakesPressed := brakeLeft || brakeRight
-
-		if brakesPressed {
-			v.playLedCue(8, "parked brake on to standby")
-		} else {
-			v.playLedCue(7, "parked brake off to standby")
-		}
-
-		// Start handlebar locking immediately to give user more time to position handlebar
-		if oldState == types.StateParked {
-			v.logger.Debugf("Starting handlebar locking during shutdown (from parked state)")
-			v.lockHandlebar()
-		}
-
-		// Keep dashboard power on briefly to allow for proper shutdown messaging
-		// The timer will handle transitioning to standby and turning off dashboard power
-
-		v.shutdownTimer = time.AfterFunc(shutdownTimerDuration, v.triggerShutdownTimeout)
-		v.logger.Infof("Started shutdown timer (4.0s)")
-
-	}
-
-	// Update engine brake based on new state
-	if err := v.updateEngineBrake(); err != nil {
-		v.logger.Errorf("Failed to update engine brake after state transition: %v", err)
-		return err
-	}
-
-	v.logger.Debugf("State transition completed successfully")
-	return nil
-}
 
 // unlockHandlebarIfNeeded checks if the handlebar needs unlocking and unlocks it
 // Also cancels any ongoing handlebar locking attempt
@@ -437,4 +185,22 @@ func (v *VehicleSystem) updateEngineBrake() error {
 	}
 
 	return nil
+}
+
+// getCurrentState returns the current state (thread-safe) using FSM
+func (v *VehicleSystem) getCurrentState() types.SystemState {
+	if v.machine != nil {
+		return stateIDToSystemState(v.machine.CurrentState())
+	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.state
+}
+
+// getCurrentStateID returns the current FSM state ID
+func (v *VehicleSystem) getCurrentStateID() librefsm.StateID {
+	if v.machine != nil {
+		return v.machine.CurrentState()
+	}
+	return systemStateToStateID(v.state)
 }
