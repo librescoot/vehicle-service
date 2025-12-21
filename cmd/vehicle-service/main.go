@@ -9,7 +9,9 @@ import (
 	"syscall"
 
 	"vehicle-service/internal/core"
+	"vehicle-service/internal/hardware"
 	"vehicle-service/internal/logger"
+	"vehicle-service/internal/messaging"
 )
 
 var version = "dev"
@@ -42,7 +44,17 @@ func main() {
 
 	l.Infof("librescoot-vehicle %s starting", version)
 
-	system := core.NewVehicleSystem("127.0.0.1", 6379, l)
+	// Create hardware IO
+	io := hardware.NewLinuxHardwareIO(l.WithTag("Hardware"))
+
+	// Create Redis client (callbacks will be set by VehicleSystem.Start())
+	redisClient, err := messaging.NewRedisClient("127.0.0.1", 6379, l.WithTag("Redis"), messaging.Callbacks{})
+	if err != nil {
+		l.Fatalf("Failed to create Redis client: %v", err)
+	}
+
+	// Create vehicle system with dependencies
+	system := core.NewVehicleSystem(io, redisClient, l)
 	if err := system.Start(); err != nil {
 		l.Fatalf("Failed to start system: %v", err)
 	}

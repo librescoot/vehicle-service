@@ -90,6 +90,10 @@ func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks
 	return r, nil
 }
 
+func (r *RedisClient) SetCallbacks(callbacks Callbacks) {
+	r.callbacks = callbacks
+}
+
 func (r *RedisClient) Connect() error {
 	r.logger.Infof("Attempting to connect to Redis")
 
