@@ -9,7 +9,7 @@ import (
 	"vehicle-service/internal/logger"
 	"vehicle-service/internal/types"
 
-	"github.com/redis/go-redis/v9"
+	ipc "github.com/librescoot/redis-ipc"
 )
 
 type Callbacks struct {
@@ -28,41 +28,76 @@ type Callbacks struct {
 }
 
 type RedisClient struct {
-	client    *redis.Client
+	client    *ipc.Client
 	callbacks Callbacks
 	logger    *logger.Logger
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
+
+	// Publishers
+	vehiclePub   *ipc.HashPublisher
+	systemPub    *ipc.HashPublisher
+	otaPub       *ipc.HashPublisher
+	dashboardPub *ipc.HashPublisher
+	buttonsPub   *ipc.HashPublisher
+
+	// Watchers
+	vehicleWatcher   *ipc.HashWatcher
+	dashboardWatcher *ipc.HashWatcher
+	keycardWatcher   *ipc.HashWatcher
+	settingsWatcher  *ipc.HashWatcher
+
+	// Fault handling
+	faultSet    *ipc.FaultSet
+	faultStream *ipc.StreamPublisher
 }
 
-func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks) *RedisClient {
+func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks) (*RedisClient, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &RedisClient{
-		client: redis.NewClient(&redis.Options{
-			Addr: fmt.Sprintf("%s:%d", host, port),
-			DB:   0,
-		}),
+
+	client, err := ipc.New(
+		ipc.WithAddress(host),
+		ipc.WithPort(port),
+		ipc.WithCodec(ipc.StringCodec{}),
+		ipc.WithOnConnect(func() { l.Infof("Redis connected") }),
+		ipc.WithOnDisconnect(func(err error) { l.Warnf("Redis disconnected: %v", err) }),
+	)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to create Redis client: %w", err)
+	}
+
+	r := &RedisClient{
+		client:    client,
 		callbacks: callbacks,
 		logger:    l,
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+
+	// Initialize publishers
+	r.vehiclePub = client.NewHashPublisher("vehicle")
+	r.systemPub = client.NewHashPublisher("system")
+	r.otaPub = client.NewHashPublisher("ota")
+	r.dashboardPub = client.NewHashPublisher("dashboard")
+	r.buttonsPub = client.NewHashPublisher("buttons")
+
+	// Initialize fault handling
+	r.faultSet = client.NewFaultSet("vehicle:fault", "vehicle", "fault")
+	r.faultStream = client.NewStreamPublisher("events:faults", ipc.WithMaxLen(1000))
+
+	return r, nil
 }
 
 func (r *RedisClient) Connect() error {
-	r.logger.Infof("Attempting to connect to Redis at %s", r.client.Options().Addr)
+	r.logger.Infof("Attempting to connect to Redis")
 
-	if err := r.client.Ping(r.ctx).Err(); err != nil {
-		r.logger.Infof("Redis connection failed: %v", err)
-		return fmt.Errorf("Redis connection failed: %w", err)
-	}
-	r.logger.Infof("Successfully connected to Redis")
-
-	ready, err := r.client.HGet(r.ctx, "dashboard", "ready").Result()
-	if err != nil && err != redis.Nil {
+	// Check initial dashboard state
+	ready, err := r.client.HGet("dashboard", "ready")
+	if err != nil {
 		r.logger.Infof("Failed to get initial dashboard state: %v", err)
-	} else {
+	} else if ready != "" {
 		r.logger.Infof("Initial dashboard ready state: %v", ready == "true")
 		if ready == "true" {
 			if err := r.callbacks.DashboardCallback(true); err != nil {
@@ -78,68 +113,43 @@ func (r *RedisClient) Connect() error {
 func (r *RedisClient) StartListening() error {
 	r.logger.Infof("Starting Redis listeners")
 
-	// Subscribe to pub/sub channels for system events
-	pubsub := r.client.Subscribe(r.ctx, "dashboard", "keycard", "ota", "power-manager", "vehicle", "settings")
-	r.logger.Infof("Subscribed to Redis channels: dashboard, keycard, ota, power-manager, vehicle, settings")
+	// Initialize hash watchers
+	r.dashboardWatcher = r.client.NewHashWatcher("dashboard")
+	r.dashboardWatcher.OnField("ready", func(value string) error {
+		r.logger.Infof("Processing dashboard ready state: %v", value == "true")
+		return r.callbacks.DashboardCallback(value == "true")
+	})
+	r.dashboardWatcher.Start()
 
-	// Start pub/sub listener
-	r.wg.Add(1)
-	go r.redisListener(pubsub)
+	r.keycardWatcher = r.client.NewHashWatcher("keycard")
+	r.keycardWatcher.OnField("authentication", func(value string) error {
+		r.logger.Infof("Processing keycard authentication")
+		return r.callbacks.KeycardCallback()
+	})
+	r.keycardWatcher.Start()
 
-	// Start list command listeners for LPUSH commands
-	r.wg.Add(8)
-	go r.listCommandListener("scooter:seatbox", r.handleSeatboxCommand)
-	go r.listCommandListener("scooter:horn", r.handleHornCommand)
-	go r.listCommandListener("scooter:blinker", r.handleBlinkerCommand)
-	go r.listCommandListener("scooter:state", r.handleStateCommand)
-	go r.listCommandListener("scooter:led:cue", r.handleLedCueCommand)
-	go r.listCommandListener("scooter:led:fade", r.handleLedFadeCommand)
-	go r.listCommandListener("scooter:update", r.handleUpdateCommand)
-	go r.listCommandListener("scooter:hardware", r.handleHardwareCommand)
-
-	return nil
-}
-
-func (r *RedisClient) listCommandListener(key string, handler func(string) error) {
-	defer r.wg.Done()
-	r.logger.Infof("Starting list command listener for %s", key)
-
-	for {
-		select {
-		case <-r.ctx.Done():
-			r.logger.Infof("Context cancelled, exiting %s listener", key)
-			return
-		default:
-			// Use BRPOP with a short timeout to allow periodic context cancellation checks
-			result, err := r.client.BRPop(r.ctx, 5*time.Second, key).Result()
-			if err != nil {
-				if err == redis.Nil {
-					// Timeout elapsed, loop back to check context
-					continue
-				}
-				if err == context.Canceled {
-					r.logger.Infof("Context cancelled, exiting %s listener", key)
-					return
-				}
-				r.logger.Infof("Error reading from %s list: %v", key, err)
-				continue
-			}
-
-			select {
-			case <-r.ctx.Done():
-				r.logger.Infof("Context cancelled, exiting %s listener", key)
-				return
-			default:
-				if len(result) >= 2 { // BRPOP returns [key, value]
-					value := result[1]
-					r.logger.Debugf("Received command from %s: %s", key, value)
-					if err := handler(value); err != nil {
-						r.logger.Warnf("Error handling %s command: %v", key, err)
-					}
-				}
-			}
+	r.settingsWatcher = r.client.NewHashWatcher("settings")
+	r.settingsWatcher.OnAny(func(field, value string) error {
+		if r.callbacks.SettingsCallback != nil {
+			r.logger.Infof("Processing settings update: %s", field)
+			return r.callbacks.SettingsCallback(field)
 		}
-	}
+		return nil
+	})
+	r.settingsWatcher.Start()
+
+	// Start queue command listeners
+	ipc.HandleRequests(r.client, "scooter:seatbox", r.handleSeatboxCommand)
+	ipc.HandleRequests(r.client, "scooter:horn", r.handleHornCommand)
+	ipc.HandleRequests(r.client, "scooter:blinker", r.handleBlinkerCommand)
+	ipc.HandleRequests(r.client, "scooter:state", r.handleStateCommand)
+	ipc.HandleRequests(r.client, "scooter:led:cue", r.handleLedCueCommand)
+	ipc.HandleRequests(r.client, "scooter:led:fade", r.handleLedFadeCommand)
+	ipc.HandleRequests(r.client, "scooter:update", r.handleUpdateCommand)
+	ipc.HandleRequests(r.client, "scooter:hardware", r.handleHardwareCommand)
+
+	r.logger.Infof("Successfully started all Redis listeners")
+	return nil
 }
 
 func (r *RedisClient) handleSeatboxCommand(value string) error {
@@ -252,198 +262,17 @@ func (r *RedisClient) handleHardwareCommand(value string) error {
 	return r.callbacks.HardwareCallback(value)
 }
 
-func (r *RedisClient) redisListener(pubsub *redis.PubSub) {
-	defer r.wg.Done()
-	defer pubsub.Close()
-
-	r.logger.Infof("Starting Redis message listener")
-	channel := pubsub.Channel()
-
-	for {
-		select {
-		case <-r.ctx.Done():
-			r.logger.Infof("Context cancelled, exiting listener")
-			return
-		case msg, ok := <-channel:
-			if !ok {
-				r.logger.Infof("Redis channel closed unexpectedly")
-				r.logger.Fatalf("Redis connection lost, exiting to allow systemd restart")
-			}
-			if msg == nil {
-				r.logger.Infof("Received nil Redis message")
-				r.logger.Fatalf("Redis connection lost, exiting to allow systemd restart")
-			}
-
-			r.logger.Debugf("Received Redis message: channel=%s payload=%s", msg.Channel, msg.Payload)
-
-			switch msg.Channel {
-			case "dashboard":
-				if msg.Payload == "ready" {
-					ready, err := r.client.HGet(r.ctx, "dashboard", "ready").Result()
-					if err != nil {
-						r.logger.Infof("Failed to get dashboard state: %v", err)
-					} else {
-						r.logger.Infof("Processing dashboard ready state: %v", ready == "true")
-						if err := r.callbacks.DashboardCallback(ready == "true"); err != nil {
-							r.logger.Infof("Failed to handle dashboard state: %v", err)
-						}
-					}
-				}
-
-			case "settings":
-				if r.callbacks.SettingsCallback != nil {
-					r.logger.Infof("Processing settings update: %s", msg.Payload)
-					if err := r.callbacks.SettingsCallback(msg.Payload); err != nil {
-						r.logger.Infof("Failed to handle settings update: %v", err)
-					}
-				}
-
-			case "keycard":
-				if msg.Payload == "authentication" {
-					r.logger.Infof("Processing keycard authentication")
-					err := r.callbacks.KeycardCallback()
-					r.logger.Infof("Keycard authentication callback completed with error: %v", err)
-				}
-
-			case "scooter:seatbox":
-				if r.callbacks.SeatboxCallback != nil {
-					switch msg.Payload {
-					case "on", "off":
-						if err := r.callbacks.SeatboxCallback(msg.Payload == "on"); err != nil {
-							r.logger.Infof("Failed to handle seatbox request: %v", err)
-						}
-					default:
-						r.logger.Infof("Invalid seatbox request value: %s", msg.Payload)
-					}
-				}
-
-			case "scooter:horn":
-				if r.callbacks.HornCallback != nil {
-					switch msg.Payload {
-					case "on", "off":
-						if err := r.callbacks.HornCallback(msg.Payload == "on"); err != nil {
-							r.logger.Infof("Failed to handle horn request: %v", err)
-						}
-					default:
-						r.logger.Infof("Invalid horn request value: %s", msg.Payload)
-					}
-				}
-
-			case "scooter:blinker":
-				if r.callbacks.BlinkerCallback != nil {
-					switch msg.Payload {
-					case "off", "left", "right", "both":
-						if err := r.callbacks.BlinkerCallback(msg.Payload); err != nil {
-							r.logger.Infof("Failed to handle blinker request: %v", err)
-						}
-					default:
-						r.logger.Infof("Invalid blinker request value: %s", msg.Payload)
-					}
-				}
-
-			case "scooter:update":
-				if r.callbacks.UpdateCallback != nil {
-					switch msg.Payload {
-					case "start", "complete":
-						if err := r.callbacks.UpdateCallback(msg.Payload); err != nil {
-							r.logger.Infof("Failed to handle update request: %v", err)
-						}
-					default:
-						r.logger.Infof("Invalid update request value: %s", msg.Payload)
-					}
-				}
-
-			case "vehicle":
-				// msg.Payload contains the hash field that changed
-				r.processVehicleMessage(msg.Payload)
-			}
-		}
-	}
-}
-
-func (r *RedisClient) processVehicleMessage(payload string) {
-	// Handles hash-based scooter commands signalled via the "vehicle" channel.
-	// The payload is expected to be the hash field that was modified (e.g. "scooter:seatbox").
-
-	// Only react to the set of commands we currently support.
-	var handler func(string) error
-	switch payload {
-	case "scooter:seatbox":
-		handler = r.handleSeatboxCommand
-	case "scooter:horn":
-		handler = r.handleHornCommand
-	case "scooter:blinker":
-		handler = r.handleBlinkerCommand
-	case "scooter:update":
-		handler = r.handleUpdateCommand
-	case "seatbox:lock", "brake:left", "brake:right", "blinker:switch", "blinker:state",
-		"kickstand", "handlebar:lock-sensor", "state", "update:status", "fault":
-		// These are state updates published by vehicle-service itself, ignore silently
-		return
-	default:
-		// Log truly unknown payloads for debugging
-		r.logger.Infof("Unhandled vehicle payload: %s", payload)
-		return
-	}
-
-	// Fetch the current value for the field
-	value, err := r.client.HGet(r.ctx, "vehicle", payload).Result()
-	if err == redis.Nil {
-		// Field not set – nothing to do.
-		return
-	}
-	if err != nil {
-		r.logger.Infof("Error reading hash field %s: %v", payload, err)
-		return
-	}
-
-	if handler != nil {
-		if err := handler(value); err != nil {
-			r.logger.Infof("Error handling %s command: %v", payload, err)
-		}
-	}
-
-	// Clear the field to acknowledge processing, mirroring previous behaviour
-	if err := r.client.HDel(r.ctx, "vehicle", payload).Err(); err != nil {
-		r.logger.Infof("Error clearing hash field %s: %v", payload, err)
-	}
-}
-
-// publishHashSet is a helper that atomically updates a hash field and publishes a notification
-func (r *RedisClient) publishHashSet(hash, field string, value interface{}, channel, payload string) error {
-	pipe := r.client.Pipeline()
-	pipe.HSet(r.ctx, hash, field, value)
-	pipe.Publish(r.ctx, channel, payload)
-	_, err := pipe.Exec(r.ctx)
-	return err
-}
-
-// publishHashDel is a helper that atomically deletes a hash field and publishes a notification
-func (r *RedisClient) publishHashDel(hash, field, channel, payload string) error {
-	pipe := r.client.Pipeline()
-	pipe.HDel(r.ctx, hash, field)
-	pipe.Publish(r.ctx, channel, payload)
-	_, err := pipe.Exec(r.ctx)
-	return err
-}
 
 func (r *RedisClient) PublishVehicleState(state types.SystemState) error {
 	r.logger.Infof("Publishing vehicle state: %s", state)
 	stateStr := string(state)
-	timestamp := time.Now().Format(time.RFC3339)
 
-	// Atomically set both state and timestamp fields
-	pipe := r.client.Pipeline()
-	pipe.HSet(r.ctx, "vehicle", "state", stateStr)
-	pipe.HSet(r.ctx, "vehicle", "state:timestamp", timestamp)
-	pipe.Publish(r.ctx, "vehicle", "state")
-	_, err := pipe.Exec(r.ctx)
-
-	if err != nil {
+	// Set both state and timestamp fields using SetWithTimestamp
+	if err := r.vehiclePub.SetWithTimestamp("state", stateStr); err != nil {
 		r.logger.Warnf("Failed to publish vehicle state: %v", err)
 		return err
 	}
-	r.logger.Debugf("Successfully published vehicle state with timestamp: %s", timestamp)
+	r.logger.Debugf("Successfully published vehicle state with timestamp")
 	return nil
 }
 
@@ -464,7 +293,7 @@ func (r *RedisClient) SetBlinkerSwitch(state string) error {
 		blinkerStr = "unknown"
 	}
 
-	if err := r.publishHashSet("vehicle", "blinker:switch", blinkerStr, "vehicle", "blinker:switch"); err != nil {
+	if err := r.vehiclePub.Set("blinker:switch", blinkerStr); err != nil {
 		r.logger.Warnf("Failed to set blinker switch: %v", err)
 		return err
 	}
@@ -489,7 +318,7 @@ func (r *RedisClient) SetBlinkerState(state string) error {
 		blinkerStr = "unknown"
 	}
 
-	if err := r.publishHashSet("vehicle", "blinker:state", blinkerStr, "vehicle", "blinker:state"); err != nil {
+	if err := r.vehiclePub.Set("blinker:state", blinkerStr); err != nil {
 		r.logger.Warnf("Failed to set blinker state: %v", err)
 		return err
 	}
@@ -499,14 +328,14 @@ func (r *RedisClient) SetBlinkerState(state string) error {
 
 func (r *RedisClient) GetVehicleState() (types.SystemState, error) {
 	r.logger.Infof("Getting vehicle state from Redis")
-	stateStr, err := r.client.HGet(r.ctx, "vehicle", "state").Result()
-	if err == redis.Nil {
-		r.logger.Infof("No vehicle state found in Redis")
-		return types.StateInit, nil
-	}
+	stateStr, err := r.client.HGet("vehicle", "state")
 	if err != nil {
 		r.logger.Infof("Failed to get vehicle state: %v", err)
 		return types.StateInit, err
+	}
+	if stateStr == "" {
+		r.logger.Infof("No vehicle state found in Redis")
+		return types.StateInit, nil
 	}
 	r.logger.Infof("Successfully retrieved vehicle state: %s", stateStr)
 	return types.SystemState(stateStr), nil
@@ -520,7 +349,7 @@ func (r *RedisClient) SetBrakeState(side string, isPressed bool) error {
 	}
 
 	field := fmt.Sprintf("brake:%s", side)
-	if err := r.publishHashSet("vehicle", field, state, "vehicle", field); err != nil {
+	if err := r.vehiclePub.Set(field, state); err != nil {
 		r.logger.Warnf("Failed to set brake state: %v", err)
 		return err
 	}
@@ -535,8 +364,9 @@ func (r *RedisClient) SetHornButton(isPressed bool) error {
 		state = "on"
 	}
 
-	// Publish to buttons channel for immediate event handling
-	if err := r.publishHashSet("vehicle", "horn:button", state, "buttons", fmt.Sprintf("horn:%s", state)); err != nil {
+	// Note: Using vehiclePub here but it publishes to "buttons" channel for these button events
+	// We need a separate publisher for the buttons hash
+	if err := r.buttonsPub.Set(fmt.Sprintf("horn:%s", state), "1"); err != nil {
 		r.logger.Warnf("Failed to set horn button state: %v", err)
 		return err
 	}
@@ -551,8 +381,8 @@ func (r *RedisClient) SetSeatboxButton(isPressed bool) error {
 		state = "on"
 	}
 
-	// Publish to buttons channel for immediate event handling
-	if err := r.publishHashSet("vehicle", "seatbox:button", state, "buttons", fmt.Sprintf("seatbox:%s", state)); err != nil {
+	// Note: Using buttonsPub here for button event publishing
+	if err := r.buttonsPub.Set(fmt.Sprintf("seatbox:%s", state), "1"); err != nil {
 		r.logger.Warnf("Failed to set seatbox button state: %v", err)
 		return err
 	}
@@ -567,7 +397,7 @@ func (r *RedisClient) SetSeatboxLockState(isLocked bool) error {
 		state = "closed"
 	}
 
-	if err := r.publishHashSet("vehicle", "seatbox:lock", state, "vehicle", "seatbox:lock"); err != nil {
+	if err := r.vehiclePub.Set("seatbox:lock", state); err != nil {
 		r.logger.Warnf("Failed to set seatbox lock state: %v", err)
 		return err
 	}
@@ -577,7 +407,8 @@ func (r *RedisClient) SetSeatboxLockState(isLocked bool) error {
 
 func (r *RedisClient) PublishSeatboxOpened() error {
 	r.logger.Infof("Publishing seatbox opened event")
-	if err := r.client.Publish(r.ctx, "vehicle", "seatbox:opened").Err(); err != nil {
+	_, err := r.client.Publish("vehicle", "seatbox:opened")
+	if err != nil {
 		r.logger.Infof("Failed to publish seatbox opened: %v", err)
 		return err
 	}
@@ -591,7 +422,7 @@ func (r *RedisClient) SetKickstandState(isDown bool) error {
 		state = "down"
 	}
 
-	if err := r.publishHashSet("vehicle", "kickstand", state, "vehicle", "kickstand"); err != nil {
+	if err := r.vehiclePub.Set("kickstand", state); err != nil {
 		r.logger.Warnf("Failed to set kickstand state: %v", err)
 		return err
 	}
@@ -606,7 +437,7 @@ func (r *RedisClient) SetHandlebarPosition(isOnPlace bool) error {
 		state = "on-place"
 	}
 
-	_, err := r.client.HSet(r.ctx, "vehicle", "handlebar:position", state).Result()
+	err := r.client.HSet("vehicle", "handlebar:position", state)
 	if err != nil {
 		r.logger.Warnf("Failed to set handlebar position: %v", err)
 		return err
@@ -622,7 +453,7 @@ func (r *RedisClient) SetHandlebarLockState(isLocked bool) error {
 		state = "locked"
 	}
 
-	if err := r.publishHashSet("vehicle", "handlebar:lock-sensor", state, "vehicle", "handlebar:lock-sensor"); err != nil {
+	if err := r.vehiclePub.Set("handlebar:lock-sensor", state); err != nil {
 		r.logger.Warnf("Failed to set handlebar lock state: %v", err)
 		return err
 	}
@@ -638,7 +469,7 @@ func (r *RedisClient) SetDbcUpdating(updating bool) error {
 		value = "true"
 	}
 
-	if err := r.publishHashSet("vehicle", "dbc-updating", value, "vehicle", "dbc-updating"); err != nil {
+	if err := r.vehiclePub.Set("dbc-updating", value); err != nil {
 		r.logger.Warnf("Failed to set DBC updating state: %v", err)
 		return err
 	}
@@ -648,12 +479,12 @@ func (r *RedisClient) SetDbcUpdating(updating bool) error {
 
 // GetDbcUpdating gets the DBC updating state from Redis
 func (r *RedisClient) GetDbcUpdating() (bool, error) {
-	value, err := r.client.HGet(r.ctx, "vehicle", "dbc-updating").Result()
+	value, err := r.client.HGet("vehicle", "dbc-updating")
 	if err != nil {
-		if err == redis.Nil {
-			return false, nil // Field doesn't exist, default to false
-		}
 		return false, err
+	}
+	if value == "" {
+		return false, nil // Field doesn't exist, default to false
 	}
 	return value == "true", nil
 }
@@ -666,7 +497,7 @@ func (r *RedisClient) SetDashboardPower(enabled bool) error {
 		value = "on"
 	}
 
-	if err := r.publishHashSet("vehicle", "dashboard:power", value, "vehicle", "dashboard:power"); err != nil {
+	if err := r.vehiclePub.Set("dashboard:power", value); err != nil {
 		r.logger.Warnf("Failed to set dashboard power state: %v", err)
 		return err
 	}
@@ -676,12 +507,12 @@ func (r *RedisClient) SetDashboardPower(enabled bool) error {
 
 // GetDashboardPower gets the dashboard power state from Redis
 func (r *RedisClient) GetDashboardPower() (bool, error) {
-	value, err := r.client.HGet(r.ctx, "vehicle", "dashboard:power").Result()
+	value, err := r.client.HGet("vehicle", "dashboard:power")
 	if err != nil {
-		if err == redis.Nil {
-			return false, nil // Field doesn't exist, default to false/off
-		}
 		return false, err
+	}
+	if value == "" {
+		return false, nil // Field doesn't exist, default to false/off
 	}
 	return value == "on", nil
 }
@@ -690,7 +521,7 @@ func (r *RedisClient) GetDashboardPower() (bool, error) {
 func (r *RedisClient) PublishUpdateStatus(status string) error {
 	r.logger.Debugf("Publishing update status: %s", status)
 
-	if err := r.publishHashSet("vehicle", "update:status", status, "vehicle", "update:status"); err != nil {
+	if err := r.vehiclePub.Set("update:status", status); err != nil {
 		r.logger.Warnf("Failed to publish update status: %v", err)
 		return err
 	}
@@ -701,7 +532,8 @@ func (r *RedisClient) PublishUpdateStatus(status string) error {
 // PublishButtonEvent publishes a button event to the "buttons" channel
 func (r *RedisClient) PublishButtonEvent(event string) error {
 	r.logger.Debugf("Publishing button event: %s", event)
-	if err := r.client.Publish(r.ctx, "buttons", event).Err(); err != nil {
+	_, err := r.client.Publish("buttons", event)
+	if err != nil {
 		r.logger.Warnf("Failed to publish button event: %v", err)
 		return err
 	}
@@ -712,43 +544,31 @@ func (r *RedisClient) PublishButtonEvent(event string) error {
 // PublishAutoStandbyCountdown publishes the auto-standby countdown to Redis
 // Deprecated: Use PublishAutoStandbyDeadline instead
 func (r *RedisClient) PublishAutoStandbyCountdown(remaining int) error {
-	if err := r.publishHashSet("vehicle", "auto-standby-remaining", remaining, "vehicle", "auto-standby-remaining"); err != nil {
-		return err
-	}
-	return nil
+	return r.vehiclePub.Set("auto-standby-remaining", remaining)
 }
 
 // ClearAutoStandbyCountdown removes the auto-standby countdown from Redis
 // Deprecated: Use ClearAutoStandbyDeadline instead
 func (r *RedisClient) ClearAutoStandbyCountdown() error {
-	if err := r.publishHashDel("vehicle", "auto-standby-remaining", "vehicle", "auto-standby-remaining"); err != nil {
-		return err
-	}
-	return nil
+	return r.vehiclePub.Delete("auto-standby-remaining")
 }
 
 // PublishAutoStandbyDeadline publishes when auto-standby will trigger as Unix timestamp
 func (r *RedisClient) PublishAutoStandbyDeadline(deadline time.Time) error {
 	unixTs := deadline.Unix()
-	if err := r.publishHashSet("vehicle", "auto-standby-deadline", unixTs, "vehicle", "auto-standby-deadline"); err != nil {
-		return err
-	}
-	return nil
+	return r.vehiclePub.Set("auto-standby-deadline", unixTs)
 }
 
 // ClearAutoStandbyDeadline removes the auto-standby deadline from Redis
 func (r *RedisClient) ClearAutoStandbyDeadline() error {
-	if err := r.publishHashDel("vehicle", "auto-standby-deadline", "vehicle", "auto-standby-deadline"); err != nil {
-		return err
-	}
-	return nil
+	return r.vehiclePub.Delete("auto-standby-deadline")
 }
 
 // PublishGovernorChange publishes a governor change event to Redis
 func (r *RedisClient) PublishGovernorChange(governor string) error {
 	r.logger.Debugf("Publishing governor change: %s", governor)
 
-	if err := r.publishHashSet("system", "cpu:governor", governor, "system", "cpu:governor"); err != nil {
+	if err := r.systemPub.Set("cpu:governor", governor); err != nil {
 		r.logger.Warnf("Failed to publish governor change: %v", err)
 		return err
 	}
@@ -760,7 +580,7 @@ func (r *RedisClient) PublishGovernorChange(governor string) error {
 func (r *RedisClient) DeleteDashboardReadyFlag() error {
 	r.logger.Infof("Deleting dashboard ready flag from Redis")
 
-	if err := r.publishHashDel("dashboard", "ready", "dashboard", "ready"); err != nil {
+	if err := r.dashboardPub.Delete("ready"); err != nil {
 		r.logger.Infof("Failed to delete dashboard ready flag: %v", err)
 		return err
 	}
@@ -773,7 +593,7 @@ func (r *RedisClient) PublishStandbyTimerStart() error {
 	r.logger.Infof("Setting standby timer start timestamp")
 	timestamp := fmt.Sprintf("%d", time.Now().Unix())
 
-	if err := r.publishHashSet("ota", "standby-timer-start", timestamp, "ota", "standby-timer-start"); err != nil {
+	if err := r.otaPub.Set("standby-timer-start", timestamp); err != nil {
 		r.logger.Infof("Failed to set standby timer start: %v", err)
 		return err
 	}
@@ -784,20 +604,20 @@ func (r *RedisClient) PublishStandbyTimerStart() error {
 // GetOtaStatus gets the OTA status for a specific component from Redis
 func (r *RedisClient) GetOtaStatus(component string) (string, error) {
 	statusKey := fmt.Sprintf("status:%s", component)
-	status, err := r.client.HGet(r.ctx, "ota", statusKey).Result()
-	if err == redis.Nil {
-		// Status field doesn't exist, return empty string (idle)
-		return "", nil
-	}
+	status, err := r.client.HGet("ota", statusKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to get OTA status for component %s: %w", component, err)
+	}
+	if status == "" {
+		// Status field doesn't exist, return empty string (idle)
+		return "", nil
 	}
 	return status, nil
 }
 
 // SendCommand sends a command to a Redis list (for communication with other services)
 func (r *RedisClient) SendCommand(channel, command string) error {
-	err := r.client.LPush(r.ctx, channel, command).Err()
+	_, err := r.client.LPush(channel, command)
 	if err != nil {
 		r.logger.Infof("Failed to send command '%s' to channel '%s': %v", command, channel, err)
 		return err
@@ -810,33 +630,24 @@ func (r *RedisClient) SendCommand(channel, command string) error {
 func (r *RedisClient) ReportFaultPresent(code int, description string, timestamp int64, info string) error {
 	r.logger.Infof("Reporting fault present: code=%d, description=%s", code, description)
 
-	pipe := r.client.Pipeline()
-
 	// Add fault code to active faults set
-	pipe.SAdd(r.ctx, "vehicle:fault", code)
+	if err := r.faultSet.Add(code); err != nil {
+		r.logger.Infof("Failed to add fault to set: %v", err)
+		return err
+	}
 
 	// Add fault event to global event stream with metadata
-	eventData := map[string]interface{}{
+	eventData := map[string]any{
 		"group":       "vehicle",
-		"code":        code,
+		"code":        fmt.Sprint(code),
 		"description": description,
-		"ts":          timestamp,
+		"ts":          fmt.Sprint(timestamp),
 	}
 	if info != "" {
 		eventData["info"] = info
 	}
-	pipe.XAdd(r.ctx, &redis.XAddArgs{
-		Stream: "events:faults",
-		MaxLen: 1000,
-		Values: eventData,
-	})
-
-	// Publish notification
-	pipe.Publish(r.ctx, "vehicle", "fault")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
-		r.logger.Infof("Failed to report fault present: %v", err)
+	if _, err := r.faultStream.Add(eventData); err != nil {
+		r.logger.Infof("Failed to add fault to stream: %v", err)
 		return err
 	}
 
@@ -848,27 +659,19 @@ func (r *RedisClient) ReportFaultPresent(code int, description string, timestamp
 func (r *RedisClient) ReportFaultAbsent(code int) error {
 	r.logger.Infof("Reporting fault absent: code=%d", code)
 
-	pipe := r.client.Pipeline()
-
 	// Remove fault code from active faults set
-	pipe.SRem(r.ctx, "vehicle:fault", code)
+	if err := r.faultSet.Remove(code); err != nil {
+		r.logger.Infof("Failed to remove fault from set: %v", err)
+		return err
+	}
 
 	// Add clear event to global event stream (negative code indicates cleared)
-	pipe.XAdd(r.ctx, &redis.XAddArgs{
-		Stream: "events:faults",
-		MaxLen: 1000,
-		Values: map[string]interface{}{
-			"group": "vehicle",
-			"code":  -code, // Negative code indicates fault cleared
-		},
-	})
-
-	// Publish notification
-	pipe.Publish(r.ctx, "vehicle", "fault")
-
-	_, err := pipe.Exec(r.ctx)
-	if err != nil {
-		r.logger.Infof("Failed to report fault absent: %v", err)
+	eventData := map[string]any{
+		"group": "vehicle",
+		"code":  fmt.Sprint(-code), // Negative code indicates fault cleared
+	}
+	if _, err := r.faultStream.Add(eventData); err != nil {
+		r.logger.Infof("Failed to add fault clear to stream: %v", err)
 		return err
 	}
 
@@ -878,13 +681,13 @@ func (r *RedisClient) ReportFaultAbsent(code int) error {
 
 // GetHashField reads a field from a Redis hash using HGET
 func (r *RedisClient) GetHashField(hash, field string) (string, error) {
-	value, err := r.client.HGet(r.ctx, hash, field).Result()
-	if err == redis.Nil {
-		// Field doesn't exist, return empty string
-		return "", nil
-	}
+	value, err := r.client.HGet(hash, field)
 	if err != nil {
 		return "", fmt.Errorf("failed to get hash field %s from %s: %w", field, hash, err)
+	}
+	if value == "" {
+		// Field doesn't exist, return empty string
+		return "", nil
 	}
 	return value, nil
 }

@@ -90,7 +90,7 @@ func (v *VehicleSystem) Start() error {
 	v.logger.Infof("Starting vehicle system")
 
 	// Initialize Redis client first (but don't start listeners yet)
-	v.redis = messaging.NewRedisClient(v.redisHost, v.redisPort, v.logger.WithTag("Redis"), messaging.Callbacks{
+	redisClient, err := messaging.NewRedisClient(v.redisHost, v.redisPort, v.logger.WithTag("Redis"), messaging.Callbacks{
 		DashboardCallback: v.handleDashboardReady,
 		KeycardCallback:   v.keycardAuthPassed,
 		SeatboxCallback:   v.handleSeatboxRequest,
@@ -104,6 +104,10 @@ func (v *VehicleSystem) Start() error {
 		HardwareCallback:  v.handleHardwareRequest,
 		SettingsCallback:  v.handleSettingsUpdate,
 	})
+	if err != nil {
+		return fmt.Errorf("failed to create Redis client: %w", err)
+	}
+	v.redis = redisClient
 
 	// Connect to Redis first so we can retrieve saved state
 	if err := v.redis.Connect(); err != nil {
