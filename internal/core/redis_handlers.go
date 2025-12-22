@@ -27,6 +27,16 @@ func (v *VehicleSystem) handleSeatboxRequest(on bool) error {
 // handleHornRequest handles horn activation requests from Redis
 func (v *VehicleSystem) handleHornRequest(on bool) error {
 	v.logger.Debugf("Handling horn request: %v", on)
+
+	// Check if horn is allowed before activating
+	if on && !v.isHornAllowed() {
+		v.mu.RLock()
+		mode := v.hornEnableMode
+		v.mu.RUnlock()
+		v.logger.Debugf("Horn request denied (mode: %s, state: %s)", mode, v.getCurrentState())
+		return nil // Silent failure - don't activate horn but don't error
+	}
+
 	return v.io.WriteDigitalOutput("horn", on)
 }
 
@@ -399,6 +409,25 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 				v.cancelAutoStandbyTimer()
 			}
 		}
+
+	case "scooter.enable-horn":
+		// Read the new value from Redis
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+
+		// Validate value
+		if value != "true" && value != "false" && value != "in-drive" {
+			v.logger.Warnf("Invalid horn enable mode: %s (must be 'true', 'false', or 'in-drive')", value)
+			return fmt.Errorf("invalid horn enable mode: %s (must be 'true', 'false', or 'in-drive')", value)
+		}
+
+		v.mu.Lock()
+		v.hornEnableMode = value
+		v.mu.Unlock()
+		v.logger.Infof("Horn enable mode updated to: %s", value)
 
 	default:
 		// Only log unknown settings if they're in the scooter namespace

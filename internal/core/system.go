@@ -64,6 +64,7 @@ type VehicleSystem struct {
 	deferredDashboardPower  *bool             // Deferred dashboard power state (nil = no change needed)
 	brakeHibernationEnabled bool              // Track if brake lever hibernation is enabled (default: true)
 	autoStandbySeconds      int               // Auto-standby timeout in seconds (0 = disabled)
+	hornEnableMode          string            // Horn enable mode: "true", "false", or "in-drive" (default: "true")
 	hibernationForceTimer   *time.Timer       // Timer for forcing hibernation after 15s of brake hold
 	machine                 *librefsm.Machine // librefsm state machine
 }
@@ -79,7 +80,8 @@ func NewVehicleSystem(redisHost string, redisPort int, l *logger.Logger) *Vehicl
 		initialized:             false,
 		keycardTapCount:         0,
 		forceStandbyNoLock:      false,
-		brakeHibernationEnabled: true, // Default to enabled for backward compatibility
+		brakeHibernationEnabled: true,   // Default to enabled for backward compatibility
+		hornEnableMode:          "true", // Default to always enabled for backward compatibility
 		// lastKeycardTapTime will be zero value (time.IsZero() will be true)
 	}
 }
@@ -167,6 +169,25 @@ func (v *VehicleSystem) Start() error {
 		}
 	} else {
 		v.logger.Infof("No auto-standby setting found on startup, using default (disabled)")
+	}
+
+	// Read initial horn enable mode setting from Redis
+	hornEnableModeSetting, err := v.redis.GetHashField("settings", "scooter.enable-horn")
+	if err != nil {
+		v.logger.Warnf("Failed to read horn enable mode setting on startup: %v", err)
+		// Continue with default (true = always enabled)
+	} else if hornEnableModeSetting != "" {
+		v.mu.Lock()
+		if hornEnableModeSetting == "true" || hornEnableModeSetting == "false" || hornEnableModeSetting == "in-drive" {
+			v.hornEnableMode = hornEnableModeSetting
+			v.logger.Infof("Horn enable mode setting on startup: %s", hornEnableModeSetting)
+		} else {
+			v.logger.Warnf("Invalid horn enable mode setting value on startup: '%s', using default (true)", hornEnableModeSetting)
+			v.hornEnableMode = "true"
+		}
+		v.mu.Unlock()
+	} else {
+		v.logger.Infof("No horn enable mode setting found on startup, using default (true)")
 	}
 
 	// Check if DBC update is in progress and restore dbcUpdating flag
@@ -501,6 +522,22 @@ func (v *VehicleSystem) resetAutoStandbyTimer() {
 	v.startAutoStandbyTimer()
 }
 
+// isHornAllowed checks if horn activation is permitted based on current setting and vehicle state
+func (v *VehicleSystem) isHornAllowed() bool {
+	v.mu.RLock()
+	mode := v.hornEnableMode
+	v.mu.RUnlock()
+
+	switch mode {
+	case "false":
+		return false
+	case "in-drive":
+		return v.getCurrentState() == types.StateReadyToDrive
+	default: // "true" or any other value defaults to enabled
+		return true
+	}
+}
+
 func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 	v.logger.Infof("Handling dashboard ready state: %v", ready)
 
@@ -598,10 +635,14 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 	switch channel {
 	case "horn_button":
-		if err := v.io.WriteDigitalOutput("horn", value); err != nil {
+		// Check if horn is allowed before activating
+		allowed := v.isHornAllowed()
+		hornValue := value && allowed // Only activate if both button pressed AND allowed
+
+		if err := v.io.WriteDigitalOutput("horn", hornValue); err != nil {
 			return err
 		}
-		return v.redis.SetHornButton(value)
+		return v.redis.SetHornButton(value) // Still publish button state even if horn disabled
 
 	case "kickstand":
 		v.logger.Infof("Kickstand changed: %v", value)
