@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -17,8 +18,14 @@ func main() {
 	// Service log level
 	var serviceLogLevel int
 	flag.IntVar(&serviceLogLevel, "log", 3, "Service log level (0=NONE, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG)")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("vehicle-service %s\n", version)
+		return
+	}
 
 	// Create standard logger with appropriate format
 	var stdLogger *log.Logger
