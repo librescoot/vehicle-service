@@ -194,12 +194,6 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 		}
 	}
 
-	// Update engine brake based on new state
-	if err := v.updateEngineBrake(); err != nil {
-		v.logger.Errorf("Failed to update engine brake after state transition: %v", err)
-		return err
-	}
-
 	return nil
 }
 
@@ -265,12 +259,6 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 		}
 	}
 
-	// Update engine brake based on new state
-	if err := v.updateEngineBrake(); err != nil {
-		v.logger.Errorf("Failed to update engine brake after state transition: %v", err)
-		return err
-	}
-
 	return nil
 }
 
@@ -330,12 +318,6 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 	// Final "all off" cue for standby
 	v.playLedCue(0, "all off")
 
-	// Update engine brake based on new state
-	if err := v.updateEngineBrake(); err != nil {
-		v.logger.Errorf("Failed to update engine brake after state transition: %v", err)
-		return err
-	}
-
 	return nil
 }
 
@@ -379,12 +361,6 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 
 	// Note: The shutdown timer is handled by librefsm WithTimeout
 	v.logger.Infof("Shutdown timer started via librefsm (4.0s)")
-
-	// Update engine brake based on new state
-	if err := v.updateEngineBrake(); err != nil {
-		v.logger.Errorf("Failed to update engine brake after state transition: %v", err)
-		return err
-	}
 
 	return nil
 }
