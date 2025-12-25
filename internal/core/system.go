@@ -12,7 +12,6 @@ import (
 	"github.com/librescoot/librefsm"
 
 	"vehicle-service/internal/fsm"
-	"vehicle-service/internal/hardware"
 	"vehicle-service/internal/logger"
 	"vehicle-service/internal/messaging"
 	"vehicle-service/internal/types"
@@ -44,11 +43,9 @@ type VehicleSystem struct {
 	state                   types.SystemState
 	dashboardReady          bool
 	logger                  *logger.Logger
-	io                      *hardware.LinuxHardwareIO
-	redis                   *messaging.RedisClient
+	io                      HardwareIO
+	redis                   MessagingClient
 	mu                      sync.RWMutex
-	redisHost               string
-	redisPort               int
 	blinkerState            BlinkerState
 	blinkerStopChan         chan struct{}
 	initialized             bool
@@ -69,13 +66,12 @@ type VehicleSystem struct {
 	machine                 *librefsm.Machine // librefsm state machine
 }
 
-func NewVehicleSystem(redisHost string, redisPort int, l *logger.Logger) *VehicleSystem {
+func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *VehicleSystem {
 	return &VehicleSystem{
 		state:                   types.StateInit,
 		logger:                  l.WithTag("Vehicle"),
-		io:                      hardware.NewLinuxHardwareIO(l.WithTag("Hardware")),
-		redisHost:               redisHost,
-		redisPort:               redisPort,
+		io:                      io,
+		redis:                   redis,
 		blinkerState:            BlinkerOff,
 		initialized:             false,
 		keycardTapCount:         0,
@@ -89,8 +85,8 @@ func NewVehicleSystem(redisHost string, redisPort int, l *logger.Logger) *Vehicl
 func (v *VehicleSystem) Start() error {
 	v.logger.Infof("Starting vehicle system")
 
-	// Initialize Redis client first (but don't start listeners yet)
-	v.redis = messaging.NewRedisClient(v.redisHost, v.redisPort, v.logger.WithTag("Redis"), messaging.Callbacks{
+	// Set up Redis callbacks
+	v.redis.SetCallbacks(messaging.Callbacks{
 		DashboardCallback: v.handleDashboardReady,
 		KeycardCallback:   v.keycardAuthPassed,
 		SeatboxCallback:   v.handleSeatboxRequest,

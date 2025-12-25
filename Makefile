@@ -1,4 +1,4 @@
-.PHONY: build clean build-arm build-amd64 build-host dist fmt deps lint test
+.PHONY: build clean build-arm build-host dist fmt deps lint test
 
 BINARY_NAME=vehicle-service
 BUILD_DIR=bin
@@ -12,21 +12,13 @@ build:
 clean:
 	rm -rf $(BUILD_DIR)
 
-build-arm:
-	mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/vehicle-service
-
-build-amd64:
-	mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-amd64 ./cmd/vehicle-service
+build-arm: build
 
 build-host:
 	mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-host ./cmd/vehicle-service
 
-dist:
-	mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/vehicle-service
+dist: build
 
 fmt:
 	go fmt ./...
