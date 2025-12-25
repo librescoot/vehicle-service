@@ -1,9 +1,13 @@
 package core
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/librescoot/librefsm"
+
+	"vehicle-service/internal/fsm"
 	"vehicle-service/internal/hardware"
 	"vehicle-service/internal/logger"
 	"vehicle-service/internal/messaging"
@@ -536,5 +540,266 @@ func TestHardwareIOInputCallback(t *testing.T) {
 	}
 	if !receivedValue {
 		t.Error("Wrong value received")
+	}
+}
+
+// ===== State Transition Tests =====
+// These tests verify the engine brake behavior during state transitions.
+// This was a regression where updateEngineBrake() was called at the end of
+// state entry actions, but it read v.state which hadn't been updated yet,
+// causing inverted engine brake behavior.
+
+// initTestFSM initializes the FSM for a test system
+func initTestFSM(t *testing.T, system *VehicleSystem) {
+	t.Helper()
+	if err := system.initFSM(context.Background()); err != nil {
+		t.Fatalf("Failed to initialize FSM: %v", err)
+	}
+}
+
+func TestEnterReadyToDrive_EngineBrakeDisabled(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	// Set up initial conditions: kickstand up, no brakes pressed
+	mockIO.digitalInputs["kickstand"] = false        // up
+	mockIO.digitalInputs["brake_left"] = false       // not pressed
+	mockIO.digitalInputs["brake_right"] = false      // not pressed
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true // closed
+
+	initTestFSM(t, system)
+
+	// Start from Parked state
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("Failed to set initial state: %v", err)
+	}
+	system.initialized = true
+	system.dashboardReady = true
+
+	// Clear any previous outputs
+	mockIO.digitalOutputs = make(map[string]bool)
+
+	// Trigger transition to ReadyToDrive via kickstand up event
+	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
+
+	// Allow state transition to complete
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify we're in ready-to-drive
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Errorf("Expected state ReadyToDrive, got %v", system.getCurrentState())
+	}
+
+	// CRITICAL: engine_brake should be FALSE in ready-to-drive (throttle enabled)
+	if mockIO.digitalOutputs["engine_brake"] != false {
+		t.Errorf("Engine brake should be FALSE (disabled) in ReadyToDrive with no brakes pressed, got %v",
+			mockIO.digitalOutputs["engine_brake"])
+	}
+}
+
+func TestEnterReadyToDrive_EngineBrakeFollowsBrakes(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	// Set up initial conditions: kickstand up, LEFT brake pressed
+	mockIO.digitalInputs["kickstand"] = false        // up
+	mockIO.digitalInputs["brake_left"] = true        // pressed
+	mockIO.digitalInputs["brake_right"] = false      // not pressed
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	// Start from Parked state
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("Failed to set initial state: %v", err)
+	}
+	system.initialized = true
+	system.dashboardReady = true
+
+	// Clear outputs
+	mockIO.digitalOutputs = make(map[string]bool)
+
+	// Trigger transition to ReadyToDrive
+	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
+	time.Sleep(50 * time.Millisecond)
+
+	// engine_brake should be TRUE when brake lever is pressed
+	if mockIO.digitalOutputs["engine_brake"] != true {
+		t.Errorf("Engine brake should be TRUE when brake lever is pressed in ReadyToDrive, got %v",
+			mockIO.digitalOutputs["engine_brake"])
+	}
+}
+
+func TestEnterParked_EngineBrakeEnabled(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	// Set up initial conditions: start with kickstand up, then will put it down
+	mockIO.digitalInputs["kickstand"] = false        // up (will change to down)
+	mockIO.digitalInputs["brake_left"] = false       // not pressed
+	mockIO.digitalInputs["brake_right"] = false      // not pressed
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	// Start from ReadyToDrive state
+	if err := system.machine.SetState(fsm.StateReadyToDrive); err != nil {
+		t.Fatalf("Failed to set initial state: %v", err)
+	}
+	system.initialized = true
+	system.dashboardReady = true
+	system.readyToDriveEntryTime = time.Now().Add(-2 * time.Second) // bypass debounce
+
+	// Clear outputs
+	mockIO.digitalOutputs = make(map[string]bool)
+
+	// Simulate kickstand going down
+	mockIO.digitalInputs["kickstand"] = true // down
+
+	// Trigger transition to Parked
+	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandDown})
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify we're in parked
+	if system.getCurrentState() != types.StateParked {
+		t.Errorf("Expected state Parked, got %v", system.getCurrentState())
+	}
+
+	// CRITICAL: engine_brake should be TRUE in parked (throttle disabled)
+	if mockIO.digitalOutputs["engine_brake"] != true {
+		t.Errorf("Engine brake should be TRUE (enabled) in Parked state, got %v",
+			mockIO.digitalOutputs["engine_brake"])
+	}
+}
+
+func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
+	// This test verifies the full transition cycle that was broken before the fix.
+	// The bug caused engine_brake to be inverted after transitions.
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true         // down (parked)
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	// Start from Parked
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("Failed to set initial state: %v", err)
+	}
+	system.initialized = true
+	system.dashboardReady = true
+
+	// Clear and verify engine_brake is TRUE in parked by re-entering
+	mockIO.digitalOutputs = make(map[string]bool)
+	system.machine.SetState(fsm.StateStandby)
+	time.Sleep(20 * time.Millisecond)
+	system.dashboardReady = true // Restore after standby clears it
+	system.machine.SetState(fsm.StateParked)
+	time.Sleep(50 * time.Millisecond)
+
+	if mockIO.digitalOutputs["engine_brake"] != true {
+		t.Errorf("Step 1: Engine brake should be TRUE in Parked, got %v", mockIO.digitalOutputs["engine_brake"])
+	}
+
+	// Now transition to ReadyToDrive
+	mockIO.digitalInputs["kickstand"] = false // up
+	mockIO.digitalOutputs = make(map[string]bool)
+	system.dashboardReady = true // Ensure dashboard ready for guard
+
+	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Fatalf("Expected ReadyToDrive, got %v", system.getCurrentState())
+	}
+
+	// CRITICAL CHECK: This was the bug - engine_brake ended up TRUE instead of FALSE
+	if mockIO.digitalOutputs["engine_brake"] != false {
+		t.Errorf("Step 2: Engine brake should be FALSE in ReadyToDrive (no brakes pressed), got %v",
+			mockIO.digitalOutputs["engine_brake"])
+	}
+
+	// Now go back to Parked
+	mockIO.digitalInputs["kickstand"] = true // down
+	system.readyToDriveEntryTime = time.Now().Add(-2 * time.Second)
+	mockIO.digitalOutputs = make(map[string]bool)
+
+	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandDown})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateParked {
+		t.Fatalf("Expected Parked, got %v", system.getCurrentState())
+	}
+
+	// CRITICAL CHECK: This was the bug - engine_brake ended up FALSE instead of TRUE
+	if mockIO.digitalOutputs["engine_brake"] != true {
+		t.Errorf("Step 3: Engine brake should be TRUE in Parked, got %v",
+			mockIO.digitalOutputs["engine_brake"])
+	}
+}
+
+func TestEnterStandby_FromShuttingDown(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	// Start from ShuttingDown
+	if err := system.machine.SetState(fsm.StateShuttingDown); err != nil {
+		t.Fatalf("Failed to set initial state: %v", err)
+	}
+	system.initialized = true
+
+	mockIO.digitalOutputs = make(map[string]bool)
+
+	// Transition to Standby (via timeout event)
+	system.machine.Send(librefsm.Event{ID: fsm.EvShutdownTimeout})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateStandby {
+		t.Errorf("Expected Standby, got %v", system.getCurrentState())
+	}
+}
+
+func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	// Start from Parked
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("Failed to set initial state: %v", err)
+	}
+	system.initialized = true
+
+	// Set engine power on initially
+	mockIO.digitalOutputs["engine_power"] = true
+
+	// Trigger shutdown via lock event
+	system.machine.Send(librefsm.Event{ID: fsm.EvLock})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateShuttingDown {
+		t.Errorf("Expected ShuttingDown, got %v", system.getCurrentState())
+	}
+
+	// Engine power should be turned off during shutdown
+	if mockIO.digitalOutputs["engine_power"] != false {
+		t.Errorf("Engine power should be FALSE during shutdown, got %v",
+			mockIO.digitalOutputs["engine_power"])
 	}
 }
