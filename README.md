@@ -56,11 +56,14 @@ To run the service:
 
 ## Configuration
 
-The service requires Redis connection details:
-- Redis host
-- Redis port
+### Command Line Options
 
-Additional configuration options can be found in the hardware constants and system configuration files.
+- `--version`: Print version and exit
+- `--log`: Service log level (0=NONE, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, default: 3)
+
+### Redis Configuration
+
+The service connects to Redis at `127.0.0.1:6379` (hardcoded).
 
 ### LED Channel Mapping
 
