@@ -147,8 +147,21 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 	case "start-dbc":
 		v.logger.Infof("Starting DBC update process")
 		v.mu.Lock()
+		// Cancel any existing timer
+		if v.dbcUpdateTimer != nil {
+			v.dbcUpdateTimer.Stop()
+			v.dbcUpdateTimer = nil
+		}
 		v.dbcUpdating = true
+
+		// Start safety timeout timer
+		v.dbcUpdateTimer = time.AfterFunc(dbcUpdateTimeout, func() {
+			v.logger.Warnf("DBC update timeout after %v - clearing stuck state", dbcUpdateTimeout)
+			v.handleDbcUpdateTimeout()
+		})
 		v.mu.Unlock()
+
+		v.logger.Infof("DBC update timeout set to %v", dbcUpdateTimeout)
 
 		// Persist to Redis
 		if err := v.redis.SetDbcUpdating(true); err != nil {
@@ -165,6 +178,11 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 	case "complete-dbc":
 		v.logger.Infof("DBC update process complete")
 		v.mu.Lock()
+		// Cancel the timeout timer
+		if v.dbcUpdateTimer != nil {
+			v.dbcUpdateTimer.Stop()
+			v.dbcUpdateTimer = nil
+		}
 		v.dbcUpdating = false
 		deferredPower := v.deferredDashboardPower
 		v.deferredDashboardPower = nil
@@ -438,4 +456,63 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 	}
 
 	return nil
+}
+
+// handleDbcUpdateTimeout handles the DBC update timeout - clears the stuck state
+// This is called from a timer goroutine when complete-dbc is not received in time
+func (v *VehicleSystem) handleDbcUpdateTimeout() {
+	v.mu.Lock()
+	if !v.dbcUpdating {
+		// Already cleared by complete-dbc, nothing to do
+		v.mu.Unlock()
+		return
+	}
+
+	v.dbcUpdating = false
+	v.dbcUpdateTimer = nil
+	deferredPower := v.deferredDashboardPower
+	v.deferredDashboardPower = nil
+	currentState := v.state
+	v.mu.Unlock()
+
+	v.logger.Warnf("DBC update timeout - clearing dbcUpdating flag and applying deferred power state")
+
+	// Persist to Redis
+	if err := v.redis.SetDbcUpdating(false); err != nil {
+		v.logger.Warnf("Failed to persist DBC updating state to Redis after timeout: %v", err)
+	}
+
+	// Apply deferred power state or default behavior (same logic as complete-dbc)
+	var powerOff bool
+	if deferredPower != nil {
+		if *deferredPower {
+			v.logger.Debugf("Applying deferred dashboard power after timeout: ON")
+			if err := v.setPower("dashboard_power", true); err != nil {
+				v.logger.Errorf("Failed to apply deferred dashboard power ON after timeout: %v", err)
+			}
+		} else {
+			if currentState == types.StateStandby {
+				v.logger.Debugf("Scheduling deferred dashboard power OFF after timeout (5s delay)")
+				powerOff = true
+			} else {
+				v.logger.Debugf("Deferred dashboard power OFF cancelled after timeout - no longer in standby (state=%s)", currentState)
+			}
+		}
+	} else {
+		if currentState == types.StateStandby {
+			v.logger.Debugf("DBC update timeout in standby - scheduling dashboard power OFF (5s delay)")
+			powerOff = true
+		} else {
+			v.logger.Debugf("DBC update timeout but not in standby (state=%s) - leaving dashboard power on", currentState)
+		}
+	}
+
+	// Delay power-off to allow DBC to poweroff gracefully
+	if powerOff {
+		time.AfterFunc(5*time.Second, func() {
+			if err := v.setPower("dashboard_power", false); err != nil {
+				v.logger.Errorf("Failed to turn off dashboard power after timeout: %v", err)
+			}
+		})
+	}
 }

@@ -37,6 +37,9 @@ const (
 	handlebarLockWindow   = 10 * time.Second
 	seatboxLockDuration   = 200 * time.Millisecond
 	parkDebounceTime      = 1 * time.Second
+
+	// DBC update timeout - safety limit to prevent stuck state if complete-dbc is never received
+	dbcUpdateTimeout = 45 * time.Minute
 )
 
 type VehicleSystem struct {
@@ -58,6 +61,7 @@ type VehicleSystem struct {
 	hibernationRequest      bool              // Track if hibernation was requested during shutdown
 	shutdownFromParked      bool              // Track if shutdown was initiated from parked state
 	dbcUpdating             bool              // Track if DBC update is in progress
+	dbcUpdateTimer          *time.Timer       // Timer for DBC update timeout (45 minutes max)
 	deferredDashboardPower  *bool             // Deferred dashboard power state (nil = no change needed)
 	brakeHibernationEnabled bool              // Track if brake lever hibernation is enabled (default: true)
 	autoStandbySeconds      int               // Auto-standby timeout in seconds (0 = disabled)
@@ -1041,6 +1045,11 @@ func (v *VehicleSystem) Shutdown() {
 	if v.handlebarTimer != nil {
 		v.handlebarTimer.Stop()
 		v.handlebarTimer = nil
+	}
+
+	if v.dbcUpdateTimer != nil {
+		v.dbcUpdateTimer.Stop()
+		v.dbcUpdateTimer = nil
 	}
 
 	if v.redis != nil {
