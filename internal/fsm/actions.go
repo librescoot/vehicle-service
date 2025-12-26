@@ -38,6 +38,7 @@ type Actions interface {
 	OnHibernationComplete(c *librefsm.Context) error
 	OnLockHibernate(c *librefsm.Context) error // Sets hibernation flag before shutdown
 	OnForceLock(c *librefsm.Context) error     // Sets force-standby flag
+	OnSeatboxButton(c *librefsm.Context) error // Opens seatbox when button pressed in parked state
 }
 
 // FSMData holds data passed through the FSM context.

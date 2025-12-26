@@ -229,6 +229,13 @@ func (v *VehicleSystem) Start() error {
 			v.mu.RLock()
 			dashboardPower = savedState == types.StateReadyToDrive || savedState == types.StateParked || v.dbcUpdating
 			v.mu.RUnlock()
+		} else {
+			// Override if DBC is updating (keep dashboard powered during updates)
+			v.mu.RLock()
+			if v.dbcUpdating {
+				dashboardPower = true
+			}
+			v.mu.RUnlock()
 		}
 		v.logger.Infof("Setting initial dashboard power: %v", dashboardPower)
 		v.io.SetInitialValue("dashboard_power", dashboardPower)
@@ -682,17 +689,15 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		if value {
 			// Reset auto-standby timer on seatbox press
 			v.resetAutoStandbyTimer()
-			// Send physical event - FSM decides transitions based on current state
+			// Send physical event - FSM handles seatbox opening via OnSeatboxButton action
 			v.logger.Infof("Seatbox button pressed - sending EvSeatboxButton")
 			v.machine.Send(librefsm.Event{ID: fsm.EvSeatboxButton})
 		}
 
+		// Update button state in Redis hash (happens after FSM event processing)
+		// This is slow (~2s) but doesn't block physical response since FSM is async
 		if err := v.redis.SetSeatboxButton(value); err != nil {
 			return err
-		}
-		// Only open seatbox via button in parked mode
-		if value && currentState == types.StateParked {
-			return v.openSeatboxLock()
 		}
 
 	case "brake_right", "brake_left":

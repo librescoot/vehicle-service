@@ -60,6 +60,7 @@ func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks
 		ipc.WithAddress(host),
 		ipc.WithPort(port),
 		ipc.WithCodec(ipc.StringCodec{}),
+		ipc.WithPoolSize(12), // 8 queue handlers + 4 for other operations
 		ipc.WithOnConnect(func() { l.Infof("Redis connected") }),
 		ipc.WithOnDisconnect(func(err error) { l.Warnf("Redis disconnected: %v", err) }),
 	)

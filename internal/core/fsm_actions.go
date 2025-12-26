@@ -558,3 +558,20 @@ func (v *VehicleSystem) OnForceLock(c *librefsm.Context) error {
 	v.mu.Unlock()
 	return nil
 }
+
+func (v *VehicleSystem) OnSeatboxButton(c *librefsm.Context) error {
+	v.logger.Infof("FSM: Seatbox button pressed - opening seatbox")
+
+	// 1. Publish event first (for immediate UI response via PUBSUB)
+	if err := v.redis.PublishSeatboxOpened(); err != nil {
+		v.logger.Warnf("Failed to publish seatbox opened event: %v", err)
+	}
+
+	// 2. Open physical seatbox lock
+	if err := v.openSeatboxLock(); err != nil {
+		v.logger.Errorf("Failed to open seatbox lock: %v", err)
+		return err
+	}
+
+	return nil
+}

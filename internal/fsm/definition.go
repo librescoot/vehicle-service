@@ -113,6 +113,10 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateParked, EvSeatboxButton, StateReadyToDrive,
 			librefsm.WithGuards(actions.IsKickstandUp, actions.AreBrakesPressed),
 		).
+		// Normal seatbox opening: button pressed in parked (fallback if guards above fail)
+		Transition(StateParked, EvSeatboxButton, StateParked,
+			librefsm.WithAction(actions.OnSeatboxButton),
+		).
 		// Hibernation entry: both brakes pressed in parked state
 		Transition(StateParked, EvBrakesPressed, StateHibernationInitialHold,
 			librefsm.WithGuard(actions.AreBrakesPressed),
