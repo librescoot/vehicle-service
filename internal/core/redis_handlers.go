@@ -186,6 +186,7 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.dbcUpdating = false
 		deferredPower := v.deferredDashboardPower
 		v.deferredDashboardPower = nil
+		currentState := v.state
 		v.mu.Unlock()
 
 		// Persist to Redis
@@ -193,44 +194,25 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 			v.logger.Warnf("Failed to persist DBC updating state to Redis: %v", err)
 		}
 
-		// Determine what power action to take (if any)
-		v.mu.Lock()
-		currentState := v.state
-		v.mu.Unlock()
-
-		var powerOff bool
-		if deferredPower != nil {
-			if *deferredPower {
-				v.logger.Debugf("Applying deferred dashboard power: ON")
-				if err := v.setPower("dashboard_power", true); err != nil {
-					v.logger.Errorf("%v (deferred)", err)
-					return err
-				}
-			} else {
-				// Deferred power-off: only execute if still in standby
-				if currentState == types.StateStandby {
-					v.logger.Debugf("Scheduling deferred dashboard power OFF (5s delay)")
-					powerOff = true
-				} else {
-					v.logger.Debugf("Deferred dashboard power OFF cancelled - no longer in standby (state=%s)", currentState)
-				}
+		// Handle deferred power-on request
+		if deferredPower != nil && *deferredPower {
+			v.logger.Debugf("Applying deferred dashboard power: ON")
+			if err := v.setPower("dashboard_power", true); err != nil {
+				v.logger.Errorf("%v (deferred)", err)
+				return err
 			}
-		} else {
-			if currentState == types.StateStandby {
-				v.logger.Debugf("DBC update complete in standby - scheduling dashboard power OFF (5s delay)")
-				powerOff = true
-			} else {
-				v.logger.Debugf("DBC update complete but not in standby (state=%s) - leaving dashboard power on", currentState)
-			}
+			return nil
 		}
 
-		// Delay power-off to allow DBC to poweroff gracefully
-		if powerOff {
-			time.AfterFunc(5*time.Second, func() {
-				if err := v.setPower("dashboard_power", false); err != nil {
-					v.logger.Errorf("Failed to turn off dashboard power: %v", err)
-				}
-			})
+		// If in standby, transition to shutting-down to give DBC time to poweroff cleanly
+		// The shutdown timeout will transition back to standby, which turns off dashboard power
+		if currentState == types.StateStandby {
+			v.logger.Infof("DBC update complete in standby - transitioning to shutting-down for clean DBC shutdown")
+			if err := v.machine.SendSync(librefsm.Event{ID: fsm.EvDbcUpdateComplete}); err != nil {
+				v.logger.Warnf("Failed to send DBC update complete event: %v", err)
+			}
+		} else {
+			v.logger.Debugf("DBC update complete but not in standby (state=%s) - leaving dashboard power on", currentState)
 		}
 		return nil
 

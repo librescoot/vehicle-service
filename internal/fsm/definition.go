@@ -9,7 +9,7 @@ import (
 // Timing constants
 const (
 	InitTimeout               = 2 * time.Second
-	ShutdownTimeout           = 4 * time.Second
+	ShutdownTimeout           = 5 * time.Second
 	WaitingSeatboxTimeout     = 30 * time.Second
 	HibernationInitialTimeout = 15 * time.Second
 	HibernationConfirmTimeout = 30 * time.Second
@@ -80,7 +80,8 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 
 		// From Standby - unlock events transition to Parked
 		Transition(StateStandby, EvUnlock, StateParked).
-		Transition(StateStandby, EvKeycardAuth, StateParked). // Keycard tap unlocks from standby
+		Transition(StateStandby, EvKeycardAuth, StateParked).    // Keycard tap unlocks from standby
+		Transition(StateStandby, EvDbcUpdateComplete, StateShuttingDown). // DBC update complete, give DBC time to poweroff
 
 		// From Parked - unlock/kickstand-up/dashboard-ready to ReadyToDrive if conditions met
 		Transition(StateParked, EvUnlock, StateReadyToDrive,
