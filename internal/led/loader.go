@@ -81,7 +81,7 @@ func (lib *CurveLibrary) loadFades(dir string) error {
 
 		if fade.Index >= 0 {
 			lib.Fades[fade.Index] = fade
-			lib.logger.Debugf("Loaded fade %d (%s): duration=%v, zeroPoints=%d, endsAtZero=%v",
+			lib.logger.Infof("Loaded fade %d (%s): duration=%v, zeroPoints=%d, endsAtZero=%v",
 				fade.Index, fade.Name, fade.Duration, len(fade.ZeroPoints), fade.EndsAtZero)
 		}
 	}
