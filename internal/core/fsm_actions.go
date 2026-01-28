@@ -156,6 +156,10 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 
 	if err := v.setPower("dashboard_power", true); err != nil {
 		v.logger.Errorf("%v", err)
+		// Roll back engine power to avoid inconsistent hardware state
+		if rbErr := v.setPower("engine_power", false); rbErr != nil {
+			v.logger.Errorf("Rollback failed: %v", rbErr)
+		}
 		return err
 	}
 
@@ -213,12 +217,18 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 	// Engage engine brake BEFORE powering ECU to prevent movement
 	if err := v.io.WriteDigitalOutput("engine_brake", true); err != nil {
 		v.logger.Errorf("Failed to engage engine brake: %v", err)
+		if rbErr := v.setPower("dashboard_power", false); rbErr != nil {
+			v.logger.Errorf("Rollback failed: %v", rbErr)
+		}
 		return err
 	}
 
 	// Keep ECU powered in parked state
 	if err := v.setPower("engine_power", true); err != nil {
 		v.logger.Errorf("%v", err)
+		if rbErr := v.setPower("dashboard_power", false); rbErr != nil {
+			v.logger.Errorf("Rollback failed: %v", rbErr)
+		}
 		return err
 	}
 
