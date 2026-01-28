@@ -3,8 +3,8 @@ module vehicle-service
 go 1.22.1
 
 require (
-	github.com/librescoot/librefsm v0.3.2
-	github.com/librescoot/redis-ipc v0.10.1
+	github.com/librescoot/librefsm v0.3.3
+	github.com/librescoot/redis-ipc v0.10.3
 	github.com/warthog618/go-gpiocdev v0.9.1
 	golang.org/x/sys v0.28.0
 )
