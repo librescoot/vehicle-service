@@ -7,11 +7,13 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/librescoot/librefsm"
 
 	"vehicle-service/internal/fsm"
+	"vehicle-service/internal/led"
 	"vehicle-service/internal/logger"
 	"vehicle-service/internal/messaging"
 	"vehicle-service/internal/types"
@@ -51,6 +53,9 @@ type VehicleSystem struct {
 	mu                      sync.RWMutex
 	blinkerState            BlinkerState
 	blinkerStopChan         chan struct{}
+	blinkerStartNanos       atomic.Int64       // UnixNano when blinker goroutine started (0 if inactive)
+	blinkerCueIndex         atomic.Int32       // Currently playing blinker cue index (-1 if none)
+	ledCurves               *led.CurveLibrary  // LED fade/cue metadata for timing
 	initialized             bool
 	handlebarUnlocked       bool        // Track if handlebar has been unlocked in this power cycle
 	handlebarTimer          *time.Timer // Timer for handlebar position window
@@ -71,7 +76,7 @@ type VehicleSystem struct {
 }
 
 func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *VehicleSystem {
-	return &VehicleSystem{
+	vs := &VehicleSystem{
 		state:                   types.StateInit,
 		logger:                  l.WithTag("Vehicle"),
 		io:                      io,
@@ -82,12 +87,19 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		forceStandbyNoLock:      false,
 		brakeHibernationEnabled: true,   // Default to enabled for backward compatibility
 		hornEnableMode:          "true", // Default to always enabled for backward compatibility
-		// lastKeycardTapTime will be zero value (time.IsZero() will be true)
 	}
+	vs.blinkerCueIndex.Store(-1)
+	return vs
 }
 
 func (v *VehicleSystem) Start() error {
 	v.logger.Infof("Starting vehicle system")
+
+	// Load LED curve library for blinker timing
+	v.ledCurves = led.NewCurveLibrary(v.logger)
+	if err := v.ledCurves.Load(); err != nil {
+		v.logger.Warnf("Failed to load LED curves (blinker timing may be imprecise): %v", err)
+	}
 
 	// Set up Redis callbacks
 	v.redis.SetCallbacks(messaging.Callbacks{
@@ -846,7 +858,9 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		return err
 	}
 
-	// Start blinker routine that will update state
+	// Start blinker routine
+	v.blinkerCueIndex.Store(int32(cue))
+	v.blinkerStartNanos.Store(time.Now().UnixNano())
 	v.blinkerStopChan = make(chan struct{})
 	go v.runBlinker(cue, switchState, v.blinkerStopChan)
 
@@ -854,15 +868,11 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 }
 
 func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}) {
-	// Trigger first blink immediately
 	if err := v.io.PlayPwmCue(cue); err != nil {
-		v.logger.Infof("Error playing blinker cue: %v", err)
-	}
-	if err := v.redis.SetBlinkerState(state); err != nil {
-		v.logger.Infof("Error updating blinker state: %v", err)
+		v.logger.Warnf("Error playing blinker cue: %v", err)
 	}
 
-	ticker := time.NewTicker(800 * time.Millisecond)
+	ticker := time.NewTicker(blinkerInterval)
 	defer ticker.Stop()
 
 	for {
@@ -870,11 +880,14 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}
 		case <-stopChan:
 			return
 		case <-ticker.C:
-			if err := v.io.PlayPwmCue(cue); err != nil {
-				v.logger.Infof("Error playing blinker cue: %v", err)
+			// Check stop before playing to avoid post-stop cue replay
+			select {
+			case <-stopChan:
+				return
+			default:
 			}
-			if err := v.redis.SetBlinkerState(state); err != nil {
-				v.logger.Infof("Error updating blinker state: %v", err)
+			if err := v.io.PlayPwmCue(cue); err != nil {
+				v.logger.Warnf("Error playing blinker cue: %v", err)
 			}
 		}
 	}

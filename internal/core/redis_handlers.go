@@ -44,12 +44,32 @@ func (v *VehicleSystem) handleHornRequest(on bool) error {
 func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 	v.logger.Debugf("Handling blinker request: %s", state)
 
-	// Stop any existing blinker routine
+	// 1. FIRST stop the goroutine (prevents new cues from being played)
 	if v.blinkerStopChan != nil {
 		close(v.blinkerStopChan)
 		v.blinkerStopChan = nil
 	}
 
+	// 2. For "off", wait for in-progress fade to reach zero point
+	if state == "off" {
+		startNanos := v.blinkerStartNanos.Load()
+		cueIdx := v.blinkerCueIndex.Load()
+
+		if startNanos > 0 && cueIdx >= 0 && v.ledCurves != nil {
+			totalElapsed := time.Duration(time.Now().UnixNano() - startNanos)
+			cyclePos := totalElapsed % blinkerInterval
+			waitTime := v.ledCurves.WaitForCueZeroOrEnd(int(cueIdx), cyclePos)
+			if waitTime > 0 {
+				v.logger.Debugf("Waiting %v for blinker fade zero point", waitTime)
+				time.Sleep(waitTime)
+			}
+		}
+
+		v.blinkerStartNanos.Store(0)
+		v.blinkerCueIndex.Store(-1)
+	}
+
+	// 3. Determine and play the target cue
 	var cue int
 	switch state {
 	case "off":
@@ -69,11 +89,11 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 	}
 
 	if state != "off" {
-		// Start blinker routine for non-off states
+		v.blinkerCueIndex.Store(int32(cue))
+		v.blinkerStartNanos.Store(time.Now().UnixNano())
 		v.blinkerStopChan = make(chan struct{})
 		go v.runBlinker(cue, state, v.blinkerStopChan)
 	} else {
-		// For off state, play the cue immediately since no goroutine will handle it
 		if err := v.io.PlayPwmCue(cue); err != nil {
 			return err
 		}
