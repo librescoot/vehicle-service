@@ -419,6 +419,12 @@ func (v *VehicleSystem) EnterHibernationAwaitingConfirm(c *librefsm.Context) err
 		v.hibernationForceTimer.Stop()
 	}
 	v.hibernationForceTimer = time.AfterFunc(15*time.Second, func() {
+		// Verify we're still in the awaiting-confirm state before sending event
+		if v.machine.CurrentState() != fsm.StateHibernationAwaitingConfirm {
+			v.logger.Debugf("FSM: Force hibernation timer fired but no longer in awaiting-confirm state")
+			return
+		}
+
 		// Check if brakes are still pressed
 		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 		if err != nil {

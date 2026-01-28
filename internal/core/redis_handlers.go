@@ -45,10 +45,7 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 	v.logger.Debugf("Handling blinker request: %s", state)
 
 	// 1. FIRST stop the goroutine (prevents new cues from being played)
-	if v.blinkerStopChan != nil {
-		close(v.blinkerStopChan)
-		v.blinkerStopChan = nil
-	}
+	v.stopBlinker()
 
 	// 2. For "off", wait for in-progress fade to reach zero point
 	if state == "off" {
@@ -91,8 +88,11 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 	if state != "off" {
 		v.blinkerCueIndex.Store(int32(cue))
 		v.blinkerStartNanos.Store(time.Now().UnixNano())
-		v.blinkerStopChan = make(chan struct{})
-		go v.runBlinker(cue, state, v.blinkerStopChan)
+		stopChan := make(chan struct{})
+		v.mu.Lock()
+		v.blinkerStopChan = stopChan
+		v.mu.Unlock()
+		go v.runBlinker(cue, state, stopChan)
 	} else {
 		if err := v.io.PlayPwmCue(cue); err != nil {
 			return err
@@ -173,9 +173,17 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 			v.dbcUpdateTimer = nil
 		}
 		v.dbcUpdating = true
+		v.dbcUpdateGeneration++
+		gen := v.dbcUpdateGeneration
 
-		// Start safety timeout timer
+		// Start safety timeout timer with generation check
 		v.dbcUpdateTimer = time.AfterFunc(dbcUpdateTimeout, func() {
+			v.mu.RLock()
+			currentGen := v.dbcUpdateGeneration
+			v.mu.RUnlock()
+			if currentGen != gen {
+				return // Stale timer, a newer start-dbc was issued
+			}
 			v.logger.Warnf("DBC update timeout after %v - clearing stuck state", dbcUpdateTimeout)
 			v.handleDbcUpdateTimeout()
 		})

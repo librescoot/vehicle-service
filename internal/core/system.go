@@ -57,8 +57,9 @@ type VehicleSystem struct {
 	blinkerCueIndex         atomic.Int32       // Currently playing blinker cue index (-1 if none)
 	ledCurves               *led.CurveLibrary  // LED fade/cue metadata for timing
 	initialized             bool
-	handlebarUnlocked       bool        // Track if handlebar has been unlocked in this power cycle
-	handlebarTimer          *time.Timer // Timer for handlebar position window
+	handlebarUnlocked       bool          // Track if handlebar has been unlocked in this power cycle
+	handlebarTimer          *time.Timer   // Timer for handlebar position window
+	handlebarDone           chan struct{}  // Done channel for handlebar lock goroutine
 	readyToDriveEntryTime   time.Time   // Track when we entered ready-to-drive state for park debounce
 	keycardTapCount         int
 	lastKeycardTapTime      time.Time
@@ -67,6 +68,7 @@ type VehicleSystem struct {
 	shutdownFromParked      bool              // Track if shutdown was initiated from parked state
 	dbcUpdating             bool              // Track if DBC update is in progress
 	dbcUpdateTimer          *time.Timer       // Timer for DBC update timeout (45 minutes max)
+	dbcUpdateGeneration     uint64            // Generation counter to invalidate stale timer callbacks
 	deferredDashboardPower  *bool             // Deferred dashboard power state (nil = no change needed)
 	brakeHibernationEnabled bool              // Track if brake lever hibernation is enabled (default: true)
 	autoStandbySeconds      int               // Auto-standby timeout in seconds (0 = disabled)
@@ -792,12 +794,19 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 	return nil
 }
 
-func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
-	// Stop any existing blinker routine
+// stopBlinker safely stops any running blinker goroutine under mutex protection
+func (v *VehicleSystem) stopBlinker() {
+	v.mu.Lock()
 	if v.blinkerStopChan != nil {
 		close(v.blinkerStopChan)
 		v.blinkerStopChan = nil
 	}
+	v.mu.Unlock()
+}
+
+func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
+	// Stop any existing blinker routine
+	v.stopBlinker()
 
 	// Update Redis switch state first
 	var switchState string
@@ -861,8 +870,11 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	// Start blinker routine
 	v.blinkerCueIndex.Store(int32(cue))
 	v.blinkerStartNanos.Store(time.Now().UnixNano())
-	v.blinkerStopChan = make(chan struct{})
-	go v.runBlinker(cue, switchState, v.blinkerStopChan)
+	stopChan := make(chan struct{})
+	v.mu.Lock()
+	v.blinkerStopChan = stopChan
+	v.mu.Unlock()
+	go v.runBlinker(cue, switchState, stopChan)
 
 	return nil
 }
@@ -1054,16 +1066,10 @@ func (v *VehicleSystem) publishState() error {
 
 func (v *VehicleSystem) Shutdown() {
 	// Stop blinker if running
-	if v.blinkerStopChan != nil {
-		close(v.blinkerStopChan)
-		v.blinkerStopChan = nil
-	}
+	v.stopBlinker()
 
-	// Stop any running timers
-	if v.handlebarTimer != nil {
-		v.handlebarTimer.Stop()
-		v.handlebarTimer = nil
-	}
+	// Stop any running handlebar lock goroutine
+	v.cancelHandlebarLock()
 
 	if v.dbcUpdateTimer != nil {
 		v.dbcUpdateTimer.Stop()

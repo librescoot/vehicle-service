@@ -9,17 +9,27 @@ import (
 	"vehicle-service/internal/types"
 )
 
-// unlockHandlebarIfNeeded checks if the handlebar needs unlocking and unlocks it
-// Also cancels any ongoing handlebar locking attempt
-func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
-	// Cancel any ongoing handlebar locking attempt when returning to active state
+// cancelHandlebarLock cancels any ongoing handlebar locking attempt
+func (v *VehicleSystem) cancelHandlebarLock() {
+	v.mu.Lock()
 	if v.handlebarTimer != nil {
 		v.logger.Infof("Cancelling handlebar locking timer")
 		v.handlebarTimer.Stop()
 		v.handlebarTimer = nil
-		// Restore original handlebar position callback
-		v.io.RegisterInputCallback("handlebar_position", v.handleHandlebarPosition)
 	}
+	if v.handlebarDone != nil {
+		close(v.handlebarDone)
+		v.handlebarDone = nil
+	}
+	v.mu.Unlock()
+	// Restore original handlebar position callback
+	v.io.RegisterInputCallback("handlebar_position", v.handleHandlebarPosition)
+}
+
+// unlockHandlebarIfNeeded checks if the handlebar needs unlocking and unlocks it
+// Also cancels any ongoing handlebar locking attempt
+func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
+	v.cancelHandlebarLock()
 
 	// Check if handlebar needs to be unlocked
 	handlebarPos, err := v.io.ReadDigitalInput("handlebar_position")
@@ -62,15 +72,25 @@ func (v *VehicleSystem) lockHandlebar() {
 			return
 		}
 
-		// Start 10 second timer for handlebar position
+		// Create done channel and timer under mutex
+		done := make(chan struct{})
+		v.mu.Lock()
 		if v.handlebarTimer != nil {
 			v.handlebarTimer.Stop()
 		}
 		v.handlebarTimer = time.NewTimer(handlebarLockWindow)
+		if v.handlebarDone != nil {
+			close(v.handlebarDone)
+		}
+		v.handlebarDone = done
+		v.mu.Unlock()
 
 		// Create a cleanup function to restore the original callback
 		cleanup := func() {
+			v.mu.Lock()
 			v.handlebarTimer = nil
+			v.handlebarDone = nil
+			v.mu.Unlock()
 			// Re-register the original handlebar position callback
 			v.io.RegisterInputCallback("handlebar_position", v.handleHandlebarPosition)
 			v.logger.Debugf("Restored original handlebar position callback")
@@ -83,13 +103,16 @@ func (v *VehicleSystem) lockHandlebar() {
 			}
 
 			// Check if we're still in the window
-			if v.handlebarTimer == nil {
+			v.mu.RLock()
+			timer := v.handlebarTimer
+			v.mu.RUnlock()
+			if timer == nil {
 				v.logger.Debugf("Lock window has expired")
 				return nil
 			}
 
 			// Stop the timer
-			v.handlebarTimer.Stop()
+			timer.Stop()
 
 			// Lock the handlebar
 			if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
@@ -112,10 +135,17 @@ func (v *VehicleSystem) lockHandlebar() {
 
 		v.logger.Debugf("Started 10 second window for handlebar lock")
 
-		// Wait for timer expiration
-		<-v.handlebarTimer.C
-		cleanup()
-		v.logger.Debugf("Handlebar lock window expired")
+		// Wait for timer expiration or cancellation
+		v.mu.RLock()
+		timerC := v.handlebarTimer.C
+		v.mu.RUnlock()
+		select {
+		case <-timerC:
+			cleanup()
+			v.logger.Debugf("Handlebar lock window expired")
+		case <-done:
+			v.logger.Debugf("Handlebar lock window cancelled")
+		}
 	}()
 }
 
