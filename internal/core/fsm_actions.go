@@ -583,11 +583,8 @@ func (v *VehicleSystem) OnSeatboxButton(c *librefsm.Context) error {
 		v.logger.Warnf("Failed to publish seatbox opened event: %v", err)
 	}
 
-	// 2. Open physical seatbox lock
-	if err := v.openSeatboxLock(); err != nil {
-		v.logger.Errorf("Failed to open seatbox lock: %v", err)
-		return err
-	}
+	// 2. Open physical seatbox lock (async, fire-and-forget)
+	v.openSeatboxLock()
 
 	return nil
 }

@@ -19,7 +19,7 @@ func (v *VehicleSystem) handleSeatboxRequest(on bool) error {
 		if err := v.redis.PublishSeatboxOpened(); err != nil {
 			v.logger.Warnf("Failed to publish seatbox opened event: %v", err)
 		}
-		return v.openSeatboxLock()
+		v.openSeatboxLock()
 	}
 	return nil
 }

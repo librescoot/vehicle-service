@@ -38,10 +38,7 @@ func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
 		return err
 	}
 	if handlebarPos && !v.handlebarUnlocked {
-		if err := v.unlockHandlebar(); err != nil {
-			v.logger.Infof("Failed to unlock handlebar: %v", err)
-			return err
-		}
+		v.unlockHandlebar()
 	}
 	return nil
 }
@@ -149,14 +146,15 @@ func (v *VehicleSystem) lockHandlebar() {
 	}()
 }
 
-// unlockHandlebar pulses the handlebar lock open output
-func (v *VehicleSystem) unlockHandlebar() error {
-	if err := v.pulseOutput("handlebar_lock_open", handlebarLockDuration); err != nil {
-		return fmt.Errorf("failed to unlock handlebar: %w", err)
-	}
-	v.handlebarUnlocked = true
-	v.logger.Infof("Handlebar unlocked")
-	return nil
+// unlockHandlebar pulses the handlebar lock open output asynchronously.
+// The handlebarUnlocked flag is set reactively by the lock sensor callback.
+func (v *VehicleSystem) unlockHandlebar() {
+	go func() {
+		if err := v.pulseOutput("handlebar_lock_open", handlebarLockDuration); err != nil {
+			v.logger.Errorf("Failed to unlock handlebar: %v", err)
+		}
+	}()
+	v.logger.Infof("Handlebar unlock initiated")
 }
 
 // handleHandlebarPosition is the callback for handlebar position sensor changes
@@ -177,7 +175,7 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 
 	// Only unlock if we haven't unlocked yet in this power cycle
 	if !unlocked && (state == types.StateParked || state == types.StateReadyToDrive) {
-		return v.unlockHandlebar()
+		v.unlockHandlebar()
 	}
 
 	return nil

@@ -790,6 +790,10 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		if err := v.redis.SetHandlebarLockState(isLocked); err != nil {
 			return err
 		}
+		// Track unlock state from sensor (source of truth for handlebarUnlocked flag)
+		v.mu.Lock()
+		v.handlebarUnlocked = value // sensor true = unlocked
+		v.mu.Unlock()
 	}
 	return nil
 }
@@ -1047,12 +1051,14 @@ func (v *VehicleSystem) playLedCue(cue int, description string) {
 	}
 }
 
-func (v *VehicleSystem) openSeatboxLock() error {
-	if err := v.pulseOutput("seatbox_lock", seatboxLockDuration); err != nil {
-		return err
-	}
-	v.logger.Infof("Seatbox lock toggled for 0.2s")
-	return nil
+func (v *VehicleSystem) openSeatboxLock() {
+	go func() {
+		if err := v.pulseOutput("seatbox_lock", seatboxLockDuration); err != nil {
+			v.logger.Errorf("Failed to toggle seatbox lock: %v", err)
+			return
+		}
+		v.logger.Infof("Seatbox lock toggled for 0.2s")
+	}()
 }
 
 func (v *VehicleSystem) publishState() error {
