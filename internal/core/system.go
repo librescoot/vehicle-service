@@ -876,7 +876,8 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	v.mu.Unlock()
 	go v.runBlinker(cue, switchState, stopChan)
 
-	return nil
+	// Update blinker state in Redis so DBC/scootui can display it
+	return v.redis.SetBlinkerState(switchState)
 }
 
 func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}) {
