@@ -206,14 +206,13 @@ func (v *VehicleSystem) Start() error {
 
 	// Check if DBC update is in progress and restore dbcUpdating flag
 	// First check the explicit vehicle:dbc-updating flag
+	restoreDbcUpdate := false
 	dbcUpdating, err := v.redis.GetDbcUpdating()
 	if err != nil {
 		v.logger.Warnf("Failed to get DBC updating flag on startup: %v", err)
 	} else if dbcUpdating {
 		v.logger.Infof("DBC updating flag set on startup, restoring dbcUpdating flag")
-		v.mu.Lock()
-		v.dbcUpdating = true
-		v.mu.Unlock()
+		restoreDbcUpdate = true
 	}
 
 	// Also check OTA status as a fallback/secondary check
@@ -222,15 +221,34 @@ func (v *VehicleSystem) Start() error {
 		v.logger.Warnf("Failed to get DBC OTA status on startup: %v", err)
 	} else if dbcStatus == "downloading" || dbcStatus == "installing" || dbcStatus == "rebooting" {
 		v.logger.Infof("DBC update in progress on startup (status=%s), restoring dbcUpdating flag", dbcStatus)
-		v.mu.Lock()
-		if !v.dbcUpdating {
-			v.dbcUpdating = true
+		if !restoreDbcUpdate {
 			// Sync the Redis flag if it wasn't already set
 			if err := v.redis.SetDbcUpdating(true); err != nil {
 				v.logger.Warnf("Failed to sync DBC updating flag to Redis: %v", err)
 			}
 		}
+		restoreDbcUpdate = true
+	}
+
+	if restoreDbcUpdate {
+		v.mu.Lock()
+		v.dbcUpdating = true
+		v.dbcUpdateGeneration++
+		gen := v.dbcUpdateGeneration
+
+		// Start safety timeout timer (same as start-dbc handler)
+		v.dbcUpdateTimer = time.AfterFunc(dbcUpdateTimeout, func() {
+			v.mu.RLock()
+			currentGen := v.dbcUpdateGeneration
+			v.mu.RUnlock()
+			if currentGen != gen {
+				return
+			}
+			v.logger.Warnf("DBC update timeout after %v - clearing stuck state (restored on startup)", dbcUpdateTimeout)
+			v.handleDbcUpdateTimeout()
+		})
 		v.mu.Unlock()
+		v.logger.Infof("DBC update timeout set to %v (restored on startup)", dbcUpdateTimeout)
 	}
 
 	// Read dashboard power from Redis BEFORE hardware initialization

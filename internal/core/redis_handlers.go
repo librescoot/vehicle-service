@@ -250,6 +250,15 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 
 	case "cycle-dashboard-power":
 		// Cycle dashboard power to reboot the DBC
+		v.mu.RLock()
+		dbcUpdating := v.dbcUpdating
+		v.mu.RUnlock()
+
+		if dbcUpdating {
+			v.logger.Warnf("Rejecting cycle-dashboard-power - DBC update in progress")
+			return fmt.Errorf("DBC update in progress, cannot cycle dashboard power")
+		}
+
 		v.logger.Infof("Cycling dashboard power to reboot DBC")
 
 		// Turn off dashboard power
