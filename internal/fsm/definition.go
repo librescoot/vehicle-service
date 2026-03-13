@@ -152,6 +152,10 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		).
 
 		// Hibernation flow - all events are physical inputs
+		// Manual ready-to-drive: seatbox button with kickstand up cancels hibernation and enters RTD
+		Transition(StateHibernationInitialHold, EvSeatboxButton, StateReadyToDrive,
+			librefsm.WithGuards(actions.IsKickstandUp, actions.AreBrakesPressed),
+		).
 		// Initial hold -> either advance (timeout) or cancel (brakes released)
 		Transition(StateHibernationInitialHold, EvHibernationInitialTimeout, StateHibernationAwaitingConfirm).
 		Transition(StateHibernationInitialHold, EvBrakesReleased, StateParked).
