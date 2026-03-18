@@ -9,7 +9,7 @@ import (
 // Timing constants
 const (
 	InitTimeout               = 2 * time.Second
-	ShutdownTimeout           = 5 * time.Second
+	ShutdownTimeout           = 10 * time.Second
 	WaitingSeatboxTimeout     = 30 * time.Second
 	HibernationInitialTimeout = 15 * time.Second
 	HibernationConfirmTimeout = 30 * time.Second
