@@ -372,6 +372,20 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 	// Note: The shutdown timer is handled by librefsm WithTimeout
 	v.logger.Infof("Shutdown timer started via librefsm (4.0s)")
 
+	// Ask DBC to shut down cleanly via Redis PUBSUB.
+	// dbc-dispatcher on the DBC executes the poweroff.
+	// GPIO cut in EnterStandby (10s later) is the hard backstop.
+	v.mu.RLock()
+	updating := v.dbcUpdating
+	v.mu.RUnlock()
+	if !updating {
+		if err := v.redis.PublishMessage("dbc:command", "poweroff"); err != nil {
+			v.logger.Warnf("Failed to send DBC poweroff: %v", err)
+		}
+	} else {
+		v.logger.Infof("Skipping DBC poweroff — DBC update in progress")
+	}
+
 	return nil
 }
 
