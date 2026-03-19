@@ -631,6 +631,17 @@ func (r *RedisClient) SendCommand(channel, command string) error {
 	return nil
 }
 
+// PublishMessage publishes a message to a Redis PUBSUB channel
+func (r *RedisClient) PublishMessage(channel, message string) error {
+	_, err := r.client.Publish(channel, message)
+	if err != nil {
+		r.logger.Infof("Failed to publish '%s' to channel '%s': %v", message, channel, err)
+		return err
+	}
+	r.logger.Infof("Published '%s' to channel '%s'", message, channel)
+	return nil
+}
+
 // ReportFaultPresent reports a fault as present to Redis
 func (r *RedisClient) ReportFaultPresent(code int, description string, timestamp int64, info string) error {
 	r.logger.Infof("Reporting fault present: code=%d, description=%s", code, description)

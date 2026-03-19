@@ -67,6 +67,7 @@ func (m *mockMessagingClient) SendCommand(channel, command string) error {
 	m.sendCommands = append(m.sendCommands, struct{ channel, command string }{channel, command})
 	return nil
 }
+func (m *mockMessagingClient) PublishMessage(channel, message string) error { return nil }
 
 func (m *mockMessagingClient) PublishVehicleState(state types.SystemState) error {
 	m.publishedStates = append(m.publishedStates, state)

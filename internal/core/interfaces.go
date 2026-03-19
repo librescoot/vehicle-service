@@ -54,6 +54,7 @@ type MessagingClient interface {
 
 	// Commands
 	SendCommand(channel, command string) error
+	PublishMessage(channel, message string) error
 }
 
 // HardwareIO defines the interface for hardware I/O operations needed by VehicleSystem
