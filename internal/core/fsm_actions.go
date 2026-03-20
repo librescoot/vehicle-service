@@ -364,10 +364,8 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 	}
 
 	// Start handlebar locking immediately
-	if prevState == types.StateParked {
-		v.logger.Debugf("Starting handlebar locking during shutdown (from parked state)")
-		v.lockHandlebar()
-	}
+	v.logger.Debugf("Starting handlebar locking during shutdown")
+	v.lockHandlebar()
 
 	// Note: The shutdown timer is handled by librefsm WithTimeout
 	v.logger.Infof("Shutdown timer started via librefsm (4.0s)")
