@@ -733,21 +733,6 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		}
 
 	case "brake_right", "brake_left":
-		if value {
-			// Reset auto-standby timer on brake press
-			v.resetAutoStandbyTimer()
-
-			// Play brake on cue
-			if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
-				return err
-			}
-		} else {
-			// Play brake off cue
-			if err := v.io.PlayPwmCue(5); err != nil { // LED_BRAKE_ON_TO_BRAKE_OFF
-				return err
-			}
-		}
-
 		// Control engine brake based on state
 		v.mu.RLock()
 		currentState := v.state
@@ -761,6 +746,23 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		brakeRight, err := v.io.ReadDigitalInput("brake_right")
 		if err != nil {
 			return fmt.Errorf("failed to read brake_right: %w", err)
+		}
+
+		eitherBrakePressed := brakeLeft || brakeRight
+
+		if eitherBrakePressed {
+			// Reset auto-standby timer on brake press
+			v.resetAutoStandbyTimer()
+
+			// Play brake on cue
+			if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
+				return err
+			}
+		} else {
+			// Play brake off cue only when BOTH brakes are released
+			if err := v.io.PlayPwmCue(5); err != nil { // LED_BRAKE_ON_TO_BRAKE_OFF
+				return err
+			}
 		}
 
 		// Engine brake logic:
