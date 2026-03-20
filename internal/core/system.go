@@ -751,15 +751,22 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		eitherBrakePressed := brakeLeft || brakeRight
 
 		if eitherBrakePressed {
-			// Reset auto-standby timer on brake press
 			v.resetAutoStandbyTimer()
+		}
 
-			// Play brake on cue
-			if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
-				return err
+		if value {
+			// A brake was just pressed — only play on-cue if the other wasn't already held
+			otherHeld := brakeLeft
+			if channel == "brake_left" {
+				otherHeld = brakeRight
 			}
-		} else {
-			// Play brake off cue only when BOTH brakes are released
+			if !otherHeld {
+				if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
+					return err
+				}
+			}
+		} else if !eitherBrakePressed {
+			// Last brake released
 			if err := v.io.PlayPwmCue(5); err != nil { // LED_BRAKE_ON_TO_BRAKE_OFF
 				return err
 			}
