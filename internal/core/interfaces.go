@@ -35,8 +35,6 @@ type MessagingClient interface {
 	// Auto-standby
 	PublishAutoStandbyDeadline(deadline time.Time) error
 	ClearAutoStandbyDeadline() error
-	PublishStandbyTimerStart() error
-	ClearStandbyTimerStart() error
 
 	// Sensors and switches
 	SetBrakeState(side string, pressed bool) error

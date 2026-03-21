@@ -98,9 +98,6 @@ func (v *VehicleSystem) initFSM(ctx context.Context) error {
 			if err := v.redis.SendCommand("scooter:governor", "ondemand"); err != nil {
 				v.logger.Warnf("Warning: Failed to request CPU governor change to ondemand: %v", err)
 			}
-			if err := v.redis.ClearStandbyTimerStart(); err != nil {
-				v.logger.Warnf("Warning: Failed to clear standby timer start: %v", err)
-			}
 		}
 
 		v.logger.Infof("State transition: %s -> %s", oldState, newState)
@@ -284,12 +281,6 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 		v.forceStandbyNoLock = false
 	}
 	v.mu.Unlock()
-
-	// Track standby entry time for MDB reboot timer
-	v.logger.Debugf("Setting standby timer start for MDB reboot coordination")
-	if err := v.redis.PublishStandbyTimerStart(); err != nil {
-		v.logger.Warnf("Warning: Failed to set standby timer start: %v", err)
-	}
 
 	prevState := stateIDToSystemState(c.FromState)
 	isFromParked := (prevState == types.StateParked)
