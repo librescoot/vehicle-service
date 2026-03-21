@@ -606,6 +606,15 @@ func (r *RedisClient) PublishStandbyTimerStart() error {
 	return nil
 }
 
+// ClearStandbyTimerStart removes the standby timer start timestamp when exiting stand-by
+func (r *RedisClient) ClearStandbyTimerStart() error {
+	if err := r.otaPub.Set("standby-timer-start", "0"); err != nil {
+		r.logger.Infof("Failed to clear standby timer start: %v", err)
+		return err
+	}
+	return nil
+}
+
 // GetOtaStatus gets the OTA status for a specific component from Redis
 func (r *RedisClient) GetOtaStatus(component string) (string, error) {
 	statusKey := fmt.Sprintf("status:%s", component)

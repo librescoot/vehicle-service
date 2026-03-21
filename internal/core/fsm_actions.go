@@ -98,6 +98,9 @@ func (v *VehicleSystem) initFSM(ctx context.Context) error {
 			if err := v.redis.SendCommand("scooter:governor", "ondemand"); err != nil {
 				v.logger.Warnf("Warning: Failed to request CPU governor change to ondemand: %v", err)
 			}
+			if err := v.redis.ClearStandbyTimerStart(); err != nil {
+				v.logger.Warnf("Warning: Failed to clear standby timer start: %v", err)
+			}
 		}
 
 		v.logger.Infof("State transition: %s -> %s", oldState, newState)
