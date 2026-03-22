@@ -60,7 +60,8 @@ type VehicleSystem struct {
 	handlebarUnlocked       bool          // Track if handlebar has been unlocked in this power cycle
 	handlebarTimer          *time.Timer   // Timer for handlebar position window
 	handlebarDone           chan struct{}  // Done channel for handlebar lock goroutine
-	readyToDriveEntryTime   time.Time   // Track when we entered ready-to-drive state for park debounce
+	readyToDriveEntryTime   time.Time    // Track when we entered ready-to-drive state for park debounce
+	kickstandDebounceTimer  *time.Timer  // Deferred kickstand-down check after debounce window
 	keycardTapCount         int
 	lastKeycardTapTime      time.Time
 	forceStandbyNoLock      bool
@@ -696,22 +697,46 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			}
 		}
 
-		// Debounce protection for kickstand down from ready-to-drive
-		if value && currentState == types.StateReadyToDrive {
+		// Cancel any pending deferred kickstand-down check
+		v.mu.Lock()
+		if v.kickstandDebounceTimer != nil {
+			v.kickstandDebounceTimer.Stop()
+			v.kickstandDebounceTimer = nil
+		}
+		v.mu.Unlock()
+
+		// Send FSM event - FSM handles all transitions based on current state
+		if value {
+			// Debounce protection for kickstand down from ready-to-drive:
+			// defer the event instead of dropping it, so quick flips are never lost
 			v.mu.RLock()
 			entryTime := v.readyToDriveEntryTime
 			v.mu.RUnlock()
 
-			if time.Since(entryTime) < parkDebounceTime {
-				v.logger.Infof("Kickstand down ignored - debounce protection")
-				return nil
+			remaining := parkDebounceTime - time.Since(entryTime)
+			if currentState == types.StateReadyToDrive && remaining > 0 {
+				v.logger.Infof("Kickstand down deferred by %v for debounce", remaining)
+				v.mu.Lock()
+				v.kickstandDebounceTimer = time.AfterFunc(remaining, func() {
+					// Re-read the actual GPIO state — if kickstand was flipped
+					// back up in the meantime we should not send EvKickstandDown
+					kickstandDown, err := v.io.ReadDigitalInput("kickstand")
+					if err != nil {
+						v.logger.Warnf("Failed to read kickstand after debounce: %v", err)
+						return
+					}
+					if kickstandDown {
+						v.logger.Infof("Sending deferred EvKickstandDown")
+						v.machine.Send(librefsm.Event{ID: fsm.EvKickstandDown})
+					} else {
+						v.logger.Infof("Deferred kickstand-down cancelled - kickstand is back up")
+					}
+				})
+				v.mu.Unlock()
+			} else {
+				v.logger.Infof("Sending EvKickstandDown")
+				v.machine.Send(librefsm.Event{ID: fsm.EvKickstandDown})
 			}
-		}
-
-		// Send FSM event - FSM handles all transitions based on current state
-		if value {
-			v.logger.Infof("Sending EvKickstandDown")
-			v.machine.Send(librefsm.Event{ID: fsm.EvKickstandDown})
 		} else {
 			v.logger.Infof("Sending EvKickstandUp")
 			v.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})

@@ -769,6 +769,106 @@ func TestEnterStandby_FromShuttingDown(t *testing.T) {
 	}
 }
 
+func TestKickstandDown_DeferredDuringDebounce(t *testing.T) {
+	// When kickstand goes down within the debounce window after entering
+	// ready-to-drive, the event should be deferred (not dropped). After the
+	// debounce window expires, the GPIO state is re-read and if the kickstand
+	// is still down the transition to Parked should fire.
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = false // up
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("Failed to set initial state: %v", err)
+	}
+	system.initialized = true
+	system.dashboardReady = true
+
+	// Transition to ReadyToDrive via kickstand up
+	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Fatalf("Expected ReadyToDrive, got %v", system.getCurrentState())
+	}
+
+	// Immediately put kickstand down (within debounce window)
+	mockIO.digitalInputs["kickstand"] = true // down
+	if err := system.handleInputChange("kickstand", true); err != nil {
+		t.Fatalf("handleInputChange failed: %v", err)
+	}
+
+	// Should still be in ReadyToDrive (debounce deferred the event)
+	time.Sleep(50 * time.Millisecond)
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Errorf("Expected ReadyToDrive during debounce, got %v", system.getCurrentState())
+	}
+
+	// Wait for debounce window to expire (parkDebounceTime = 1s)
+	time.Sleep(1100 * time.Millisecond)
+
+	// Now should have transitioned to Parked via the deferred event
+	if system.getCurrentState() != types.StateParked {
+		t.Errorf("Expected Parked after deferred kickstand-down, got %v", system.getCurrentState())
+	}
+}
+
+func TestKickstandDown_DeferredCancelledByKickstandUp(t *testing.T) {
+	// When kickstand goes down within the debounce window but is then
+	// lifted back up before the window expires, the deferred event should
+	// be cancelled (GPIO re-read shows kickstand is up).
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = false // up
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("Failed to set initial state: %v", err)
+	}
+	system.initialized = true
+	system.dashboardReady = true
+
+	// Transition to ReadyToDrive
+	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Fatalf("Expected ReadyToDrive, got %v", system.getCurrentState())
+	}
+
+	// Kickstand down within debounce window
+	mockIO.digitalInputs["kickstand"] = true
+	if err := system.handleInputChange("kickstand", true); err != nil {
+		t.Fatalf("handleInputChange (down) failed: %v", err)
+	}
+
+	// Kickstand back up before debounce expires — this cancels the deferred timer
+	// and sends EvKickstandUp immediately (no-op since already in RTD)
+	mockIO.digitalInputs["kickstand"] = false
+	if err := system.handleInputChange("kickstand", false); err != nil {
+		t.Fatalf("handleInputChange (up) failed: %v", err)
+	}
+
+	// Wait for the original debounce window to pass
+	time.Sleep(1200 * time.Millisecond)
+
+	// Should still be in ReadyToDrive — the deferred event was cancelled
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Errorf("Expected ReadyToDrive (deferred cancelled), got %v", system.getCurrentState())
+	}
+}
+
 func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
