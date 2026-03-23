@@ -329,12 +329,23 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 				}
 			}
 
+			// Ask DBC to shut down cleanly before cutting power.
+			// dbc-dispatcher listens on dbc:command and runs poweroff.
+			if !force {
+				if err := v.redis.PublishMessage("dbc:command", "poweroff"); err != nil {
+					v.logger.Warnf("Failed to send DBC poweroff command: %v", err)
+				} else {
+					v.logger.Infof("Sent DBC poweroff, waiting 4s for clean shutdown")
+					time.Sleep(4 * time.Second)
+				}
+			}
+
 			if err := v.setPower("dashboard_power", false); err != nil {
 				v.logger.Errorf("%v", err)
 				return err
 			}
 			if force {
-				v.logger.Infof("Dashboard power disabled (forced)")
+				v.logger.Infof("Dashboard power disabled (forced, no graceful shutdown)")
 			} else {
 				v.logger.Infof("Dashboard power disabled")
 			}
