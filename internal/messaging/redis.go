@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -693,6 +694,68 @@ func (r *RedisClient) GetHashField(hash, field string) (string, error) {
 		return "", nil
 	}
 	return value, nil
+}
+
+const (
+	inhibitHashKey = "power:inhibits"
+	inhibitChannel = "power:inhibits"
+)
+
+// inhibitData matches the JSON schema that pm-service reads from the power:inhibits hash
+type inhibitData struct {
+	ID       string `json:"id"`
+	Who      string `json:"who"`
+	What     string `json:"what"`
+	Why      string `json:"why"`
+	Type     string `json:"type"`
+	Duration int64  `json:"duration"`
+	Created  int64  `json:"created"`
+}
+
+// SetInhibitor writes a power inhibitor to the power:inhibits Redis hash and notifies pm-service
+func (r *RedisClient) SetInhibitor(id, inhibitType, why string) error {
+	r.logger.Infof("Setting power inhibitor: id=%s, type=%s", id, inhibitType)
+
+	data := inhibitData{
+		ID:       id,
+		Who:      "vehicle-service",
+		What:     "power-state-change",
+		Why:      why,
+		Type:     inhibitType,
+		Duration: 0,
+		Created:  time.Now().Unix(),
+	}
+
+	jsonBytes, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal inhibitor data: %w", err)
+	}
+
+	if err := r.client.HSet(inhibitHashKey, id, string(jsonBytes)); err != nil {
+		return fmt.Errorf("failed to set inhibitor in Redis: %w", err)
+	}
+
+	if _, err := r.client.Publish(inhibitChannel, fmt.Sprintf("add:%s", id)); err != nil {
+		r.logger.Warnf("Failed to publish inhibitor add notification: %v", err)
+	}
+
+	return nil
+}
+
+// RemoveInhibitor removes a power inhibitor from the power:inhibits Redis hash and notifies pm-service
+func (r *RedisClient) RemoveInhibitor(id string) error {
+	r.logger.Infof("Removing power inhibitor: id=%s", id)
+
+	raw := r.client.Raw()
+	if err := raw.HDel(context.Background(), inhibitHashKey, id).Err(); err != nil {
+		return fmt.Errorf("failed to remove inhibitor from Redis: %w", err)
+	}
+
+	if _, err := r.client.Publish(inhibitChannel, fmt.Sprintf("remove:%s", id)); err != nil {
+		r.logger.Warnf("Failed to publish inhibitor remove notification: %v", err)
+	}
+
+	return nil
 }
 
 func (r *RedisClient) Close() error {

@@ -220,7 +220,7 @@ func (v *VehicleSystem) Start() error {
 	dbcStatus, err := v.redis.GetOtaStatus("dbc")
 	if err != nil {
 		v.logger.Warnf("Failed to get DBC OTA status on startup: %v", err)
-	} else if dbcStatus == "downloading" || dbcStatus == "installing" || dbcStatus == "rebooting" {
+	} else if dbcStatus == "downloading" || dbcStatus == "preparing" || dbcStatus == "installing" || dbcStatus == "pending-reboot" {
 		v.logger.Infof("DBC update in progress on startup (status=%s), restoring dbcUpdating flag", dbcStatus)
 		if !restoreDbcUpdate {
 			// Sync the Redis flag if it wasn't already set
@@ -250,6 +250,16 @@ func (v *VehicleSystem) Start() error {
 		})
 		v.mu.Unlock()
 		v.logger.Infof("DBC update timeout set to %v (restored on startup)", dbcUpdateTimeout)
+
+		// Re-set suspend-only inhibitor so pm-service keeps MDB awake during DBC update
+		if err := v.redis.SetInhibitor("dbc-update", "suspend-only", "DBC update in progress (restored on startup)"); err != nil {
+			v.logger.Warnf("Failed to set DBC update inhibitor on startup: %v", err)
+		}
+	} else {
+		// Not restoring DBC update, clean up any stale inhibitor from a previous run
+		if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
+			v.logger.Warnf("Failed to remove stale DBC update inhibitor on startup: %v", err)
+		}
 	}
 
 	// Read dashboard power from Redis BEFORE hardware initialization
