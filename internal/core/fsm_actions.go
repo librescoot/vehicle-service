@@ -367,15 +367,31 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 	// Ask DBC to shut down cleanly via Redis PUBSUB.
 	// dbc-dispatcher on the DBC executes the poweroff.
 	// GPIO cut in EnterStandby (10s later) is the hard backstop.
+	//
+	// If a DBC update is in progress, skip the poweroff so the DBC can keep
+	// updating during standby. But if hibernation was requested, the MDB is
+	// about to power off and the DBC will lose power anyway, so shut it down
+	// cleanly instead of deferring.
 	v.mu.RLock()
 	updating := v.dbcUpdating
+	hibernating := v.hibernationRequest
 	v.mu.RUnlock()
-	if !updating {
+	if !updating || hibernating {
+		if updating && hibernating {
+			v.logger.Infof("Hibernate requested, forcing DBC shutdown despite active update")
+			v.mu.Lock()
+			v.dbcUpdating = false
+			v.deferredDashboardPower = nil
+			v.mu.Unlock()
+			if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
+				v.logger.Warnf("Failed to remove DBC update inhibitor: %v", err)
+			}
+		}
 		if err := v.redis.PublishMessage("dbc:command", "poweroff"); err != nil {
 			v.logger.Warnf("Failed to send DBC poweroff: %v", err)
 		}
 	} else {
-		v.logger.Infof("Skipping DBC poweroff — DBC update in progress")
+		v.logger.Infof("Skipping DBC poweroff, update in progress")
 	}
 
 	return nil
