@@ -54,6 +54,8 @@ func (m *mockMessagingClient) DeleteDashboardReadyFlag() error                { 
 func (m *mockMessagingClient) GetDbcUpdating() (bool, error)                  { return m.dbcUpdating, nil }
 func (m *mockMessagingClient) SetDbcUpdating(updating bool) error             { m.dbcUpdating = updating; return nil }
 func (m *mockMessagingClient) GetOtaStatus(component string) (string, error)  { return m.otaStatus, nil }
+func (m *mockMessagingClient) SetInhibitor(id, inhibitType, why string) error { return nil }
+func (m *mockMessagingClient) RemoveInhibitor(id string) error                { return nil }
 func (m *mockMessagingClient) GetHashField(hash, field string) (string, error) { return m.hashFieldValue, nil }
 func (m *mockMessagingClient) PublishAutoStandbyDeadline(deadline time.Time) error { return nil }
 func (m *mockMessagingClient) ClearAutoStandbyDeadline() error                { return nil }

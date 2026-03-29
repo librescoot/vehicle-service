@@ -196,6 +196,11 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 			v.logger.Warnf("Failed to persist DBC updating state to Redis: %v", err)
 		}
 
+		// Keep MDB awake during standby while DBC is updating
+		if err := v.redis.SetInhibitor("dbc-update", "suspend-only", "DBC update in progress"); err != nil {
+			v.logger.Warnf("Failed to set DBC update inhibitor: %v", err)
+		}
+
 		// Ensure dashboard is powered on
 		if err := v.setPower("dashboard_power", true); err != nil {
 			v.logger.Errorf("%v for DBC update", err)
@@ -220,6 +225,11 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		// Persist to Redis
 		if err := v.redis.SetDbcUpdating(false); err != nil {
 			v.logger.Warnf("Failed to persist DBC updating state to Redis: %v", err)
+		}
+
+		// Remove suspend-only inhibitor now that DBC update is done
+		if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
+			v.logger.Warnf("Failed to remove DBC update inhibitor: %v", err)
 		}
 
 		// Handle deferred power-on request
@@ -510,6 +520,11 @@ func (v *VehicleSystem) handleDbcUpdateTimeout() {
 	// Persist to Redis
 	if err := v.redis.SetDbcUpdating(false); err != nil {
 		v.logger.Warnf("Failed to persist DBC updating state to Redis after timeout: %v", err)
+	}
+
+	// Remove suspend-only inhibitor on timeout
+	if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
+		v.logger.Warnf("Failed to remove DBC update inhibitor after timeout: %v", err)
 	}
 
 	// Apply deferred power state or default behavior (same logic as complete-dbc)

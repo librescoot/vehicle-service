@@ -29,6 +29,10 @@ type MessagingClient interface {
 	SetDbcUpdating(updating bool) error
 	GetOtaStatus(component string) (string, error)
 
+	// Power inhibitors
+	SetInhibitor(id, inhibitType, why string) error
+	RemoveInhibitor(id string) error
+
 	// Settings
 	GetHashField(hash, field string) (string, error)
 
