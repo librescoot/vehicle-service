@@ -219,8 +219,9 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.dbcUpdating = false
 		deferredPower := v.deferredDashboardPower
 		v.deferredDashboardPower = nil
-		currentState := v.state
 		v.mu.Unlock()
+
+		currentState := v.getCurrentState()
 
 		// Persist to Redis
 		if err := v.redis.SetDbcUpdating(false); err != nil {
@@ -447,8 +448,9 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 		v.mu.Lock()
 		oldSeconds := v.autoStandbySeconds
 		v.autoStandbySeconds = seconds
-		currentState := v.state
 		v.mu.Unlock()
+
+		currentState := v.getCurrentState()
 
 		if seconds > 0 {
 			v.logger.Infof("Auto-standby enabled via settings update: %d seconds", seconds)
@@ -512,8 +514,9 @@ func (v *VehicleSystem) handleDbcUpdateTimeout() {
 	v.dbcUpdateTimer = nil
 	deferredPower := v.deferredDashboardPower
 	v.deferredDashboardPower = nil
-	currentState := v.state
 	v.mu.Unlock()
+
+	currentState := v.getCurrentState()
 
 	v.logger.Warnf("DBC update timeout - clearing dbcUpdating flag and applying deferred power state")
 

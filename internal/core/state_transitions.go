@@ -6,6 +6,7 @@ import (
 
 	"github.com/librescoot/librefsm"
 
+	"vehicle-service/internal/fsm"
 	"vehicle-service/internal/types"
 )
 
@@ -203,9 +204,7 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 // updateEngineBrake updates only the engine brake based on current state
 // Used when brake lever state changes but vehicle state hasn't
 func (v *VehicleSystem) updateEngineBrake() error {
-	v.mu.RLock()
-	currentState := v.state
-	v.mu.RUnlock()
+	currentState := v.getCurrentState()
 
 	// Read current brake states
 	brakeLeft, err := v.io.ReadDigitalInput("brake_left")
@@ -234,20 +233,18 @@ func (v *VehicleSystem) updateEngineBrake() error {
 	return nil
 }
 
-// getCurrentState returns the current state (thread-safe) using FSM
+// getCurrentState returns the current state (thread-safe) by querying the FSM
 func (v *VehicleSystem) getCurrentState() types.SystemState {
-	if v.machine != nil {
-		return stateIDToSystemState(v.machine.CurrentState())
+	if v.machine == nil {
+		return types.StateInit
 	}
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return v.state
+	return stateIDToSystemState(v.machine.CurrentState())
 }
 
 // getCurrentStateID returns the current FSM state ID
 func (v *VehicleSystem) getCurrentStateID() librefsm.StateID {
-	if v.machine != nil {
-		return v.machine.CurrentState()
+	if v.machine == nil {
+		return fsm.StateInit
 	}
-	return systemStateToStateID(v.state)
+	return v.machine.CurrentState()
 }

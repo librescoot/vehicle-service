@@ -45,7 +45,6 @@ const (
 )
 
 type VehicleSystem struct {
-	state                   types.SystemState
 	dashboardReady          bool
 	logger                  *logger.Logger
 	io                      HardwareIO
@@ -80,7 +79,6 @@ type VehicleSystem struct {
 
 func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *VehicleSystem {
 	vs := &VehicleSystem{
-		state:                   types.StateInit,
 		logger:                  l.WithTag("Vehicle"),
 		io:                      io,
 		redis:                   redis,
@@ -769,9 +767,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 	case "brake_right", "brake_left":
 		// Control engine brake based on state
-		v.mu.RLock()
-		currentState := v.state
-		v.mu.RUnlock()
+		currentState := v.getCurrentState()
 
 		// Check if either brake is pressed after this change
 		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
