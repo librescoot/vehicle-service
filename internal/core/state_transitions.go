@@ -166,12 +166,32 @@ func (v *VehicleSystem) lockHandlebar() {
 }
 
 // unlockHandlebar pulses the handlebar lock open output asynchronously.
-// The handlebarUnlocked flag is set reactively by the lock sensor callback.
+// Retries up to handlebarUnlockRetries times if the lock sensor still shows locked.
 func (v *VehicleSystem) unlockHandlebar() {
 	go func() {
-		if err := v.pulseOutput("handlebar_lock_open", handlebarLockDuration); err != nil {
-			v.logger.Errorf("Failed to unlock handlebar: %v", err)
+		for attempt := 1; attempt <= handlebarUnlockRetries; attempt++ {
+			if err := v.pulseOutput("handlebar_lock_open", handlebarLockDuration); err != nil {
+				v.logger.Errorf("Failed to unlock handlebar (attempt %d/%d): %v", attempt, handlebarUnlockRetries, err)
+				return
+			}
+
+			// Wait briefly for the lock sensor to register the change
+			time.Sleep(handlebarUnlockRetryDelay)
+
+			v.mu.RLock()
+			unlocked := v.handlebarUnlocked
+			v.mu.RUnlock()
+
+			if unlocked {
+				v.logger.Infof("Handlebar unlocked successfully (attempt %d/%d)", attempt, handlebarUnlockRetries)
+				return
+			}
+
+			if attempt < handlebarUnlockRetries {
+				v.logger.Warnf("Handlebar still locked after attempt %d/%d, retrying", attempt, handlebarUnlockRetries)
+			}
 		}
+		v.logger.Errorf("Handlebar unlock failed after %d attempts — lock sensor still shows locked", handlebarUnlockRetries)
 	}()
 	v.logger.Infof("Handlebar unlock initiated")
 }
