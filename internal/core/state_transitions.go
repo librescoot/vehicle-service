@@ -150,7 +150,7 @@ func (v *VehicleSystem) lockHandlebar() {
 			return nil
 		})
 
-		v.logger.Debugf("Started 10 second window for handlebar lock")
+		v.logger.Debugf("Started 60 second window for handlebar lock")
 
 		v.mu.RLock()
 		timerC := v.handlebarTimer.C

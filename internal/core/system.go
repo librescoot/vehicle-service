@@ -36,7 +36,7 @@ const (
 	// Hardware timing constants
 	blinkerInterval       = 800 * time.Millisecond
 	handlebarLockDuration = 1100 * time.Millisecond
-	handlebarLockWindow   = 10 * time.Second
+	handlebarLockWindow   = 60 * time.Second
 	seatboxLockDuration   = 200 * time.Millisecond
 	parkDebounceTime      = 1 * time.Second
 
