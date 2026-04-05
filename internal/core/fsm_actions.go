@@ -505,8 +505,8 @@ func (v *VehicleSystem) CanEnterReadyToDrive(c *librefsm.Context) bool {
 		v.logger.Errorf("Failed to read kickstand in guard: %v", err)
 		return false
 	}
-	// Kickstand must be UP (value false) AND dashboard ready to enter ready-to-drive
-	return !kickstandDown && v.IsDashboardReady(c)
+	// Kickstand must be UP (value false) AND dashboard ready AND handlebar unlocked
+	return !kickstandDown && v.IsDashboardReady(c) && v.IsHandlebarUnlocked(c)
 }
 
 func (v *VehicleSystem) IsKickstandDown(c *librefsm.Context) bool {
@@ -534,6 +534,12 @@ func (v *VehicleSystem) IsSeatboxClosed(c *librefsm.Context) bool {
 		return false
 	}
 	return seatboxClosed
+}
+
+func (v *VehicleSystem) IsHandlebarUnlocked(c *librefsm.Context) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.handlebarUnlocked
 }
 
 func (v *VehicleSystem) AreBrakesPressed(c *librefsm.Context) bool {

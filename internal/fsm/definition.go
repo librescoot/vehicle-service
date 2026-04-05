@@ -88,10 +88,10 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 			librefsm.WithGuard(actions.CanEnterReadyToDrive), // Requires both kickstand up AND dashboard ready
 		).
 		Transition(StateParked, EvKickstandUp, StateReadyToDrive,
-			librefsm.WithGuard(actions.IsDashboardReady),
+			librefsm.WithGuards(actions.IsDashboardReady, actions.IsHandlebarUnlocked),
 		).
 		Transition(StateParked, EvDashboardReady, StateReadyToDrive,
-			librefsm.WithGuard(actions.IsKickstandUp),
+			librefsm.WithGuards(actions.IsKickstandUp, actions.IsHandlebarUnlocked),
 		).
 		Transition(StateParked, EvLock, StateShuttingDown,
 			librefsm.WithGuard(actions.IsSeatboxClosed),

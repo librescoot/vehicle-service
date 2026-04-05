@@ -31,6 +31,7 @@ type Actions interface {
 	IsKickstandDown(c *librefsm.Context) bool      // True when kickstand is down (parked position)
 	IsSeatboxClosed(c *librefsm.Context) bool
 	AreBrakesPressed(c *librefsm.Context) bool
+	IsHandlebarUnlocked(c *librefsm.Context) bool // True when handlebar lock sensor shows unlocked
 
 	// Transition actions
 	OnShutdownTimeout(c *librefsm.Context) error
