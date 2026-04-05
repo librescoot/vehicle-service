@@ -73,19 +73,8 @@ func (v *VehicleSystem) lockHandlebar() {
 		}
 
 		if handlebarPos {
-			// Handlebar is in position, lock it immediately
-			if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
-				v.logger.Infof("Failed to lock handlebar: %v", err)
-			} else {
-				// Check if cancelled during the pulse
-				select {
-				case <-done:
-					v.logger.Debugf("Handlebar lock cancelled during pulse")
-				default:
-					v.logger.Infof("Handlebar locked")
-					// handlebarUnlocked updated reactively by lock sensor callback
-				}
-			}
+			// Handlebar is in position, lock it with retry + sensor verification
+			v.lockHandlebarWithRetry(done)
 			// Clear done reference
 			v.mu.Lock()
 			if v.handlebarDone == done {
@@ -139,13 +128,7 @@ func (v *VehicleSystem) lockHandlebar() {
 
 			timer.Stop()
 
-			if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
-				cleanup()
-				v.logger.Infof("Failed to lock handlebar: %v", err)
-				return err
-			}
-			v.logger.Infof("Handlebar locked")
-			// handlebarUnlocked updated reactively by lock sensor callback
+			v.lockHandlebarWithRetry(done)
 			cleanup()
 			return nil
 		})
@@ -165,17 +148,69 @@ func (v *VehicleSystem) lockHandlebar() {
 	}()
 }
 
+// lockHandlebarWithRetry pulses the lock closed and verifies via the lock sensor.
+// Retries up to handlebarLockRetries times if the sensor doesn't confirm engagement.
+func (v *VehicleSystem) lockHandlebarWithRetry(done chan struct{}) {
+	for attempt := 1; attempt <= handlebarLockRetries; attempt++ {
+		// Check for cancellation
+		select {
+		case <-done:
+			v.logger.Debugf("Handlebar lock cancelled before attempt %d", attempt)
+			return
+		default:
+		}
+
+		if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
+			v.logger.Errorf("Failed to lock handlebar (attempt %d/%d): %v", attempt, handlebarLockRetries, err)
+			return
+		}
+
+		// Check for cancellation after pulse
+		select {
+		case <-done:
+			v.logger.Debugf("Handlebar lock cancelled during pulse")
+			return
+		default:
+		}
+
+		// Wait for lock sensor to register
+		time.Sleep(handlebarLockRetryDelay)
+
+		v.mu.RLock()
+		locked := !v.handlebarUnlocked
+		v.mu.RUnlock()
+
+		if locked {
+			v.logger.Infof("Handlebar locked successfully (attempt %d/%d)", attempt, handlebarLockRetries)
+			return
+		}
+
+		if attempt < handlebarLockRetries {
+			v.logger.Warnf("Handlebar not locked after attempt %d/%d, retrying", attempt, handlebarLockRetries)
+		}
+	}
+	v.logger.Errorf("Handlebar lock failed after %d attempts — lock sensor still shows unlocked", handlebarLockRetries)
+}
+
 // unlockHandlebar pulses the handlebar lock open output asynchronously.
-// Retries up to handlebarUnlockRetries times if the lock sensor still shows locked.
+// Does an initial burst of quick retries, then keeps retrying with backoff
+// as long as the vehicle remains in parked or ready-to-drive state.
 func (v *VehicleSystem) unlockHandlebar() {
 	go func() {
-		for attempt := 1; attempt <= handlebarUnlockRetries; attempt++ {
-			if err := v.pulseOutput("handlebar_lock_open", handlebarLockDuration); err != nil {
-				v.logger.Errorf("Failed to unlock handlebar (attempt %d/%d): %v", attempt, handlebarUnlockRetries, err)
+		attempt := 0
+		for {
+			attempt++
+			state := v.getCurrentState()
+			if state != types.StateParked && state != types.StateReadyToDrive {
+				v.logger.Infof("Handlebar unlock: state changed to %s, stopping retries", state)
 				return
 			}
 
-			// Wait briefly for the lock sensor to register the change
+			if err := v.pulseOutput("handlebar_lock_open", handlebarLockDuration); err != nil {
+				v.logger.Errorf("Failed to unlock handlebar (attempt %d): %v", attempt, err)
+				return
+			}
+
 			time.Sleep(handlebarUnlockRetryDelay)
 
 			v.mu.RLock()
@@ -183,15 +218,22 @@ func (v *VehicleSystem) unlockHandlebar() {
 			v.mu.RUnlock()
 
 			if unlocked {
-				v.logger.Infof("Handlebar unlocked successfully (attempt %d/%d)", attempt, handlebarUnlockRetries)
+				v.logger.Infof("Handlebar unlocked successfully (attempt %d)", attempt)
 				return
 			}
 
-			if attempt < handlebarUnlockRetries {
-				v.logger.Warnf("Handlebar still locked after attempt %d/%d, retrying", attempt, handlebarUnlockRetries)
+			if attempt <= handlebarUnlockRetries {
+				v.logger.Warnf("Handlebar still locked after attempt %d, retrying", attempt)
+			} else {
+				// Back off after initial burst
+				delay := time.Duration(attempt-handlebarUnlockRetries) * time.Second
+				if delay > 5*time.Second {
+					delay = 5 * time.Second
+				}
+				v.logger.Warnf("Handlebar still locked after attempt %d, retrying in %v", attempt, delay)
+				time.Sleep(delay)
 			}
 		}
-		v.logger.Errorf("Handlebar unlock failed after %d attempts — lock sensor still shows locked", handlebarUnlockRetries)
 	}()
 	v.logger.Infof("Handlebar unlock initiated")
 }

@@ -37,6 +37,8 @@ const (
 	blinkerInterval       = 800 * time.Millisecond
 	handlebarLockDuration = 1100 * time.Millisecond
 	handlebarLockWindow   = 60 * time.Second
+	handlebarLockRetries      = 3
+	handlebarLockRetryDelay   = 500 * time.Millisecond
 	handlebarUnlockRetries    = 3
 	handlebarUnlockRetryDelay = 500 * time.Millisecond
 	seatboxLockDuration   = 200 * time.Millisecond
