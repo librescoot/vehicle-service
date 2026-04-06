@@ -70,29 +70,37 @@ func init() {
 }
 
 type LinuxHardwareIO struct {
-	logger          *logger.Logger
-	inputDevicePath string
-	inputFile       *os.File
-	chips           map[int]*gpiocdev.Chip
-	lines           map[string]*gpiocdev.Line
-	inputCallbacks  map[string]InputCallback
-	pwmLed          *ImxPwmLed
-	mu              sync.RWMutex
-	stopChan        chan struct{}
-	activeKeys      map[uint16]bool // Track key states
-	initialValues   map[string]bool // Initial values for outputs
+	logger            *logger.Logger
+	inputDevicePath   string
+	inputFile         *os.File
+	chips             map[int]*gpiocdev.Chip
+	lines             map[string]*gpiocdev.Line
+	inputCallbacks    map[string]InputCallback
+	pwmLed            *ImxPwmLed
+	mu                sync.RWMutex
+	stopChan          chan struct{}
+	activeKeys        map[uint16]bool            // Track key states
+	initialValues     map[string]bool            // Initial values for outputs
+	debounceDurations map[string]time.Duration   // Debounce duration per channel
+	debounceTimers    map[string]*time.Timer     // Active debounce timer per channel
+	debounceLast      map[string]bool            // Last seen value per channel (for debounce)
+	debounceGen       map[string]uint64          // Generation counter per debounced channel
 }
 
 func NewLinuxHardwareIO(l *logger.Logger) *LinuxHardwareIO {
 	return &LinuxHardwareIO{
-		logger:          l,
-		inputDevicePath: GpioKeysInput,
-		chips:           make(map[int]*gpiocdev.Chip),
-		lines:           make(map[string]*gpiocdev.Line),
-		inputCallbacks:  make(map[string]InputCallback),
-		stopChan:        make(chan struct{}),
-		activeKeys:      make(map[uint16]bool),
-		initialValues:   make(map[string]bool),
+		logger:            l,
+		inputDevicePath:   GpioKeysInput,
+		chips:             make(map[int]*gpiocdev.Chip),
+		lines:             make(map[string]*gpiocdev.Line),
+		inputCallbacks:    make(map[string]InputCallback),
+		stopChan:          make(chan struct{}),
+		activeKeys:        make(map[uint16]bool),
+		initialValues:     make(map[string]bool),
+		debounceDurations: make(map[string]time.Duration),
+		debounceTimers:    make(map[string]*time.Timer),
+		debounceLast:      make(map[string]bool),
+		debounceGen:       make(map[string]uint64),
 	}
 }
 
@@ -100,6 +108,61 @@ func (io *LinuxHardwareIO) SetInitialValue(name string, value bool) {
 	io.mu.Lock()
 	defer io.mu.Unlock()
 	io.initialValues[name] = value
+}
+
+func (io *LinuxHardwareIO) SetDebounce(channel string, duration time.Duration) {
+	io.mu.Lock()
+	defer io.mu.Unlock()
+	io.debounceDurations[channel] = duration
+}
+
+func (io *LinuxHardwareIO) debounceInput(channel string, value bool) {
+	io.mu.Lock()
+	duration, hasDuration := io.debounceDurations[channel]
+	if !hasDuration {
+		callback, exists := io.inputCallbacks[channel]
+		io.mu.Unlock()
+		if exists {
+			if io.logger != nil {
+				io.logger.Debugf("Executing callback for channel %s (value=%v)", channel, value)
+			}
+			if err := callback(channel, value); err != nil {
+				if io.logger != nil {
+					io.logger.Warnf("Error in callback for %s: %v", channel, err)
+				}
+			}
+		}
+		return
+	}
+
+	io.debounceLast[channel] = value
+	if t, exists := io.debounceTimers[channel]; exists && t != nil {
+		t.Stop()
+	}
+	io.debounceGen[channel]++
+	gen := io.debounceGen[channel]
+	io.debounceTimers[channel] = time.AfterFunc(duration, func() {
+		io.mu.Lock()
+		if io.debounceGen[channel] != gen {
+			io.mu.Unlock()
+			return
+		}
+		settled := io.debounceLast[channel]
+		callback, exists := io.inputCallbacks[channel]
+		io.mu.Unlock()
+
+		if exists {
+			if io.logger != nil {
+				io.logger.Debugf("Debounced callback for channel %s (value=%v)", channel, settled)
+			}
+			if err := callback(channel, settled); err != nil {
+				if io.logger != nil {
+					io.logger.Warnf("Error in debounced callback for %s: %v", channel, err)
+				}
+			}
+		}
+	})
+	io.mu.Unlock()
 }
 
 func (io *LinuxHardwareIO) Initialize() error {
@@ -246,44 +309,42 @@ func (io *LinuxHardwareIO) monitorInputs() {
 
 func (io *LinuxHardwareIO) handleKeyEvent(event *InputEvent) {
 	channel := io.mapKeycode(event.Code)
-	io.logger.Debugf("Key event: code=%d channel=%q value=%d",
-		event.Code, channel, event.Value)
+	if io.logger != nil {
+		io.logger.Debugf("Key event: code=%d channel=%q value=%d",
+			event.Code, channel, event.Value)
+	}
 
 	// Update active keys map
 	io.mu.Lock()
 	if event.Value == 0 {
 		delete(io.activeKeys, event.Code)
-		io.logger.Debugf("Key released: code=%d", event.Code)
+		if io.logger != nil {
+			io.logger.Debugf("Key released: code=%d", event.Code)
+		}
 	} else {
 		io.activeKeys[event.Code] = true
-		io.logger.Debugf("Key pressed: code=%d", event.Code)
+		if io.logger != nil {
+			io.logger.Debugf("Key pressed: code=%d", event.Code)
+		}
 	}
 	io.mu.Unlock()
 
 	// Only process key press (1) and release (0)
 	if event.Value > 1 {
-		io.logger.Debugf("Ignoring repeat event")
+		if io.logger != nil {
+			io.logger.Debugf("Ignoring repeat event")
+		}
 		return
 	}
 
 	if channel == "" {
-		io.logger.Debugf("Unknown key code: %d", event.Code)
+		if io.logger != nil {
+			io.logger.Debugf("Unknown key code: %d", event.Code)
+		}
 		return
 	}
 
-	io.mu.RLock()
-	callback, exists := io.inputCallbacks[channel]
-	io.mu.RUnlock()
-
-	if exists {
-		io.logger.Debugf("Executing callback for channel %s (value=%v)",
-			channel, event.Value == 1)
-		if err := callback(channel, event.Value == 1); err != nil {
-			io.logger.Warnf("Error in callback for %s: %v", channel, err)
-		}
-	} else {
-		io.logger.Debugf("No callback registered for channel: %s", channel)
-	}
+	io.debounceInput(channel, event.Value == 1)
 }
 
 func (io *LinuxHardwareIO) mapKeycode(code uint16) string {
@@ -376,8 +437,25 @@ func (io *LinuxHardwareIO) Cleanup() {
 	// First close the input file descriptor to interrupt any blocked Read() calls
 	if io.inputFile != nil {
 		io.inputFile.Close()
-		io.logger.Infof("Closed input device file descriptor")
+		if io.logger != nil {
+			io.logger.Infof("Closed input device file descriptor")
+		}
 	}
+
+	// Stop all pending debounce timers before releasing GPIO lines.
+	// Bump generation counters so any already-scheduled AfterFunc callbacks
+	// see a stale generation and bail out without firing.
+	io.mu.Lock()
+	for channel, t := range io.debounceTimers {
+		if t != nil {
+			t.Stop()
+		}
+		delete(io.debounceTimers, channel)
+	}
+	for channel := range io.debounceDurations {
+		io.debounceGen[channel]++
+	}
+	io.mu.Unlock()
 
 	// Short delay to allow goroutine to process the error and exit
 	time.Sleep(100 * time.Millisecond)
@@ -385,22 +463,32 @@ func (io *LinuxHardwareIO) Cleanup() {
 	io.mu.Lock()
 	defer io.mu.Unlock()
 
-	io.logger.Infof("Cleaning up hardware resources")
+	if io.logger != nil {
+		io.logger.Infof("Cleaning up hardware resources")
+	}
 
 	for name, line := range io.lines {
 		line.Close()
-		io.logger.Infof("Closed GPIO line for %s", name)
+		if io.logger != nil {
+			io.logger.Infof("Closed GPIO line for %s", name)
+		}
 	}
 
 	for id, chip := range io.chips {
 		chip.Close()
-		io.logger.Infof("Closed GPIO chip %d", id)
+		if io.logger != nil {
+			io.logger.Infof("Closed GPIO chip %d", id)
+		}
 	}
 
 	if io.pwmLed != nil {
 		io.pwmLed.Cleanup()
-		io.logger.Infof("Cleaned up PWM LED")
+		if io.logger != nil {
+			io.logger.Infof("Cleaned up PWM LED")
+		}
 	}
 
-	io.logger.Infof("Hardware cleanup complete")
+	if io.logger != nil {
+		io.logger.Infof("Hardware cleanup complete")
+	}
 }

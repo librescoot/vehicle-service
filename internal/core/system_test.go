@@ -144,6 +144,8 @@ func (m *mockHardwareIO) RegisterInputCallback(channel string, callback hardware
 	m.inputCallbacks[channel] = callback
 }
 
+func (m *mockHardwareIO) SetDebounce(channel string, duration time.Duration) {}
+
 func (m *mockHardwareIO) PlayPwmCue(idx int) error {
 	m.pwmCues = append(m.pwmCues, idx)
 	return nil

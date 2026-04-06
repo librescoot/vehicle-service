@@ -70,6 +70,7 @@ type HardwareIO interface {
 	WriteDigitalOutput(channel string, value bool) error
 	SetInitialValue(name string, value bool)
 	RegisterInputCallback(channel string, callback hardware.InputCallback)
+	SetDebounce(channel string, duration time.Duration)
 
 	// PWM control
 	PlayPwmCue(idx int) error

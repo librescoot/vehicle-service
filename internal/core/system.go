@@ -34,8 +34,9 @@ const (
 	keycardTapMaxInterval   = 3 * time.Second // Max interval between taps to be part of a sequence
 
 	// Hardware timing constants
-	blinkerInterval       = 800 * time.Millisecond
-	handlebarLockDuration = 1100 * time.Millisecond
+	blinkerInterval              = 800 * time.Millisecond
+	handlebarPositionDebounce    = 250 * time.Millisecond
+	handlebarLockDuration        = 1100 * time.Millisecond
 	handlebarLockWindow   = 60 * time.Second
 	handlebarLockRetries      = 3
 	handlebarLockRetryDelay   = 500 * time.Millisecond
@@ -316,6 +317,9 @@ func (v *VehicleSystem) Start() error {
 	if err := v.io.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize hardware: %w", err)
 	}
+
+	// Configure per-channel debounce before registering callbacks
+	v.io.SetDebounce("handlebar_position", handlebarPositionDebounce)
 
 	// Restore saved FSM state now that hardware is initialized
 	if err := v.restoreFSMState(savedState); err != nil {
