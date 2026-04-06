@@ -848,11 +848,6 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			return fmt.Errorf("failed to handle blinker change: %w", err)
 		}
 
-	case "handlebar_position":
-		if err := v.redis.SetHandlebarPosition(value); err != nil {
-			return err
-		}
-
 	case "handlebar_lock_sensor":
 		// Invert the value: true (pressed) means unlocked, false (released) means locked.
 		// Redis stores true for locked, false for unlocked.
