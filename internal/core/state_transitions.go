@@ -26,6 +26,16 @@ func (v *VehicleSystem) cancelHandlebarLock() {
 	v.io.RegisterInputCallback("handlebar_position", v.handleHandlebarPosition)
 }
 
+// cancelHandlebarUnlock cancels any ongoing handlebar unlock retry loop
+func (v *VehicleSystem) cancelHandlebarUnlock() {
+	v.mu.Lock()
+	if v.handlebarUnlockDone != nil {
+		close(v.handlebarUnlockDone)
+		v.handlebarUnlockDone = nil
+	}
+	v.mu.Unlock()
+}
+
 // unlockHandlebarIfNeeded checks if the handlebar needs unlocking and unlocks it
 // Also cancels any ongoing handlebar locking attempt
 func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
@@ -211,11 +221,27 @@ func (v *VehicleSystem) lockHandlebarWithRetry(done chan struct{}) {
 // unlockHandlebar pulses the handlebar lock open output asynchronously.
 // Does an initial burst of quick retries, then keeps retrying with backoff
 // as long as the vehicle remains in parked or ready-to-drive state.
+// The retry loop can be cancelled via cancelHandlebarUnlock().
 func (v *VehicleSystem) unlockHandlebar() {
+	v.cancelHandlebarUnlock()
+
+	done := make(chan struct{})
+	v.mu.Lock()
+	v.handlebarUnlockDone = done
+	v.mu.Unlock()
+
 	go func() {
 		attempt := 0
 		for {
 			attempt++
+
+			select {
+			case <-done:
+				v.logger.Infof("Handlebar unlock cancelled (attempt %d)", attempt)
+				return
+			default:
+			}
+
 			state := v.getCurrentState()
 			if state != types.StateParked && state != types.StateReadyToDrive {
 				v.logger.Infof("Handlebar unlock: state changed to %s, stopping retries", state)
@@ -227,19 +253,22 @@ func (v *VehicleSystem) unlockHandlebar() {
 				return
 			}
 
-			// Wait for mechanism to settle after pulse ends
 			time.Sleep(handlebarUnlockRetryDelay)
 
-			// Read hardware sensor directly — the cached flag may have been set
-			// during the pulse while the actuator was still energized
+			select {
+			case <-done:
+				v.logger.Infof("Handlebar unlock cancelled after pulse (attempt %d)", attempt)
+				return
+			default:
+			}
+
 			sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
 			if err != nil {
 				v.logger.Errorf("Failed to read handlebar lock sensor: %v", err)
 				return
 			}
-			unlocked := sensorVal // sensor true (pressed) = unlocked
+			unlocked := sensorVal
 
-			// Update cached state to match reality
 			v.mu.Lock()
 			v.handlebarUnlocked = unlocked
 			v.mu.Unlock()
@@ -252,13 +281,18 @@ func (v *VehicleSystem) unlockHandlebar() {
 			if attempt <= handlebarUnlockRetries {
 				v.logger.Warnf("Handlebar still locked after attempt %d, retrying", attempt)
 			} else {
-				// Back off after initial burst
 				delay := time.Duration(attempt-handlebarUnlockRetries) * time.Second
 				if delay > 5*time.Second {
 					delay = 5 * time.Second
 				}
 				v.logger.Warnf("Handlebar still locked after attempt %d, retrying in %v", attempt, delay)
-				time.Sleep(delay)
+
+				select {
+				case <-done:
+					v.logger.Infof("Handlebar unlock cancelled during backoff (attempt %d)", attempt)
+					return
+				case <-time.After(delay):
+				}
 			}
 		}
 	}()

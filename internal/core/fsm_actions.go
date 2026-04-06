@@ -149,6 +149,16 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 		return err
 	}
 
+	// If handlebar is still locked after unlock attempt, the user forced RTD
+	// via the three-button override — cancel the unlock loop.
+	v.mu.RLock()
+	stillLocked := !v.handlebarUnlocked
+	v.mu.RUnlock()
+	if stillLocked {
+		v.logger.Infof("Handlebar still locked in RTD — forced entry, cancelling unlock retries")
+		v.cancelHandlebarUnlock()
+	}
+
 	if err := v.setPower("engine_power", true); err != nil {
 		v.logger.Errorf("%v", err)
 		return err
@@ -275,6 +285,8 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: EnterStandby")
 
+	v.cancelHandlebarUnlock()
+
 	v.mu.Lock()
 	forcedStandby := v.forceStandbyNoLock
 	if forcedStandby {
@@ -327,6 +339,8 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 
 func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: EnterShuttingDown")
+
+	v.cancelHandlebarUnlock()
 
 	prevState := stateIDToSystemState(c.FromState)
 	v.logger.Infof("Entering shutting down state from %s", prevState)

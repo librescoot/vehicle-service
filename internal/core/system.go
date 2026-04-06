@@ -65,6 +65,7 @@ type VehicleSystem struct {
 	handlebarUnlocked       bool          // Track if handlebar has been unlocked in this power cycle
 	handlebarTimer          *time.Timer   // Timer for handlebar position window
 	handlebarDone           chan struct{}  // Done channel for handlebar lock goroutine
+	handlebarUnlockDone     chan struct{}  // Done channel for handlebar unlock goroutine
 	readyToDriveEntryTime   time.Time    // Track when we entered ready-to-drive state for park debounce
 	kickstandDebounceTimer  *time.Timer  // Deferred kickstand-down check after debounce window
 	keycardTapCount         int
@@ -1164,8 +1165,9 @@ func (v *VehicleSystem) Shutdown() {
 	// Stop blinker if running
 	v.stopBlinker()
 
-	// Stop any running handlebar lock goroutine
+	// Stop any running handlebar lock/unlock goroutine
 	v.cancelHandlebarLock()
+	v.cancelHandlebarUnlock()
 
 	if v.dbcUpdateTimer != nil {
 		v.dbcUpdateTimer.Stop()
