@@ -386,14 +386,41 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 				v.logger.Infof("Failed to lock handlebar: %v", err)
 				return err
 			}
-			v.logger.Infof("Handlebar lock activated")
+			// Wait for mechanism to settle, then verify via sensor
+			time.Sleep(handlebarLockRetryDelay)
+			sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+			if err != nil {
+				v.logger.Warnf("Failed to read handlebar lock sensor after lock command: %v", err)
+			} else {
+				v.mu.Lock()
+				v.handlebarUnlocked = sensorVal
+				v.mu.Unlock()
+				if sensorVal {
+					v.logger.Warnf("Handlebar lock command sent but sensor still shows unlocked")
+				} else {
+					v.logger.Infof("Handlebar locked via hardware command")
+				}
+			}
 		case "unlock":
 			if err := v.pulseHandlebarLock(false); err != nil {
 				v.logger.Infof("Failed to unlock handlebar: %v", err)
 				return err
 			}
-			v.handlebarUnlocked = true
-			v.logger.Infof("Handlebar unlock activated")
+			// Wait for mechanism to settle, then verify via sensor
+			time.Sleep(handlebarUnlockRetryDelay)
+			sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+			if err != nil {
+				v.logger.Warnf("Failed to read handlebar lock sensor after unlock command: %v", err)
+			} else {
+				v.mu.Lock()
+				v.handlebarUnlocked = sensorVal
+				v.mu.Unlock()
+				if !sensorVal {
+					v.logger.Warnf("Handlebar unlock command sent but sensor still shows locked")
+				} else {
+					v.logger.Infof("Handlebar unlocked via hardware command")
+				}
+			}
 		default:
 			return fmt.Errorf("invalid handlebar action: %s", action)
 		}
