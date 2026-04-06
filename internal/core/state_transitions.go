@@ -31,16 +31,22 @@ func (v *VehicleSystem) cancelHandlebarLock() {
 func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
 	v.cancelHandlebarLock()
 
-	// Check if handlebar needs to be unlocked
-	handlebarPos, err := v.io.ReadDigitalInput("handlebar_position")
+	// Read the actual lock sensor state from hardware to avoid acting on
+	// stale cached values (e.g. transient readings during a lock pulse)
+	sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
 	if err != nil {
-		v.logger.Infof("Failed to read handlebar position: %v", err)
-		return err
+		v.logger.Warnf("Failed to read handlebar lock sensor: %v", err)
+	} else {
+		v.mu.Lock()
+		v.handlebarUnlocked = sensorVal // sensor true (pressed) = unlocked
+		v.mu.Unlock()
 	}
+
 	v.mu.RLock()
 	unlocked := v.handlebarUnlocked
 	v.mu.RUnlock()
-	if handlebarPos && !unlocked {
+
+	if !unlocked {
 		v.unlockHandlebar()
 	}
 	return nil
@@ -160,7 +166,7 @@ func (v *VehicleSystem) lockHandlebarWithRetry(done chan struct{}) {
 		default:
 		}
 
-		if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
+		if err := v.pulseHandlebarLock(true); err != nil {
 			v.logger.Errorf("Failed to lock handlebar (attempt %d/%d): %v", attempt, handlebarLockRetries, err)
 			return
 		}
@@ -173,12 +179,22 @@ func (v *VehicleSystem) lockHandlebarWithRetry(done chan struct{}) {
 		default:
 		}
 
-		// Wait for lock sensor to register
+		// Wait for mechanism to settle after pulse ends
 		time.Sleep(handlebarLockRetryDelay)
 
-		v.mu.RLock()
-		locked := !v.handlebarUnlocked
-		v.mu.RUnlock()
+		// Read hardware sensor directly — the cached flag may reflect
+		// a transient state during the pulse
+		sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+		if err != nil {
+			v.logger.Errorf("Failed to read handlebar lock sensor: %v", err)
+			return
+		}
+		locked := !sensorVal // sensor false (released) = locked
+
+		// Update cached state to match reality
+		v.mu.Lock()
+		v.handlebarUnlocked = sensorVal
+		v.mu.Unlock()
 
 		if locked {
 			v.logger.Infof("Handlebar locked successfully (attempt %d/%d)", attempt, handlebarLockRetries)
@@ -206,16 +222,27 @@ func (v *VehicleSystem) unlockHandlebar() {
 				return
 			}
 
-			if err := v.pulseOutput("handlebar_lock_open", handlebarLockDuration); err != nil {
+			if err := v.pulseHandlebarLock(false); err != nil {
 				v.logger.Errorf("Failed to unlock handlebar (attempt %d): %v", attempt, err)
 				return
 			}
 
+			// Wait for mechanism to settle after pulse ends
 			time.Sleep(handlebarUnlockRetryDelay)
 
-			v.mu.RLock()
-			unlocked := v.handlebarUnlocked
-			v.mu.RUnlock()
+			// Read hardware sensor directly — the cached flag may have been set
+			// during the pulse while the actuator was still energized
+			sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+			if err != nil {
+				v.logger.Errorf("Failed to read handlebar lock sensor: %v", err)
+				return
+			}
+			unlocked := sensorVal // sensor true (pressed) = unlocked
+
+			// Update cached state to match reality
+			v.mu.Lock()
+			v.handlebarUnlocked = unlocked
+			v.mu.Unlock()
 
 			if unlocked {
 				v.logger.Infof("Handlebar unlocked successfully (attempt %d)", attempt)
@@ -250,12 +277,23 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 	}
 
 	state := v.getCurrentState()
-	v.mu.RLock()
-	unlocked := v.handlebarUnlocked
-	v.mu.RUnlock()
+	if state != types.StateParked && state != types.StateReadyToDrive {
+		return nil
+	}
 
-	// Only unlock if we haven't unlocked yet in this power cycle
-	if !unlocked && (state == types.StateParked || state == types.StateReadyToDrive) {
+	// Read lock sensor from hardware to avoid stale cached state
+	sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+	if err != nil {
+		v.logger.Warnf("Failed to read handlebar lock sensor: %v", err)
+		return nil
+	}
+	unlocked := sensorVal // sensor true (pressed) = unlocked
+
+	v.mu.Lock()
+	v.handlebarUnlocked = unlocked
+	v.mu.Unlock()
+
+	if !unlocked {
 		v.unlockHandlebar()
 	}
 

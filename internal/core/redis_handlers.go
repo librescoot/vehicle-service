@@ -382,13 +382,13 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 	case "handlebar":
 		switch action {
 		case "lock":
-			if err := v.pulseOutput("handlebar_lock_close", handlebarLockDuration); err != nil {
+			if err := v.pulseHandlebarLock(true); err != nil {
 				v.logger.Infof("Failed to lock handlebar: %v", err)
 				return err
 			}
 			v.logger.Infof("Handlebar lock activated")
 		case "unlock":
-			if err := v.pulseOutput("handlebar_lock_open", handlebarLockDuration); err != nil {
+			if err := v.pulseHandlebarLock(false); err != nil {
 				v.logger.Infof("Failed to unlock handlebar: %v", err)
 				return err
 			}

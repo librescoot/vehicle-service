@@ -401,6 +401,43 @@ func (io *LinuxHardwareIO) ReadDigitalInput(channel string) (bool, error) {
 	return state, nil
 }
 
+// ReadDigitalInputDirect reads the current hardware state via ioctl, bypassing
+// the cached activeKeys map. Use this when the cached state may be stale
+// (e.g. the lock sensor during/after actuator pulses).
+func (io *LinuxHardwareIO) ReadDigitalInputDirect(channel string) (bool, error) {
+	keycode := channelToKeycode[channel]
+	if keycode == 0 {
+		return false, fmt.Errorf("unknown input channel: %s", channel)
+	}
+
+	buffer := make([]byte, 128)
+	_, _, errno := syscall.Syscall(
+		syscall.SYS_IOCTL,
+		uintptr(io.inputFile.Fd()),
+		uintptr(0x80804518), // EVIOCGKEY(len)
+		uintptr(unsafe.Pointer(&buffer[0])),
+	)
+	if errno != 0 {
+		return false, fmt.Errorf("EVIOCGKEY ioctl failed: %v", errno)
+	}
+
+	byteOffset := int(keycode / 8)
+	bitOffset := keycode % 8
+	if byteOffset >= len(buffer) {
+		return false, fmt.Errorf("keycode %d out of range", keycode)
+	}
+
+	isPressed := (buffer[byteOffset] & (1 << bitOffset)) != 0
+
+	// Update the cache to match reality
+	io.mu.Lock()
+	io.activeKeys[keycode] = isPressed
+	io.mu.Unlock()
+
+	io.logger.Debugf("Reading digital input for channel %s (keycode %d) -> %v (direct ioctl)", channel, keycode, isPressed)
+	return isPressed, nil
+}
+
 func (io *LinuxHardwareIO) getKeycodeForChannel(channel string) uint16 {
 	return channelToKeycode[channel]
 }

@@ -67,6 +67,7 @@ type HardwareIO interface {
 
 	// Digital I/O
 	ReadDigitalInput(channel string) (bool, error)
+	ReadDigitalInputDirect(channel string) (bool, error)
 	WriteDigitalOutput(channel string, value bool) error
 	SetInitialValue(name string, value bool)
 	RegisterInputCallback(channel string, callback hardware.InputCallback)

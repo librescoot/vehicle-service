@@ -131,6 +131,10 @@ func (m *mockHardwareIO) ReadDigitalInput(channel string) (bool, error) {
 	return m.digitalInputs[channel], nil
 }
 
+func (m *mockHardwareIO) ReadDigitalInputDirect(channel string) (bool, error) {
+	return m.digitalInputs[channel], nil
+}
+
 func (m *mockHardwareIO) WriteDigitalOutput(channel string, value bool) error {
 	m.digitalOutputs[channel] = value
 	return nil

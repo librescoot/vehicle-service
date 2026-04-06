@@ -327,7 +327,7 @@ func (v *VehicleSystem) Start() error {
 	}
 
 	// Check initial handlebar lock sensor state
-	handlebarLockSensorRaw, err := v.io.ReadDigitalInput("handlebar_lock_sensor")
+	handlebarLockSensorRaw, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
 	if err != nil {
 		v.logger.Infof("Warning: Failed to read initial handlebar lock sensor state: %v", err)
 	} else if !handlebarLockSensorRaw { // Invert the logic: true (pressed) means unlocked, false (released) means locked. We want to know if it's locked initially.
@@ -1107,6 +1107,30 @@ func (v *VehicleSystem) pulseOutput(name string, duration time.Duration) error {
 		return err
 	}
 	return nil
+}
+
+// pulseHandlebarLock drives the handlebar lock solenoid H-bridge.
+// Explicitly sets both sides: active side high, complementary side low,
+// holds for the lock duration, then sets both low.
+func (v *VehicleSystem) pulseHandlebarLock(lock bool) error {
+	closeVal := lock
+	openVal := !lock
+	if err := v.io.WriteDigitalOutput("handlebar_lock_close", closeVal); err != nil {
+		return err
+	}
+	if err := v.io.WriteDigitalOutput("handlebar_lock_open", openVal); err != nil {
+		// Best-effort: deactivate the first output before returning
+		v.io.WriteDigitalOutput("handlebar_lock_close", false)
+		return err
+	}
+	time.Sleep(handlebarLockDuration)
+	// Both outputs low (coast)
+	err1 := v.io.WriteDigitalOutput("handlebar_lock_close", false)
+	err2 := v.io.WriteDigitalOutput("handlebar_lock_open", false)
+	if err1 != nil {
+		return err1
+	}
+	return err2
 }
 
 // playLedCue plays an LED cue and logs any errors with context
