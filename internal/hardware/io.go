@@ -165,6 +165,33 @@ func (io *LinuxHardwareIO) debounceInput(channel string, value bool) {
 	io.mu.Unlock()
 }
 
+func requestLineWithRetry(
+	request func() (*gpiocdev.Line, error),
+	name string,
+	maxAttempts int,
+	retryDelay time.Duration,
+	l *logger.Logger,
+) (*gpiocdev.Line, error) {
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		line, err := request()
+		if err == nil {
+			if attempt > 1 && l != nil {
+				l.Infof("GPIO line %s acquired on attempt %d", name, attempt)
+			}
+			return line, nil
+		}
+		lastErr = err
+		if attempt < maxAttempts {
+			if l != nil {
+				l.Warnf("GPIO line %s busy, retrying in %v (attempt %d/%d)", name, retryDelay, attempt, maxAttempts)
+			}
+			time.Sleep(retryDelay)
+		}
+	}
+	return nil, lastErr
+}
+
 func (io *LinuxHardwareIO) Initialize() error {
 	io.logger.Infof("Initializing hardware IO")
 
@@ -191,10 +218,13 @@ func (io *LinuxHardwareIO) Initialize() error {
 		}
 		io.mu.RUnlock()
 
-		// Request line as output with initial value
-		line, err := chip.RequestLine(mapping.Line,
-			gpiocdev.AsOutput(val),
-			gpiocdev.WithConsumer("vehicle-service"))
+		// Request line as output with initial value, with retry on busy
+		requestFn := func() (*gpiocdev.Line, error) {
+			return chip.RequestLine(mapping.Line,
+				gpiocdev.AsOutput(val),
+				gpiocdev.WithConsumer("vehicle-service"))
+		}
+		line, err := requestLineWithRetry(requestFn, name, 5, 500*time.Millisecond, io.logger)
 		if err != nil {
 			return fmt.Errorf("failed to request GPIO line %d: %w", mapping.Line, err)
 		}

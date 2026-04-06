@@ -1,10 +1,13 @@
 package hardware
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/warthog618/go-gpiocdev"
 )
 
 func TestDebounce_FiltersBounces(t *testing.T) {
@@ -136,5 +139,57 @@ func TestDebounce_StableInputFiresOnce(t *testing.T) {
 	mu.Unlock()
 	if got {
 		t.Errorf("expected final value false, got true")
+	}
+}
+
+func TestRequestLineWithRetry_ReturnsOnSuccess(t *testing.T) {
+	calls := 0
+	request := func() (*gpiocdev.Line, error) {
+		calls++
+		return &gpiocdev.Line{}, nil
+	}
+
+	line, err := requestLineWithRetry(request, "test_line", 3, 50*time.Millisecond, nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if line == nil {
+		t.Fatal("Expected non-nil line")
+	}
+	if calls != 1 {
+		t.Errorf("Expected 1 call, got %d", calls)
+	}
+}
+
+func TestRequestLineWithRetry_RetriesOnBusy(t *testing.T) {
+	calls := 0
+	request := func() (*gpiocdev.Line, error) {
+		calls++
+		if calls < 3 {
+			return nil, fmt.Errorf("failed to request GPIO line 10: device or resource busy")
+		}
+		return &gpiocdev.Line{}, nil
+	}
+
+	line, err := requestLineWithRetry(request, "test_line", 5, 50*time.Millisecond, nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if line == nil {
+		t.Fatal("Expected non-nil line")
+	}
+	if calls != 3 {
+		t.Errorf("Expected 3 calls, got %d", calls)
+	}
+}
+
+func TestRequestLineWithRetry_ExhaustsRetries(t *testing.T) {
+	request := func() (*gpiocdev.Line, error) {
+		return nil, fmt.Errorf("device or resource busy")
+	}
+
+	_, err := requestLineWithRetry(request, "test_line", 3, 50*time.Millisecond, nil)
+	if err == nil {
+		t.Fatal("Expected error after exhausting retries")
 	}
 }
