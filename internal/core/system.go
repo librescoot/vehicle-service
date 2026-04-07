@@ -44,9 +44,6 @@ const (
 	handlebarUnlockRetryDelay = 500 * time.Millisecond
 	seatboxLockDuration   = 200 * time.Millisecond
 	parkDebounceTime      = 1 * time.Second
-
-	// DBC update timeout - safety limit to prevent stuck state if complete-dbc is never received
-	dbcUpdateTimeout = 45 * time.Minute
 )
 
 type VehicleSystem struct {
@@ -74,8 +71,6 @@ type VehicleSystem struct {
 	hibernationRequest      bool              // Track if hibernation was requested during shutdown
 	shutdownFromParked      bool              // Track if shutdown was initiated from parked state
 	dbcUpdating             bool              // Track if DBC update is in progress
-	dbcUpdateTimer          *time.Timer       // Timer for DBC update timeout (45 minutes max)
-	dbcUpdateGeneration     uint64            // Generation counter to invalidate stale timer callbacks
 	deferredDashboardPower  *bool             // Deferred dashboard power state (nil = no change needed)
 	brakeHibernationEnabled bool              // Track if brake lever hibernation is enabled (default: true)
 	autoStandbySeconds      int               // Auto-standby timeout in seconds (0 = disabled)
@@ -240,22 +235,8 @@ func (v *VehicleSystem) Start() error {
 	if restoreDbcUpdate {
 		v.mu.Lock()
 		v.dbcUpdating = true
-		v.dbcUpdateGeneration++
-		gen := v.dbcUpdateGeneration
-
-		// Start safety timeout timer (same as start-dbc handler)
-		v.dbcUpdateTimer = time.AfterFunc(dbcUpdateTimeout, func() {
-			v.mu.RLock()
-			currentGen := v.dbcUpdateGeneration
-			v.mu.RUnlock()
-			if currentGen != gen {
-				return
-			}
-			v.logger.Warnf("DBC update timeout after %v - clearing stuck state (restored on startup)", dbcUpdateTimeout)
-			v.handleDbcUpdateTimeout()
-		})
 		v.mu.Unlock()
-		v.logger.Infof("DBC update timeout set to %v (restored on startup)", dbcUpdateTimeout)
+		v.logger.Infof("Restored DBC updating state from previous run")
 
 		// Re-set suspend-only inhibitor so pm-service keeps MDB awake during DBC update
 		if err := v.redis.SetInhibitor("dbc-update", "suspend-only", "DBC update in progress (restored on startup)"); err != nil {
@@ -1168,11 +1149,6 @@ func (v *VehicleSystem) Shutdown() {
 	// Stop any running handlebar lock/unlock goroutine
 	v.cancelHandlebarLock()
 	v.cancelHandlebarUnlock()
-
-	if v.dbcUpdateTimer != nil {
-		v.dbcUpdateTimer.Stop()
-		v.dbcUpdateTimer = nil
-	}
 
 	if v.redis != nil {
 		v.redis.Close()
