@@ -168,7 +168,9 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.logger.Infof("Starting DBC update process")
 		v.mu.Lock()
 		v.dbcUpdating = true
+		v.startDbcWatchdog()
 		v.mu.Unlock()
+		v.logger.Infof("DBC update watchdog started (timeout: %v)", dbcUpdateWatchdogTimeout)
 
 		// Persist to Redis
 		if err := v.redis.SetDbcUpdating(true); err != nil {
@@ -190,6 +192,7 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 	case "complete-dbc":
 		v.logger.Infof("DBC update process complete")
 		v.mu.Lock()
+		v.stopDbcWatchdog()
 		v.dbcUpdating = false
 		deferredPower := v.deferredDashboardPower
 		v.deferredDashboardPower = nil
@@ -497,5 +500,56 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 	}
 
 	return nil
+}
+
+// handleDbcWatchdogTimeout is called when the DBC update watchdog expires —
+// no OTA status writes from the DBC for the watchdog timeout duration.
+// Clears the stuck dbcUpdating state and applies deferred power changes.
+func (v *VehicleSystem) handleDbcWatchdogTimeout() {
+	v.mu.Lock()
+	if !v.dbcUpdating {
+		v.mu.Unlock()
+		return
+	}
+
+	v.dbcUpdating = false
+	v.dbcWatchdogTimer = nil
+	deferredPower := v.deferredDashboardPower
+	v.deferredDashboardPower = nil
+	currentState := v.state
+	v.mu.Unlock()
+
+	v.logger.Warnf("DBC update watchdog expired — no OTA activity for %v, clearing stuck state", dbcUpdateWatchdogTimeout)
+
+	if err := v.redis.SetDbcUpdating(false); err != nil {
+		v.logger.Warnf("Failed to persist DBC updating state after watchdog timeout: %v", err)
+	}
+
+	if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
+		v.logger.Warnf("Failed to remove DBC update inhibitor after watchdog timeout: %v", err)
+	}
+
+	var powerOff bool
+	if deferredPower != nil {
+		if *deferredPower {
+			v.logger.Debugf("Applying deferred dashboard power ON after watchdog timeout")
+			if err := v.setPower("dashboard_power", true); err != nil {
+				v.logger.Errorf("Failed to apply deferred dashboard power ON: %v", err)
+			}
+		} else if currentState == types.StateStandby {
+			powerOff = true
+		}
+	} else if currentState == types.StateStandby {
+		powerOff = true
+	}
+
+	if powerOff {
+		v.logger.Debugf("Scheduling dashboard power OFF after watchdog timeout (5s delay)")
+		time.AfterFunc(5*time.Second, func() {
+			if err := v.setPower("dashboard_power", false); err != nil {
+				v.logger.Errorf("Failed to turn off dashboard power after watchdog timeout: %v", err)
+			}
+		})
+	}
 }
 

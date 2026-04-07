@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ type Callbacks struct {
 	UpdateCallback    func(string) error // "start", "complete"
 	HardwareCallback  func(string) error // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
 	SettingsCallback  func(string) error // setting key that was updated (e.g., "scooter.brake-hibernation")
+	OtaDbcActivityCallback func() error  // Called on any OTA hash field change for DBC component
 }
 
 type RedisClient struct {
@@ -48,6 +50,7 @@ type RedisClient struct {
 	dashboardWatcher *ipc.HashWatcher
 	keycardWatcher   *ipc.HashWatcher
 	settingsWatcher  *ipc.HashWatcher
+	otaWatcher       *ipc.HashWatcher
 
 	// Fault handling
 	faultSet    *ipc.FaultSet
@@ -143,6 +146,16 @@ func (r *RedisClient) StartListening() error {
 		return nil
 	})
 	r.settingsWatcher.Start()
+
+	// Watch OTA hash for DBC update activity (feeds the watchdog timer)
+	r.otaWatcher = r.client.NewHashWatcher("ota")
+	r.otaWatcher.OnAny(func(field, value string) error {
+		if strings.HasSuffix(field, ":dbc") && r.callbacks.OtaDbcActivityCallback != nil {
+			return r.callbacks.OtaDbcActivityCallback()
+		}
+		return nil
+	})
+	r.otaWatcher.Start()
 
 	// Start queue command listeners
 	ipc.HandleRequests(r.client, "scooter:seatbox", r.handleSeatboxCommand)

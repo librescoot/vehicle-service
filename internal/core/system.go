@@ -44,6 +44,9 @@ const (
 	handlebarUnlockRetryDelay = 500 * time.Millisecond
 	seatboxLockDuration   = 200 * time.Millisecond
 	parkDebounceTime      = 1 * time.Second
+
+	// DBC update watchdog — reset on every OTA status write from DBC
+	dbcUpdateWatchdogTimeout = 15 * time.Minute
 )
 
 type VehicleSystem struct {
@@ -71,6 +74,8 @@ type VehicleSystem struct {
 	hibernationRequest      bool              // Track if hibernation was requested during shutdown
 	shutdownFromParked      bool              // Track if shutdown was initiated from parked state
 	dbcUpdating             bool              // Track if DBC update is in progress
+	dbcWatchdogTimer        *time.Timer       // Watchdog timer for DBC updates, reset on OTA activity
+	dbcWatchdogGeneration   uint64            // Generation counter to invalidate stale callbacks
 	deferredDashboardPower  *bool             // Deferred dashboard power state (nil = no change needed)
 	brakeHibernationEnabled bool              // Track if brake lever hibernation is enabled (default: true)
 	autoStandbySeconds      int               // Auto-standby timeout in seconds (0 = disabled)
@@ -118,7 +123,8 @@ func (v *VehicleSystem) Start() error {
 		LedFadeCallback:   v.handleLedFadeRequest,
 		UpdateCallback:    v.handleUpdateRequest,
 		HardwareCallback:  v.handleHardwareRequest,
-		SettingsCallback:  v.handleSettingsUpdate,
+		SettingsCallback:        v.handleSettingsUpdate,
+		OtaDbcActivityCallback: v.resetDbcWatchdog,
 	})
 
 	// Connect to Redis first so we can retrieve saved state
@@ -235,8 +241,9 @@ func (v *VehicleSystem) Start() error {
 	if restoreDbcUpdate {
 		v.mu.Lock()
 		v.dbcUpdating = true
+		v.startDbcWatchdog()
 		v.mu.Unlock()
-		v.logger.Infof("Restored DBC updating state from previous run")
+		v.logger.Infof("Restored DBC updating state, watchdog started (timeout: %v)", dbcUpdateWatchdogTimeout)
 
 		// Re-set suspend-only inhibitor so pm-service keeps MDB awake during DBC update
 		if err := v.redis.SetInhibitor("dbc-update", "suspend-only", "DBC update in progress (restored on startup)"); err != nil {
@@ -1142,6 +1149,45 @@ func (v *VehicleSystem) publishState() error {
 	return nil
 }
 
+// resetDbcWatchdog resets the DBC update watchdog timer on OTA activity.
+// Called from the ota pub/sub watcher whenever any :dbc field changes.
+func (v *VehicleSystem) resetDbcWatchdog() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.dbcWatchdogTimer != nil {
+		v.dbcWatchdogTimer.Reset(dbcUpdateWatchdogTimeout)
+	}
+	return nil
+}
+
+// startDbcWatchdog starts (or restarts) the DBC update watchdog timer.
+// Must be called with v.mu held.
+func (v *VehicleSystem) startDbcWatchdog() {
+	if v.dbcWatchdogTimer != nil {
+		v.dbcWatchdogTimer.Stop()
+	}
+	v.dbcWatchdogGeneration++
+	gen := v.dbcWatchdogGeneration
+	v.dbcWatchdogTimer = time.AfterFunc(dbcUpdateWatchdogTimeout, func() {
+		v.mu.RLock()
+		currentGen := v.dbcWatchdogGeneration
+		v.mu.RUnlock()
+		if currentGen != gen {
+			return
+		}
+		v.handleDbcWatchdogTimeout()
+	})
+}
+
+// stopDbcWatchdog stops the DBC update watchdog timer.
+// Must be called with v.mu held.
+func (v *VehicleSystem) stopDbcWatchdog() {
+	if v.dbcWatchdogTimer != nil {
+		v.dbcWatchdogTimer.Stop()
+		v.dbcWatchdogTimer = nil
+	}
+}
+
 func (v *VehicleSystem) Shutdown() {
 	// Stop blinker if running
 	v.stopBlinker()
@@ -1149,6 +1195,10 @@ func (v *VehicleSystem) Shutdown() {
 	// Stop any running handlebar lock/unlock goroutine
 	v.cancelHandlebarLock()
 	v.cancelHandlebarUnlock()
+
+	v.mu.Lock()
+	v.stopDbcWatchdog()
+	v.mu.Unlock()
 
 	if v.redis != nil {
 		v.redis.Close()
