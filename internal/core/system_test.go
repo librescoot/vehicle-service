@@ -191,8 +191,9 @@ func TestNewVehicleSystem(t *testing.T) {
 	if system.redis != mockRedis {
 		t.Error("redis not set correctly")
 	}
-	if system.state != types.StateInit {
-		t.Errorf("Expected initial state StateInit, got %v", system.state)
+	// Before FSM is initialized, machine is nil; verify the struct was constructed
+	if system.machine != nil {
+		t.Error("Expected machine to be nil before initFSM")
 	}
 }
 
@@ -553,9 +554,6 @@ func TestHardwareIOInputCallback(t *testing.T) {
 
 // ===== State Transition Tests =====
 // These tests verify the engine brake behavior during state transitions.
-// This was a regression where updateEngineBrake() was called at the end of
-// state entry actions, but it read v.state which hadn't been updated yet,
-// causing inverted engine brake behavior.
 
 // initTestFSM initializes the FSM for a test system
 func initTestFSM(t *testing.T, system *VehicleSystem) {

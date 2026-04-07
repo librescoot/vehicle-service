@@ -83,14 +83,10 @@ func (v *VehicleSystem) initFSM(ctx context.Context) error {
 	}
 	v.machine = machine
 
-	// Set up state change callback to sync legacy state field and publish
+	// Set up state change callback to publish state and manage governor
 	v.machine.OnStateChange(func(from, to librefsm.StateID) {
 		newState := stateIDToSystemState(to)
 		oldState := stateIDToSystemState(from)
-
-		v.mu.Lock()
-		v.state = newState
-		v.mu.Unlock()
 
 		// Request CPU governor change when leaving standby
 		if oldState == types.StateStandby && newState != types.StateStandby {
