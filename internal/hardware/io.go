@@ -26,9 +26,11 @@ const (
 	KEY_F = 33 // blinker_right
 	KEY_G = 34 // blinker_left
 	KEY_H = 35 // ecu_power
-	KEY_K = 37 // handlebar_lock_sensor
-	KEY_I = 38 // handlebar_position
+	KEY_I = 23 // di2_0
 	KEY_J = 36 // seatbox_lock_sensor
+	KEY_K = 37 // handlebar_lock_sensor
+	KEY_L = 38 // handlebar_position
+	KEY_O = 24 // external_charger
 	KEY_Q = 16 // 48v_detect
 )
 
@@ -52,9 +54,11 @@ var keycodeToChannel = map[uint16]string{
 	KEY_F: "blinker_right",
 	KEY_G: "blinker_left",
 	KEY_H: "ecu_power",
-	KEY_K: "handlebar_lock_sensor",
-	KEY_I: "handlebar_position",
+	KEY_I: "di2_0",
 	KEY_J: "seatbox_lock_sensor",
+	KEY_K: "handlebar_lock_sensor",
+	KEY_L: "handlebar_position",
+	KEY_O: "external_charger",
 	KEY_Q: "48v_detect",
 }
 
@@ -273,7 +277,7 @@ func (io *LinuxHardwareIO) readInitialState() error {
 	// Check each key we care about
 	keycodes := []uint16{
 		KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H,
-		KEY_K, KEY_I, KEY_J, KEY_Q,
+		KEY_I, KEY_J, KEY_K, KEY_L, KEY_O, KEY_Q,
 	}
 
 	for _, code := range keycodes {
