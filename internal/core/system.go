@@ -167,18 +167,20 @@ func (v *VehicleSystem) Start() error {
 		v.logger.Infof("No brake hibernation setting found on startup, using default (enabled)")
 	}
 
-	// Read initial auto-standby setting from Redis
+	// Read initial auto-standby setting from Redis. Default 900 s (15 minutes)
+	// when unset; the last 60 s are shown as a cancellable countdown on the
+	// dashboard. Set to 0 to disable.
+	const defaultAutoStandbySeconds = 900
+	v.mu.Lock()
+	v.autoStandbySeconds = defaultAutoStandbySeconds
+	v.mu.Unlock()
 	autoStandbySetting, err := v.redis.GetHashField("settings", "scooter.auto-standby-seconds")
 	if err != nil {
-		v.logger.Warnf("Failed to read auto-standby setting on startup: %v", err)
-		// Continue with default (0 = disabled)
+		v.logger.Warnf("Failed to read auto-standby setting on startup: %v (using default %d s)", err, defaultAutoStandbySeconds)
 	} else if autoStandbySetting != "" {
 		seconds, parseErr := strconv.Atoi(autoStandbySetting)
 		if parseErr != nil {
-			v.logger.Warnf("Invalid auto-standby setting value on startup: '%s', using default (0)", autoStandbySetting)
-			v.mu.Lock()
-			v.autoStandbySeconds = 0
-			v.mu.Unlock()
+			v.logger.Warnf("Invalid auto-standby setting value on startup: '%s', using default (%d)", autoStandbySetting, defaultAutoStandbySeconds)
 		} else {
 			v.mu.Lock()
 			v.autoStandbySeconds = seconds
@@ -190,7 +192,7 @@ func (v *VehicleSystem) Start() error {
 			}
 		}
 	} else {
-		v.logger.Infof("No auto-standby setting found on startup, using default (disabled)")
+		v.logger.Infof("No auto-standby setting found on startup, using default (%d seconds)", defaultAutoStandbySeconds)
 	}
 
 	// Read initial horn enable mode setting from Redis
@@ -511,8 +513,22 @@ func (v *VehicleSystem) checkHibernationConditions() {
 	}
 }
 
-// startAutoStandbyTimer starts the auto-standby timer using librefsm
+// startAutoStandbyTimer starts the auto-standby timer using librefsm.
+//
+// SAFETY: The auto-standby timer must NEVER run outside of StateParked. This
+// function refuses to start the timer in any other state — defense in depth,
+// in addition to the per-callsite checks in resetAutoStandbyTimer and
+// handleSettingsUpdate. The FSM also restricts EvAutoStandbyTimeout to a
+// single transition (StateParked -> StateShuttingDown), and ExitParked stops
+// the timer on state exit, but this guard exists so a future caller cannot
+// accidentally arm the timer outside parked.
 func (v *VehicleSystem) startAutoStandbyTimer() {
+	currentState := v.getCurrentState()
+	if currentState != types.StateParked {
+		v.logger.Warnf("Refusing to start auto-standby timer: not in parked state (current: %s)", currentState)
+		return
+	}
+
 	v.mu.RLock()
 	seconds := v.autoStandbySeconds
 	v.mu.RUnlock()
