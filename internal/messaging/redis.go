@@ -320,8 +320,8 @@ func (r *RedisClient) SetBlinkerSwitch(state string) error {
 	return nil
 }
 
-func (r *RedisClient) SetBlinkerState(state string) error {
-	r.logger.Debugf("Setting blinker state: %s", state)
+func (r *RedisClient) SetBlinkerState(state string, startNanos int64) error {
+	r.logger.Debugf("Setting blinker state: %s (startNanos: %d)", state, startNanos)
 
 	var blinkerStr string
 	switch state {
@@ -337,9 +337,25 @@ func (r *RedisClient) SetBlinkerState(state string) error {
 		blinkerStr = "unknown"
 	}
 
-	if err := r.vehiclePub.Set("blinker:state", blinkerStr); err != nil {
-		r.logger.Warnf("Failed to set blinker state: %v", err)
-		return err
+	if blinkerStr == "off" || startNanos <= 0 {
+		if err := r.vehiclePub.Set("blinker:state", blinkerStr); err != nil {
+			r.logger.Warnf("Failed to set blinker state: %v", err)
+			return err
+		}
+	} else {
+		// Atomically write both blinker:state and blinker:start_nanos so the UI
+		// can compute the correct phase offset for animation synchronization.
+		err := r.vehiclePub.SetManyPublishOne(
+			map[string]any{
+				"blinker:state":      blinkerStr,
+				"blinker:start_nanos": startNanos,
+			},
+			"blinker:state",
+		)
+		if err != nil {
+			r.logger.Warnf("Failed to set blinker state: %v", err)
+			return err
+		}
 	}
 	r.logger.Debugf("Successfully set blinker state")
 	return nil

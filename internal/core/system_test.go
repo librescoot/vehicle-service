@@ -90,7 +90,7 @@ func (m *mockMessagingClient) SetBlinkerSwitch(state string) error {
 	return nil
 }
 
-func (m *mockMessagingClient) SetBlinkerState(state string) error {
+func (m *mockMessagingClient) SetBlinkerState(state string, _ int64) error {
 	m.setBlinkerStates = append(m.setBlinkerStates, state)
 	return nil
 }

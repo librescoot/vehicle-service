@@ -99,7 +99,7 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 		}
 	}
 
-	return v.redis.SetBlinkerState(state)
+	return v.redis.SetBlinkerState(state, v.blinkerStartNanos.Load())
 }
 
 // handleStateRequest handles vehicle state change requests from Redis

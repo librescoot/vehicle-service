@@ -922,7 +922,7 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 			}
 		}
 
-		return v.redis.SetBlinkerState(switchState)
+		return v.redis.SetBlinkerState(switchState, 0)
 	}
 
 	// Handle blinker activation
@@ -963,7 +963,7 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	go v.runBlinker(cue, switchState, stopChan)
 
 	// Update blinker state in Redis so DBC/scootui can display it
-	return v.redis.SetBlinkerState(switchState)
+	return v.redis.SetBlinkerState(switchState, v.blinkerStartNanos.Load())
 }
 
 func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}) {

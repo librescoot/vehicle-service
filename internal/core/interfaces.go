@@ -47,7 +47,7 @@ type MessagingClient interface {
 	SetHandlebarPosition(isOnPlace bool) error
 	SetSeatboxLockState(locked bool) error
 	SetBlinkerSwitch(state string) error
-	SetBlinkerState(state string) error
+	SetBlinkerState(state string, startNanos int64) error
 	SetHornButton(pressed bool) error
 	SetSeatboxButton(pressed bool) error
 
