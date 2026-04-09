@@ -284,15 +284,25 @@ func (r *RedisClient) handleHardwareCommand(value string) error {
 }
 
 // handleHopOnCommand processes hop-on / hop-off mode commands.
-// Accepts "engage" to enter hop-on mode (block ready-to-drive transitions)
-// and "release" to leave it. The dashboard sends these via LPUSH to
-// "scooter:hop-on".
+// Accepts:
+//
+//	"engage"        — enter hop-on mode with the user-facing side-effects
+//	                  (LED cue, opportunistic steering lock, hop-on-active
+//	                  flag published). Sent by the dashboard's "Activate
+//	                  now" menu action.
+//	"engage-silent" — enter hop-on mode quietly: no LED cue, no steering
+//	                  lock, no hop-on-active flag. Used by the combo
+//	                  learning UI so vehicle-service still suppresses
+//	                  input side-effects (horn, blinker, brake LED, seatbox
+//	                  open, hibernation hold) but the user doesn't see the
+//	                  scooter "power down" while configuring a combo.
+//	"release"       — leave hop-on mode regardless of how it was entered.
 func (r *RedisClient) handleHopOnCommand(value string) error {
 	if r.callbacks.HopOnCallback == nil {
 		return nil
 	}
 	switch value {
-	case "engage", "release":
+	case "engage", "engage-silent", "release":
 		r.logger.Infof("Processing hop-on command: %s", value)
 		return r.callbacks.HopOnCallback(value)
 	default:

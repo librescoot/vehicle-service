@@ -86,9 +86,10 @@ type VehicleSystem struct {
 	machine                 *librefsm.Machine // librefsm state machine
 
 	// Hop-on / hop-off mode (runtime-only — does NOT survive a power cycle).
-	// State is implicit in the FSM (StateHopOn). The two fields below are
+	// State is implicit in the FSM (StateHopOn). The fields below are
 	// transient bookkeeping carried across the engage/release transitions.
 	hopOnLockedHandlebar    bool      // True when WE engaged the steering lock on hop-on entry
+	hopOnSilent             bool      // True when StateHopOn was entered silently (learning mode): no LED cue, no steering lock, no hop-on-active publish
 	autoStandbyDeadline     time.Time // Live auto-standby deadline (set by EnterParked / EnterHopOn)
 	hopOnSavedAutoStandbyDl time.Time // Captured by handleHopOnRequest before ExitParked clears the live one
 }

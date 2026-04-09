@@ -415,19 +415,25 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 // captures the live auto-standby deadline before the transition fires
 // (because ExitParked will clear it before EnterHopOn runs) and then
 // dispatches the event.
+//
+// "engage-silent" is the same transition as "engage" with a silent flag
+// passed via the event payload, used by the dashboard's combo learning
+// flow so input side-effects (horn, blinker, brake LED, seatbox open,
+// hibernation hold) are suppressed without the user-facing "powering
+// down" cue, opportunistic steering lock, or hop-on-active publish.
 func (v *VehicleSystem) handleHopOnRequest(action string) error {
 	if v.machine == nil {
 		return fmt.Errorf("hop-on: FSM not initialised")
 	}
 	switch action {
-	case "engage":
+	case "engage", "engage-silent":
 		current := v.machine.CurrentState()
 		if current == fsm.StateHopOn {
-			v.logger.Debugf("hop-on engage requested but already in StateHopOn — no-op")
+			v.logger.Debugf("hop-on %s requested but already in StateHopOn — no-op", action)
 			return nil
 		}
 		if current != fsm.StateParked {
-			v.logger.Warnf("hop-on engage refused: scooter is in %s, not parked", current)
+			v.logger.Warnf("hop-on %s refused: scooter is in %s, not parked", action, current)
 			return nil
 		}
 		// Capture the live auto-standby deadline so EnterHopOn (and later
@@ -436,7 +442,8 @@ func (v *VehicleSystem) handleHopOnRequest(action string) error {
 		v.mu.Lock()
 		v.hopOnSavedAutoStandbyDl = v.autoStandbyDeadline
 		v.mu.Unlock()
-		return v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnEngage})
+		silent := action == "engage-silent"
+		return v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnEngage, Payload: silent})
 
 	case "release":
 		if v.machine.CurrentState() != fsm.StateHopOn {

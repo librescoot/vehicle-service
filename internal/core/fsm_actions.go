@@ -552,8 +552,28 @@ func (v *VehicleSystem) EnterHibernationConfirm(c *librefsm.Context) error {
 // timer is resumed from the deadline that handleHopOnRequest captured
 // just before sending EvHopOnEngage (since ExitParked already cleared
 // the live deadline by the time this runs).
+//
+// If the EvHopOnEngage payload carries silent=true (combo learning
+// mode), the user-facing side-effects (LED cue, opportunistic steering
+// lock, hop-on-active flag publish) are skipped — only the input
+// suppression behaviour of StateHopOn is borrowed. The auto-standby
+// resume still happens regardless.
 func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
-	v.logger.Infof("FSM: EnterHopOn")
+	silent := false
+	if c != nil && c.Event != nil {
+		if s, ok := c.Event.Payload.(bool); ok {
+			silent = s
+		}
+	}
+	if silent {
+		v.logger.Infof("FSM: EnterHopOn (silent)")
+	} else {
+		v.logger.Infof("FSM: EnterHopOn")
+	}
+
+	v.mu.Lock()
+	v.hopOnSilent = silent
+	v.mu.Unlock()
 
 	// Resume the auto-standby timer using the saved deadline. If it has
 	// already passed, fire the timeout immediately so the FSM moves to
@@ -575,6 +595,13 @@ func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
 			v.logger.Warnf("Failed to publish auto-standby deadline in hop-on: %v", err)
 		}
 		v.logger.Infof("hop-on: resumed auto-standby timer with %v remaining", remaining)
+	}
+
+	if silent {
+		// Learning mode: suppress every user-facing signal. The dashboard
+		// shows its own learn overlay; vehicle-service stays "invisible"
+		// while the user records their combo.
+		return nil
 	}
 
 	// Publish the hop-on flag so the dashboard renders the lock screen.
@@ -630,11 +657,23 @@ func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
 }
 
 // ExitHopOn leaves hop-on / hop-off mode. Always cancels the auto-standby
-// timer (EnterParked or another state's onEnter will rearm it as needed),
-// publishes hop-on-active=false, plays the reverse LED cue, and releases
-// the steering lock if WE engaged it on entry.
+// timer (EnterParked or another state's onEnter will rearm it as needed)
+// and releases the steering lock if WE engaged it on entry. The
+// user-facing reverse LED cue and hop-on-active publish are skipped if
+// we entered silently (combo learning) — they were never set.
 func (v *VehicleSystem) ExitHopOn(c *librefsm.Context) error {
-	v.logger.Infof("FSM: ExitHopOn")
+	v.mu.Lock()
+	silent := v.hopOnSilent
+	v.hopOnSilent = false
+	releaseHandlebar := v.hopOnLockedHandlebar
+	v.hopOnLockedHandlebar = false
+	v.mu.Unlock()
+
+	if silent {
+		v.logger.Infof("FSM: ExitHopOn (silent)")
+	} else {
+		v.logger.Infof("FSM: ExitHopOn")
+	}
 
 	if v.machine != nil {
 		v.machine.StopTimer(fsm.TimerAutoStandby)
@@ -646,23 +685,22 @@ func (v *VehicleSystem) ExitHopOn(c *librefsm.Context) error {
 	v.autoStandbyDeadline = time.Time{}
 	v.mu.Unlock()
 
-	if err := v.redis.SetHopOnActive(false); err != nil {
-		v.logger.Warnf("Failed to publish hop-on-active=false: %v", err)
+	if !silent {
+		if err := v.redis.SetHopOnActive(false); err != nil {
+			v.logger.Warnf("Failed to publish hop-on-active=false: %v", err)
+		}
+
+		// Reverse LED cue: same one we play for standby->parked.
+		brakeLeft, brakeRight, _ := v.readBrakeStates()
+		if brakeLeft || brakeRight {
+			v.playLedCue(2, "hop-on release (brakes on)")
+		} else {
+			v.playLedCue(1, "hop-on release (brakes off)")
+		}
 	}
 
-	// Reverse LED cue: same one we play for standby->parked.
-	brakeLeft, brakeRight, _ := v.readBrakeStates()
-	if brakeLeft || brakeRight {
-		v.playLedCue(2, "hop-on release (brakes on)")
-	} else {
-		v.playLedCue(1, "hop-on release (brakes off)")
-	}
-
-	// Release the steering lock only if we engaged it on entry.
-	v.mu.Lock()
-	releaseHandlebar := v.hopOnLockedHandlebar
-	v.hopOnLockedHandlebar = false
-	v.mu.Unlock()
+	// Release the steering lock only if we engaged it on entry. Silent
+	// mode never engages it, so this is naturally a no-op for learning.
 	if releaseHandlebar {
 		v.logger.Infof("hop-on: releasing steering lock that we engaged")
 		go func() {
