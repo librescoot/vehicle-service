@@ -18,6 +18,14 @@ const (
 	StateHibernationAwaitingConfirm librefsm.StateID = "hibernation-awaiting-confirm"
 	StateHibernationSeatbox         librefsm.StateID = "hibernation-seatbox"
 	StateHibernationConfirm         librefsm.StateID = "hibernation-confirm"
+
+	// Hop-on / hop-off mode: a sibling of Parked. While in this state the
+	// scooter stays powered up but ALL physical inputs are published only,
+	// never processed (no horn, no blinker, no kickstand->RTD, no seatbox
+	// open). The auto-standby timer's deadline is preserved across the
+	// engage/release transitions so a forgotten hop-on still drops to
+	// standby on schedule.
+	StateHopOn librefsm.StateID = "hop-on"
 )
 
 // Vehicle events
@@ -53,6 +61,10 @@ const (
 
 	// Seatbox events
 	EvSeatboxClosed librefsm.EventID = "seatbox-closed"
+
+	// Hop-on / hop-off mode events
+	EvHopOnEngage  librefsm.EventID = "hop-on-engage"
+	EvHopOnRelease librefsm.EventID = "hop-on-release"
 )
 
 // Timer names for imperative timers

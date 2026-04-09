@@ -24,6 +24,10 @@ type Actions interface {
 	EnterHibernationSeatbox(c *librefsm.Context) error
 	EnterHibernationConfirm(c *librefsm.Context) error
 
+	// Hop-on / hop-off state actions
+	EnterHopOn(c *librefsm.Context) error
+	ExitHopOn(c *librefsm.Context) error
+
 	// Guards for conditional transitions
 	CanEnterReadyToDrive(c *librefsm.Context) bool // True when both kickstand up AND dashboard ready
 	IsDashboardReady(c *librefsm.Context) bool     // True when dashboard has booted
@@ -32,7 +36,6 @@ type Actions interface {
 	IsSeatboxClosed(c *librefsm.Context) bool
 	AreBrakesPressed(c *librefsm.Context) bool
 	IsHandlebarUnlocked(c *librefsm.Context) bool // True when handlebar lock sensor shows unlocked
-	IsHopOnInactive(c *librefsm.Context) bool     // False while hop-on / hop-off mode is engaged (blocks Parked->RTD)
 
 	// Transition actions
 	OnShutdownTimeout(c *librefsm.Context) error

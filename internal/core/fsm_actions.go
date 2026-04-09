@@ -39,6 +39,12 @@ func stateIDToSystemState(id librefsm.StateID) types.SystemState {
 		return types.StateWaitingHibernationSeatbox
 	case fsm.StateHibernationConfirm:
 		return types.StateWaitingHibernationConfirm
+	case fsm.StateHopOn:
+		// Externally hop-on looks like parked: the dashboard's `isParked()`
+		// check (used to allow opening the menu, learning, etc.) keeps
+		// working. Hop-on engagement is signalled separately via the
+		// `vehicle:hop-on-active` field.
+		return types.StateParked
 	default:
 		return types.SystemState(string(id))
 	}
@@ -262,21 +268,51 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 		}
 	}
 
-	// Start auto-standby timer using librefsm
+	// Start (or resume) the auto-standby timer.
+	//
+	// When transitioning back from hop-on we resume from the saved
+	// deadline so a forgotten hop-on still drops to standby on the
+	// original schedule. handleHopOnRequest captures the live deadline
+	// just before sending EvHopOnEngage; ExitParked then clears the
+	// live one but the saved copy persists across the StateHopOn detour.
 	v.mu.RLock()
 	seconds := v.autoStandbySeconds
+	saved := v.hopOnSavedAutoStandbyDl
 	v.mu.RUnlock()
 
-	if seconds > 0 && v.machine != nil {
-		duration := time.Duration(seconds) * time.Second
-		v.machine.StartTimer(fsm.TimerAutoStandby, duration, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
-		v.logger.Infof("Started auto-standby timer: %d seconds", seconds)
+	cameFromHopOn := c.FromState == fsm.StateHopOn
 
-		// Publish the deadline time so UI can display countdown
-		deadline := time.Now().Add(duration)
+	if seconds > 0 && v.machine != nil {
+		var duration time.Duration
+		var deadline time.Time
+
+		if cameFromHopOn && !saved.IsZero() {
+			deadline = saved
+			duration = time.Until(deadline)
+			if duration < 1*time.Millisecond {
+				duration = 1 * time.Millisecond
+			}
+			v.logger.Infof("Resumed auto-standby timer with %v remaining (came from hop-on)", duration)
+		} else {
+			duration = time.Duration(seconds) * time.Second
+			deadline = time.Now().Add(duration)
+			v.logger.Infof("Started auto-standby timer: %d seconds", seconds)
+		}
+
+		v.mu.Lock()
+		v.autoStandbyDeadline = deadline
+		v.hopOnSavedAutoStandbyDl = time.Time{} // consumed (or stale — clear either way)
+		v.mu.Unlock()
+
+		v.machine.StartTimer(fsm.TimerAutoStandby, duration, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
 		if err := v.redis.PublishAutoStandbyDeadline(deadline); err != nil {
 			v.logger.Warnf("Failed to publish auto-standby deadline: %v", err)
 		}
+	} else {
+		// Even if no timer is armed, clear any stale saved deadline.
+		v.mu.Lock()
+		v.hopOnSavedAutoStandbyDl = time.Time{}
+		v.mu.Unlock()
 	}
 
 	return nil
@@ -429,6 +465,12 @@ func (v *VehicleSystem) ExitParked(c *librefsm.Context) error {
 	if err := v.redis.ClearAutoStandbyDeadline(); err != nil {
 		v.logger.Warnf("Failed to clear auto-standby deadline: %v", err)
 	}
+	// Clear the live deadline. The saved-for-hop-on copy is intentionally
+	// NOT touched here — handleHopOnRequest captured it before triggering
+	// EvHopOnEngage so EnterHopOn / EnterParked-from-HopOn can resume.
+	v.mu.Lock()
+	v.autoStandbyDeadline = time.Time{}
+	v.mu.Unlock()
 	return nil
 }
 
@@ -505,6 +547,149 @@ func (v *VehicleSystem) EnterHibernationConfirm(c *librefsm.Context) error {
 	return nil
 }
 
+// EnterHopOn enters hop-on / hop-off mode. The scooter stays powered up
+// but handleInputChange will publish-only every input. The auto-standby
+// timer is resumed from the deadline that handleHopOnRequest captured
+// just before sending EvHopOnEngage (since ExitParked already cleared
+// the live deadline by the time this runs).
+func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
+	v.logger.Infof("FSM: EnterHopOn")
+
+	// Resume the auto-standby timer using the saved deadline. If it has
+	// already passed, fire the timeout immediately so the FSM moves to
+	// shutdown without delay.
+	v.mu.RLock()
+	saved := v.hopOnSavedAutoStandbyDl
+	v.mu.RUnlock()
+
+	if !saved.IsZero() && v.machine != nil {
+		remaining := time.Until(saved)
+		if remaining < 1*time.Millisecond {
+			remaining = 1 * time.Millisecond
+		}
+		v.machine.StartTimer(fsm.TimerAutoStandby, remaining, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
+		v.mu.Lock()
+		v.autoStandbyDeadline = saved
+		v.mu.Unlock()
+		if err := v.redis.PublishAutoStandbyDeadline(saved); err != nil {
+			v.logger.Warnf("Failed to publish auto-standby deadline in hop-on: %v", err)
+		}
+		v.logger.Infof("hop-on: resumed auto-standby timer with %v remaining", remaining)
+	}
+
+	// Publish the hop-on flag so the dashboard renders the lock screen.
+	if err := v.redis.SetHopOnActive(true); err != nil {
+		v.logger.Warnf("Failed to publish hop-on-active=true: %v", err)
+	}
+
+	// Play the same LED cue we use for parked->standby (cue 7/8 picked
+	// by current brake state). Visually the scooter "powers down".
+	brakeLeft, brakeRight, _ := v.readBrakeStates()
+	if brakeLeft || brakeRight {
+		v.playLedCue(8, "hop-on engage (brakes on)")
+	} else {
+		v.playLedCue(7, "hop-on engage (brakes off)")
+	}
+
+	// Opportunistic steering-lock engagement: only if the handlebar
+	// happens to be in lock-position right now. Synchronous pulse
+	// (~1.1s) so run on a goroutine to avoid blocking the FSM.
+	positioned, err := v.io.ReadDigitalInputDirect("handlebar_position")
+	if err != nil {
+		v.logger.Warnf("hop-on: failed to read handlebar position: %v", err)
+	} else if positioned {
+		v.logger.Infof("hop-on: handlebar in position, engaging steering lock")
+		go func() {
+			if err := v.pulseHandlebarLock(true); err != nil {
+				v.logger.Warnf("hop-on: failed to pulse handlebar lock: %v", err)
+				return
+			}
+			time.Sleep(handlebarLockRetryDelay)
+			sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+			if err != nil {
+				v.logger.Warnf("hop-on: failed to read handlebar lock sensor after pulse: %v", err)
+				return
+			}
+			v.mu.Lock()
+			v.handlebarUnlocked = sensorVal
+			if !sensorVal {
+				v.hopOnLockedHandlebar = true
+			}
+			v.mu.Unlock()
+			if sensorVal {
+				v.logger.Warnf("hop-on: lock pulse fired but sensor still reads unlocked")
+			} else {
+				v.logger.Infof("hop-on: steering lock engaged")
+			}
+		}()
+	} else {
+		v.logger.Debugf("hop-on: handlebar not in position, skipping steering lock")
+	}
+
+	return nil
+}
+
+// ExitHopOn leaves hop-on / hop-off mode. Always cancels the auto-standby
+// timer (EnterParked or another state's onEnter will rearm it as needed),
+// publishes hop-on-active=false, plays the reverse LED cue, and releases
+// the steering lock if WE engaged it on entry.
+func (v *VehicleSystem) ExitHopOn(c *librefsm.Context) error {
+	v.logger.Infof("FSM: ExitHopOn")
+
+	if v.machine != nil {
+		v.machine.StopTimer(fsm.TimerAutoStandby)
+	}
+	if err := v.redis.ClearAutoStandbyDeadline(); err != nil {
+		v.logger.Warnf("Failed to clear auto-standby deadline on hop-on exit: %v", err)
+	}
+	v.mu.Lock()
+	v.autoStandbyDeadline = time.Time{}
+	v.mu.Unlock()
+
+	if err := v.redis.SetHopOnActive(false); err != nil {
+		v.logger.Warnf("Failed to publish hop-on-active=false: %v", err)
+	}
+
+	// Reverse LED cue: same one we play for standby->parked.
+	brakeLeft, brakeRight, _ := v.readBrakeStates()
+	if brakeLeft || brakeRight {
+		v.playLedCue(2, "hop-on release (brakes on)")
+	} else {
+		v.playLedCue(1, "hop-on release (brakes off)")
+	}
+
+	// Release the steering lock only if we engaged it on entry.
+	v.mu.Lock()
+	releaseHandlebar := v.hopOnLockedHandlebar
+	v.hopOnLockedHandlebar = false
+	v.mu.Unlock()
+	if releaseHandlebar {
+		v.logger.Infof("hop-on: releasing steering lock that we engaged")
+		go func() {
+			if err := v.pulseHandlebarLock(false); err != nil {
+				v.logger.Warnf("hop-on: failed to pulse handlebar unlock: %v", err)
+				return
+			}
+			time.Sleep(handlebarUnlockRetryDelay)
+			sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+			if err != nil {
+				v.logger.Warnf("hop-on: failed to read handlebar lock sensor after unlock pulse: %v", err)
+				return
+			}
+			v.mu.Lock()
+			v.handlebarUnlocked = sensorVal
+			v.mu.Unlock()
+			if !sensorVal {
+				v.logger.Warnf("hop-on: unlock pulse fired but sensor still reads locked")
+			} else {
+				v.logger.Infof("hop-on: steering lock released")
+			}
+		}()
+	}
+
+	return nil
+}
+
 // === Guards ===
 
 func (v *VehicleSystem) IsDashboardReady(c *librefsm.Context) bool {
@@ -560,16 +745,6 @@ func (v *VehicleSystem) AreBrakesPressed(c *librefsm.Context) bool {
 	brakeLeft, _ := v.io.ReadDigitalInput("brake_left")
 	brakeRight, _ := v.io.ReadDigitalInput("brake_right")
 	return brakeLeft && brakeRight
-}
-
-// IsHopOnInactive returns true while hop-on / hop-off mode is NOT engaged.
-// Used as an extra guard on every Parked->ReadyToDrive transition so that
-// while hop-on is active, neither EvUnlock, EvKickstandUp, EvDashboardReady
-// nor the seatbox+brakes manual RTD path can promote the FSM out of Parked.
-func (v *VehicleSystem) IsHopOnInactive(c *librefsm.Context) bool {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return !v.hopOnActive
 }
 
 // === Transition Actions ===
