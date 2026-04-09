@@ -40,6 +40,9 @@ type MessagingClient interface {
 	PublishAutoStandbyDeadline(deadline time.Time) error
 	ClearAutoStandbyDeadline() error
 
+	// Hop-on / hop-off
+	SetHopOnActive(active bool) error
+
 	// Sensors and switches
 	SetBrakeState(side string, pressed bool) error
 	SetKickstandState(deployed bool) error

@@ -32,6 +32,7 @@ type Actions interface {
 	IsSeatboxClosed(c *librefsm.Context) bool
 	AreBrakesPressed(c *librefsm.Context) bool
 	IsHandlebarUnlocked(c *librefsm.Context) bool // True when handlebar lock sensor shows unlocked
+	IsHopOnInactive(c *librefsm.Context) bool     // False while hop-on / hop-off mode is engaged (blocks Parked->RTD)
 
 	// Transition actions
 	OnShutdownTimeout(c *librefsm.Context) error

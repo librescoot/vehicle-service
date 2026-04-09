@@ -82,6 +82,10 @@ type VehicleSystem struct {
 	hornEnableMode          string            // Horn enable mode: "true", "false", or "in-drive" (default: "true")
 	hibernationForceTimer   *time.Timer       // Timer for forcing hibernation after 15s of brake hold
 	machine                 *librefsm.Machine // librefsm state machine
+
+	// Hop-on / hop-off mode (runtime-only — does NOT survive a power cycle)
+	hopOnActive          bool // While true, FSM blocks Parked->ReadyToDrive
+	hopOnLockedHandlebar bool // True when WE engaged the steering lock on hop-on entry
 }
 
 func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *VehicleSystem {
@@ -125,6 +129,7 @@ func (v *VehicleSystem) Start() error {
 		HardwareCallback:  v.handleHardwareRequest,
 		SettingsCallback:        v.handleSettingsUpdate,
 		OtaDbcActivityCallback: v.resetDbcWatchdog,
+		HopOnCallback:          v.handleHopOnRequest,
 	})
 
 	// Connect to Redis first so we can retrieve saved state

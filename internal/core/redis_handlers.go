@@ -408,6 +408,138 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 	return nil
 }
 
+// handleHopOnRequest engages or releases hop-on / hop-off mode.
+//
+// In hop-on mode the scooter stays in StateParked (auto-standby still ticks)
+// but the FSM blocks every Parked->ReadyToDrive transition via the
+// IsHopOnInactive guard, so a stranger kicking the kickstand up cannot ride
+// the scooter away. The dashboard turns its backlight off and watches for
+// the user-defined unlock combo.
+//
+// On engage, if the handlebar happens to be in lock-position right now, the
+// steering lock is engaged opportunistically (we do NOT wait for the user to
+// position it — that would defeat the "fast hop off" goal). On release the
+// lock is reversed only if WE engaged it.
+func (v *VehicleSystem) handleHopOnRequest(action string) error {
+	switch action {
+	case "engage":
+		v.mu.Lock()
+		if v.hopOnActive {
+			v.mu.Unlock()
+			v.logger.Debugf("hop-on engage requested but already active — no-op")
+			return nil
+		}
+		v.hopOnActive = true
+		v.mu.Unlock()
+
+		v.logger.Infof("Hop-on mode engaged")
+		if err := v.redis.SetHopOnActive(true); err != nil {
+			v.logger.Warnf("Failed to publish hop-on-active=true: %v", err)
+		}
+
+		// Play the same LED cue we use when transitioning Parked->Standby
+		// (cue 7 = brakes off, cue 8 = brakes on). Visually this turns the
+		// scooter "off" — same effect the user is used to from auto-lock.
+		brakeLeftHopOn, brakeRightHopOn, _ := v.readBrakeStates()
+		if brakeLeftHopOn || brakeRightHopOn {
+			v.playLedCue(8, "hop-on engage (brakes on)")
+		} else {
+			v.playLedCue(7, "hop-on engage (brakes off)")
+		}
+
+		// Opportunistic steering-lock engagement: only if the handlebar is
+		// already in position right now. The pulse is synchronous (~1.1s)
+		// so run it on a goroutine to avoid blocking the redis handler.
+		positioned, err := v.io.ReadDigitalInputDirect("handlebar_position")
+		if err != nil {
+			v.logger.Warnf("hop-on: failed to read handlebar position: %v", err)
+		} else if positioned {
+			v.logger.Infof("hop-on: handlebar in position, engaging steering lock")
+			go func() {
+				if err := v.pulseHandlebarLock(true); err != nil {
+					v.logger.Warnf("hop-on: failed to pulse handlebar lock: %v", err)
+					return
+				}
+				time.Sleep(handlebarLockRetryDelay)
+				sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+				if err != nil {
+					v.logger.Warnf("hop-on: failed to read handlebar lock sensor after pulse: %v", err)
+					return
+				}
+				v.mu.Lock()
+				v.handlebarUnlocked = sensorVal
+				if !sensorVal {
+					v.hopOnLockedHandlebar = true
+				}
+				v.mu.Unlock()
+				if sensorVal {
+					v.logger.Warnf("hop-on: lock pulse fired but sensor still reads unlocked")
+				} else {
+					v.logger.Infof("hop-on: steering lock engaged")
+				}
+			}()
+		} else {
+			v.logger.Debugf("hop-on: handlebar not in position, skipping steering lock")
+		}
+		return nil
+
+	case "release":
+		v.mu.Lock()
+		if !v.hopOnActive {
+			v.mu.Unlock()
+			v.logger.Debugf("hop-on release requested but not active — no-op")
+			return nil
+		}
+		v.hopOnActive = false
+		releaseHandlebar := v.hopOnLockedHandlebar
+		v.hopOnLockedHandlebar = false
+		v.mu.Unlock()
+
+		v.logger.Infof("Hop-on mode released")
+		if err := v.redis.SetHopOnActive(false); err != nil {
+			v.logger.Warnf("Failed to publish hop-on-active=false: %v", err)
+		}
+
+		// Play the same LED cue we use when transitioning Standby->Parked
+		// (cue 1 = brakes off, cue 2 = brakes on). Visually this turns the
+		// scooter back "on".
+		brakeLeftHopOff, brakeRightHopOff, _ := v.readBrakeStates()
+		if brakeLeftHopOff || brakeRightHopOff {
+			v.playLedCue(2, "hop-on release (brakes on)")
+		} else {
+			v.playLedCue(1, "hop-on release (brakes off)")
+		}
+
+		if releaseHandlebar {
+			v.logger.Infof("hop-on: releasing steering lock that we engaged")
+			go func() {
+				if err := v.pulseHandlebarLock(false); err != nil {
+					v.logger.Warnf("hop-on: failed to pulse handlebar unlock: %v", err)
+					return
+				}
+				time.Sleep(handlebarUnlockRetryDelay)
+				sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+				if err != nil {
+					v.logger.Warnf("hop-on: failed to read handlebar lock sensor after unlock pulse: %v", err)
+					return
+				}
+				v.mu.Lock()
+				v.handlebarUnlocked = sensorVal
+				v.mu.Unlock()
+				if !sensorVal {
+					v.logger.Warnf("hop-on: unlock pulse fired but sensor still reads locked")
+				} else {
+					v.logger.Infof("hop-on: steering lock released")
+				}
+			}()
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("invalid hop-on action: %s", action)
+	}
+}
+
 // handleSettingsUpdate processes settings changes from Redis
 func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 	v.logger.Infof("Handling settings update: %s", settingKey)

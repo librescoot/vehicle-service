@@ -562,6 +562,16 @@ func (v *VehicleSystem) AreBrakesPressed(c *librefsm.Context) bool {
 	return brakeLeft && brakeRight
 }
 
+// IsHopOnInactive returns true while hop-on / hop-off mode is NOT engaged.
+// Used as an extra guard on every Parked->ReadyToDrive transition so that
+// while hop-on is active, neither EvUnlock, EvKickstandUp, EvDashboardReady
+// nor the seatbox+brakes manual RTD path can promote the FSM out of Parked.
+func (v *VehicleSystem) IsHopOnInactive(c *librefsm.Context) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return !v.hopOnActive
+}
+
 // === Transition Actions ===
 
 func (v *VehicleSystem) OnShutdownTimeout(c *librefsm.Context) error {
