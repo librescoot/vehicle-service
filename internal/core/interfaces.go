@@ -76,4 +76,7 @@ type HardwareIO interface {
 	// PWM control
 	PlayPwmCue(idx int) error
 	PlayPwmFade(ch int, idx int) error
+
+	// DBC boot LED
+	SetDbcLed(color string) error
 }

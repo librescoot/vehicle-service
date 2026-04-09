@@ -160,6 +160,8 @@ func (m *mockHardwareIO) PlayPwmFade(ch int, idx int) error {
 	return nil
 }
 
+func (m *mockHardwareIO) SetDbcLed(color string) error { return nil }
+
 // SimulateInput triggers an input callback
 func (m *mockHardwareIO) SimulateInput(channel string, value bool) error {
 	if cb, ok := m.inputCallbacks[channel]; ok {

@@ -491,6 +491,17 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 		v.mu.Unlock()
 		v.logger.Infof("Horn enable mode updated to: %s", value)
 
+	case "scooter.dbc-blinker-led":
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+		v.mu.Lock()
+		v.dbcBlinkerLed = value == "enabled"
+		v.mu.Unlock()
+		v.logger.Infof("DBC blinker LED setting updated to: %s", value)
+
 	default:
 		// Only log unknown settings if they're in the scooter namespace
 		// Silently ignore settings for other services (e.g., updates.*, battery.*, etc.)

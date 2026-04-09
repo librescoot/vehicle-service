@@ -81,6 +81,7 @@ type LinuxHardwareIO struct {
 	lines             map[string]*gpiocdev.Line
 	inputCallbacks    map[string]InputCallback
 	pwmLed            *ImxPwmLed
+	dbcLed            *DbcLed
 	mu                sync.RWMutex
 	stopChan          chan struct{}
 	activeKeys        map[uint16]bool            // Track key states
@@ -249,6 +250,15 @@ func (io *LinuxHardwareIO) Initialize() error {
 	// Get initial state of all inputs
 	if err := io.readInitialState(); err != nil {
 		io.logger.Infof("Warning: Failed to read initial input states: %v", err)
+	}
+
+	// Initialize DBC boot LED (best-effort — not present on all hardware)
+	dbcLed, err := NewDbcLed(DbcLedI2CDevice)
+	if err != nil {
+		io.logger.Infof("DBC LED not available (%v), skipping", err)
+	} else {
+		io.dbcLed = dbcLed
+		io.logger.Infof("DBC LED initialized")
 	}
 
 	// Start input monitoring
@@ -502,6 +512,13 @@ func (io *LinuxHardwareIO) PlayPwmFade(ch int, idx int) error {
 	return io.pwmLed.PlayFade(ch, idx)
 }
 
+func (io *LinuxHardwareIO) SetDbcLed(color string) error {
+	if io.dbcLed == nil {
+		return nil
+	}
+	return io.dbcLed.Set(color)
+}
+
 func (io *LinuxHardwareIO) Cleanup() {
 	close(io.stopChan)
 
@@ -557,6 +574,10 @@ func (io *LinuxHardwareIO) Cleanup() {
 		if io.logger != nil {
 			io.logger.Infof("Cleaned up PWM LED")
 		}
+	}
+
+	if io.dbcLed != nil {
+		io.dbcLed.Close()
 	}
 
 	if io.logger != nil {

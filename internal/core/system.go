@@ -80,6 +80,7 @@ type VehicleSystem struct {
 	brakeHibernationEnabled bool              // Track if brake lever hibernation is enabled (default: true)
 	autoStandbySeconds      int               // Auto-standby timeout in seconds (0 = disabled)
 	hornEnableMode          string            // Horn enable mode: "true", "false", or "in-drive" (default: "true")
+	dbcBlinkerLed           bool              // Blink DBC boot LED in sync with blinkers (default: false)
 	hibernationForceTimer   *time.Timer       // Timer for forcing hibernation after 15s of brake hold
 	machine                 *librefsm.Machine // librefsm state machine
 }
@@ -212,6 +213,17 @@ func (v *VehicleSystem) Start() error {
 		v.mu.Unlock()
 	} else {
 		v.logger.Infof("No horn enable mode setting found on startup, using default (true)")
+	}
+
+	// Read initial DBC blinker LED setting from Redis
+	dbcBlinkerLedSetting, err := v.redis.GetHashField("settings", "scooter.dbc-blinker-led")
+	if err != nil {
+		v.logger.Warnf("Failed to read DBC blinker LED setting on startup: %v", err)
+	} else if dbcBlinkerLedSetting != "" {
+		v.mu.Lock()
+		v.dbcBlinkerLed = dbcBlinkerLedSetting == "enabled"
+		v.mu.Unlock()
+		v.logger.Infof("DBC blinker LED setting on startup: %s", dbcBlinkerLedSetting)
 	}
 
 	// Check if DBC update is in progress and restore dbcUpdating flag
@@ -955,27 +967,54 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 }
 
 func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}) {
-	if err := v.io.PlayPwmCue(cue); err != nil {
-		v.logger.Warnf("Error playing blinker cue: %v", err)
+	v.mu.RLock()
+	dbcLed := v.dbcBlinkerLed
+	v.mu.RUnlock()
+
+	ledColor := "green"
+	if state == "both" {
+		ledColor = "red"
 	}
 
+	setDbcLed := func(color string) {
+		if !dbcLed {
+			return
+		}
+		if err := v.io.SetDbcLed(color); err != nil {
+			v.logger.Warnf("Error setting DBC LED: %v", err)
+		}
+	}
+
+	playCue := func() {
+		if err := v.io.PlayPwmCue(cue); err != nil {
+			v.logger.Warnf("Error playing blinker cue: %v", err)
+		}
+		setDbcLed(ledColor)
+	}
+
+	playCue()
+
 	ticker := time.NewTicker(blinkerInterval)
+	halfTimer := time.NewTimer(blinkerInterval / 2)
 	defer ticker.Stop()
+	defer halfTimer.Stop()
 
 	for {
 		select {
 		case <-stopChan:
+			setDbcLed("off")
 			return
+		case <-halfTimer.C:
+			setDbcLed("off")
 		case <-ticker.C:
-			// Check stop before playing to avoid post-stop cue replay
 			select {
 			case <-stopChan:
+				setDbcLed("off")
 				return
 			default:
 			}
-			if err := v.io.PlayPwmCue(cue); err != nil {
-				v.logger.Warnf("Error playing blinker cue: %v", err)
-			}
+			playCue()
+			halfTimer.Reset(blinkerInterval / 2)
 		}
 	}
 }
