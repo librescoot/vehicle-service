@@ -59,6 +59,7 @@ func (m *mockMessagingClient) RemoveInhibitor(id string) error                { 
 func (m *mockMessagingClient) GetHashField(hash, field string) (string, error) { return m.hashFieldValue, nil }
 func (m *mockMessagingClient) PublishAutoStandbyDeadline(deadline time.Time) error { return nil }
 func (m *mockMessagingClient) ClearAutoStandbyDeadline() error                { return nil }
+func (m *mockMessagingClient) SetHopOnActive(active bool) error               { return nil }
 func (m *mockMessagingClient) SetKickstandState(deployed bool) error          { return nil }
 func (m *mockMessagingClient) SetHandlebarLockState(locked bool) error        { return nil }
 func (m *mockMessagingClient) SetSeatboxLockState(locked bool) error          { return nil }

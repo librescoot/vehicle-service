@@ -73,6 +73,17 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 			librefsm.WithOnEnter(actions.EnterHibernationConfirm),
 		).
 
+		// Hop-on / hop-off mode (sibling of Parked).
+		// While in this state every physical input is published only,
+		// never processed — see handleInputChange's hop-on early-return.
+		// The auto-standby deadline is preserved across the engage and
+		// release transitions by VehicleSystem so a forgotten hop-on
+		// still drops to standby on the original schedule.
+		State(StateHopOn,
+			librefsm.WithOnEnter(actions.EnterHopOn),
+			librefsm.WithOnExit(actions.ExitHopOn),
+		).
+
 		// === Transitions ===
 
 		// From Init
@@ -83,7 +94,7 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateStandby, EvKeycardAuth, StateParked).    // Keycard tap unlocks from standby
 		Transition(StateStandby, EvDbcUpdateComplete, StateShuttingDown). // DBC update complete, give DBC time to poweroff
 
-		// From Parked - unlock/kickstand-up/dashboard-ready to ReadyToDrive if conditions met
+		// From Parked - unlock/kickstand-up/dashboard-ready to ReadyToDrive if conditions met.
 		Transition(StateParked, EvUnlock, StateReadyToDrive,
 			librefsm.WithGuard(actions.CanEnterReadyToDrive), // Requires both kickstand up AND dashboard ready
 		).
@@ -122,6 +133,30 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// Hibernation entry: both brakes pressed in parked state
 		Transition(StateParked, EvBrakesPressed, StateHibernationInitialHold,
 			librefsm.WithGuard(actions.AreBrakesPressed),
+		).
+		// Hop-on / hop-off engage
+		Transition(StateParked, EvHopOnEngage, StateHopOn).
+
+		// From HopOn — the only "normal" exit is the explicit release
+		// (combo matched on the dashboard). Standard escape paths still
+		// work: lock, force-lock, keycard, auto-standby timeout. Inputs
+		// like kickstand-up are deliberately NOT routed here because
+		// handleInputChange suppresses every FSM event send while in
+		// StateHopOn — the inputs are published but not processed.
+		Transition(StateHopOn, EvHopOnRelease, StateParked).
+		Transition(StateHopOn, EvAutoStandbyTimeout, StateShuttingDown).
+		Transition(StateHopOn, EvLock, StateShuttingDown,
+			librefsm.WithGuard(actions.IsSeatboxClosed),
+		).
+		Transition(StateHopOn, EvLock, StateWaitingSeatbox). // Fallback if seatbox open
+		Transition(StateHopOn, EvForceLock, StateStandby,
+			librefsm.WithAction(actions.OnForceLock),
+		).
+		Transition(StateHopOn, EvKeycardAuth, StateShuttingDown,
+			librefsm.WithGuards(actions.IsKickstandDown, actions.IsSeatboxClosed),
+		).
+		Transition(StateHopOn, EvKeycardAuth, StateWaitingSeatbox,
+			librefsm.WithGuard(actions.IsKickstandDown),
 		).
 
 		// From ReadyToDrive

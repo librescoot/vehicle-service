@@ -28,6 +28,7 @@ type Callbacks struct {
 	HardwareCallback  func(string) error // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
 	SettingsCallback  func(string) error // setting key that was updated (e.g., "scooter.brake-hibernation")
 	OtaDbcActivityCallback func() error  // Called on any OTA hash field change for DBC component
+	HopOnCallback     func(string) error // "engage", "release"
 }
 
 type RedisClient struct {
@@ -166,6 +167,7 @@ func (r *RedisClient) StartListening() error {
 	ipc.HandleRequests(r.client, "scooter:led:fade", r.handleLedFadeCommand)
 	ipc.HandleRequests(r.client, "scooter:update", r.handleUpdateCommand)
 	ipc.HandleRequests(r.client, "scooter:hardware", r.handleHardwareCommand)
+	ipc.HandleRequests(r.client, "scooter:hop-on", r.handleHopOnCommand)
 
 	r.logger.Infof("Successfully started all Redis listeners")
 	return nil
@@ -279,6 +281,24 @@ func (r *RedisClient) handleHardwareCommand(value string) error {
 	r.logger.Infof("Processing hardware command: %s", value)
 
 	return r.callbacks.HardwareCallback(value)
+}
+
+// handleHopOnCommand processes hop-on / hop-off mode commands.
+// Accepts "engage" to enter hop-on mode (block ready-to-drive transitions)
+// and "release" to leave it. The dashboard sends these via LPUSH to
+// "scooter:hop-on".
+func (r *RedisClient) handleHopOnCommand(value string) error {
+	if r.callbacks.HopOnCallback == nil {
+		return nil
+	}
+	switch value {
+	case "engage", "release":
+		r.logger.Infof("Processing hop-on command: %s", value)
+		return r.callbacks.HopOnCallback(value)
+	default:
+		r.logger.Infof("Invalid hop-on command value: %s", value)
+		return fmt.Errorf("invalid hop-on command: %s", value)
+	}
 }
 
 
@@ -550,6 +570,22 @@ func (r *RedisClient) GetDashboardPower() (bool, error) {
 		return false, nil // Field doesn't exist, default to false/off
 	}
 	return value == "on", nil
+}
+
+// SetHopOnActive publishes the hop-on / hop-off mode flag to the vehicle hash.
+// While true, the FSM blocks Parked->ReadyToDrive transitions so the scooter
+// stays powered up but cannot be ridden away.
+func (r *RedisClient) SetHopOnActive(active bool) error {
+	value := "false"
+	if active {
+		value = "true"
+	}
+	if err := r.vehiclePub.Set("hop-on-active", value); err != nil {
+		r.logger.Warnf("Failed to set hop-on-active: %v", err)
+		return err
+	}
+	r.logger.Infof("Set hop-on-active=%s", value)
+	return nil
 }
 
 // PublishUpdateStatus publishes the update status to Redis

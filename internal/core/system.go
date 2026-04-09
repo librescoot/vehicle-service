@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -83,6 +84,13 @@ type VehicleSystem struct {
 	dbcBlinkerLed           bool              // Blink DBC boot LED in sync with blinkers (default: false)
 	hibernationForceTimer   *time.Timer       // Timer for forcing hibernation after 15s of brake hold
 	machine                 *librefsm.Machine // librefsm state machine
+
+	// Hop-on / hop-off mode (runtime-only — does NOT survive a power cycle).
+	// State is implicit in the FSM (StateHopOn). The two fields below are
+	// transient bookkeeping carried across the engage/release transitions.
+	hopOnLockedHandlebar    bool      // True when WE engaged the steering lock on hop-on entry
+	autoStandbyDeadline     time.Time // Live auto-standby deadline (set by EnterParked / EnterHopOn)
+	hopOnSavedAutoStandbyDl time.Time // Captured by handleHopOnRequest before ExitParked clears the live one
 }
 
 func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *VehicleSystem {
@@ -126,6 +134,7 @@ func (v *VehicleSystem) Start() error {
 		HardwareCallback:  v.handleHardwareRequest,
 		SettingsCallback:        v.handleSettingsUpdate,
 		OtaDbcActivityCallback: v.resetDbcWatchdog,
+		HopOnCallback:          v.handleHopOnRequest,
 	})
 
 	// Connect to Redis first so we can retrieve saved state
@@ -676,6 +685,50 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			v.logger.Infof("Warning: Failed to publish button event: %v", err)
 			// Continue with normal processing even if PUBSUB fails
 		}
+	}
+
+	// Hop-on / hop-off mode: publish input state but skip ALL action
+	// processing. The dashboard uses these inputs to match the unlock
+	// combo via the buttons PUBSUB channel and the vehicle hash sync;
+	// the scooter must NOT honk, blink, open the seatbox, or transition
+	// out of HopOn except via an explicit hop-on release (or one of the
+	// standard escape transitions defined on StateHopOn: lock, force-lock,
+	// keycard, auto-standby timeout). FSM events are deliberately not
+	// sent here so the FSM never sees kickstand-up etc. while in HopOn.
+	if v.machine != nil && v.machine.CurrentState() == fsm.StateHopOn {
+		switch channel {
+		case "brake_left":
+			return v.redis.SetBrakeState("left", value)
+		case "brake_right":
+			return v.redis.SetBrakeState("right", value)
+		case "horn_button":
+			return v.redis.SetHornButton(value)
+		case "seatbox_button":
+			return v.redis.SetSeatboxButton(value)
+		case "kickstand":
+			return v.redis.SetKickstandState(value)
+		case "blinker_left", "blinker_right":
+			// The top of this function skipped the PUBSUB publish for
+			// blinker channels (handleBlinkerChange normally handles them)
+			// — emit it manually so the dashboard's matcher sees it.
+			position := strings.TrimPrefix(channel, "blinker_")
+			evt := fmt.Sprintf("blinker:%s:%s", position, state)
+			if err := v.redis.PublishButtonEvent(evt); err != nil {
+				v.logger.Warnf("hop-on: failed to publish %s: %v", evt, err)
+			}
+			switchState := "off"
+			if value {
+				switchState = position
+			}
+			return v.redis.SetBlinkerSwitch(switchState)
+		case "handlebar_lock_sensor":
+			isLocked := !value
+			v.mu.Lock()
+			v.handlebarUnlocked = value // sensor true = unlocked
+			v.mu.Unlock()
+			return v.redis.SetHandlebarLockState(isLocked)
+		}
+		return nil
 	}
 
 	// First check if we should handle this input in current state
