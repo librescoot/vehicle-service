@@ -6,6 +6,7 @@ import (
 
 	"github.com/librescoot/librefsm"
 
+	"vehicle-service/internal/fsm"
 	"vehicle-service/internal/types"
 )
 
@@ -242,9 +243,9 @@ func (v *VehicleSystem) unlockHandlebar() {
 			default:
 			}
 
-			state := v.getCurrentState()
-			if state != types.StateParked && state != types.StateReadyToDrive {
-				v.logger.Infof("Handlebar unlock: state changed to %s, stopping retries", state)
+			stateID := v.getCurrentStateID()
+			if stateID != fsm.StateParked && stateID != fsm.StateReadyToDrive {
+				v.logger.Infof("Handlebar unlock: state changed to %s, stopping retries", stateID)
 				return
 			}
 
@@ -310,8 +311,8 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 		return nil // Only care about activation
 	}
 
-	state := v.getCurrentState()
-	if state != types.StateParked && state != types.StateReadyToDrive {
+	stateID := v.getCurrentStateID()
+	if stateID != fsm.StateParked && stateID != fsm.StateReadyToDrive {
 		return nil
 	}
 
