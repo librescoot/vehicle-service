@@ -266,6 +266,13 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 		} else {
 			v.playLedCue(1, "standby to parked brake off")
 		}
+
+		// Restore blinker if the physical switch is still held
+		if left, err := v.io.ReadDigitalInput("blinker_left"); err == nil && left {
+			v.handleBlinkerChange("blinker_left", true)
+		} else if right, err := v.io.ReadDigitalInput("blinker_right"); err == nil && right {
+			v.handleBlinkerChange("blinker_right", true)
+		}
 	}
 
 	// Start (or resume) the auto-standby timer.
@@ -322,6 +329,11 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: EnterStandby")
 
 	v.cancelHandlebarUnlock()
+
+	// Turn off any active blinkers
+	if err := v.handleBlinkerRequest("off"); err != nil {
+		v.logger.Warnf("Failed to turn off blinkers on standby: %v", err)
+	}
 
 	v.mu.Lock()
 	forcedStandby := v.forceStandbyNoLock
