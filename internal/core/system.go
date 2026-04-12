@@ -84,6 +84,7 @@ type VehicleSystem struct {
 	dbcBlinkerLed           bool              // Blink DBC boot LED in sync with blinkers (default: false)
 	hibernationForceTimer   *time.Timer       // Timer for forcing hibernation after 15s of brake hold
 	machine                 *librefsm.Machine // librefsm state machine
+	gestures                *gestureDetector
 
 	// Hop-on / hop-off mode (runtime-only — does NOT survive a power cycle).
 	// State is implicit in the FSM (StateHopOn). The fields below are
@@ -108,6 +109,11 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		hornEnableMode:          "true", // Default to always enabled for backward compatibility
 	}
 	vs.blinkerCueIndex.Store(-1)
+	vs.gestures = newGestureDetector(func(event string) {
+		if err := vs.redis.PublishInputEvent(event); err != nil {
+			vs.logger.Debugf("Failed to publish input event: %v", err)
+		}
+	}, gestureLongTapThreshold, gestureHoldThreshold)
 	return vs
 }
 
@@ -684,8 +690,19 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 	if shouldPublish {
 		if err := v.redis.PublishButtonEvent(buttonEvent); err != nil {
 			v.logger.Infof("Warning: Failed to publish button event: %v", err)
-			// Continue with normal processing even if PUBSUB fails
 		}
+	}
+
+	// Feed gesture detector for synthesized input events
+	switch channel {
+	case "brake_right":
+		v.gestures.OnChange("brake:right", value)
+	case "brake_left":
+		v.gestures.OnChange("brake:left", value)
+	case "seatbox_button":
+		v.gestures.OnChange("seatbox", value)
+	case "horn_button":
+		v.gestures.OnChange("horn", value)
 	}
 
 	// Hop-on / hop-off mode: publish input state but skip ALL action
