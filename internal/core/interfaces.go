@@ -56,6 +56,7 @@ type MessagingClient interface {
 
 	// Events
 	PublishButtonEvent(event string) error
+	PublishInputEvent(event string) error
 	PublishSeatboxOpened() error
 
 	// Commands

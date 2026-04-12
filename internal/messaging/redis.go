@@ -622,6 +622,18 @@ func (r *RedisClient) PublishButtonEvent(event string) error {
 	return nil
 }
 
+// PublishInputEvent publishes a synthesized gesture event to the "input-events" channel.
+// Events are formatted as "source:gesture" e.g. "brake:left:hold", "brake:right:tap".
+func (r *RedisClient) PublishInputEvent(event string) error {
+	r.logger.Debugf("Publishing input event: %s", event)
+	_, err := r.client.Publish("input-events", event)
+	if err != nil {
+		r.logger.Warnf("Failed to publish input event: %v", err)
+		return err
+	}
+	return nil
+}
+
 // PublishAutoStandbyCountdown publishes the auto-standby countdown to Redis
 // Deprecated: Use PublishAutoStandbyDeadline instead
 func (r *RedisClient) PublishAutoStandbyCountdown(remaining int) error {

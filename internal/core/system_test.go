@@ -101,6 +101,10 @@ func (m *mockMessagingClient) PublishButtonEvent(event string) error {
 	return nil
 }
 
+func (m *mockMessagingClient) PublishInputEvent(event string) error {
+	return nil
+}
+
 func (m *mockMessagingClient) PublishSeatboxOpened() error {
 	m.publishedSeatboxOpened++
 	return nil
