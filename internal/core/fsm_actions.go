@@ -165,6 +165,11 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 		v.cancelHandlebarUnlock()
 	}
 
+	// Ensure backlight is enabled for user interaction
+	if err := v.redis.SetBacklightEnabled(true); err != nil {
+		v.logger.Warnf("Failed to enable backlight: %v", err)
+	}
+
 	if err := v.setPower("engine_power", true); err != nil {
 		v.logger.Errorf("%v", err)
 		return err
@@ -222,6 +227,11 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 
 	if err := v.unlockHandlebarIfNeeded(); err != nil {
 		return err
+	}
+
+	// Ensure backlight is enabled for user interaction
+	if err := v.redis.SetBacklightEnabled(true); err != nil {
+		v.logger.Warnf("Failed to enable backlight: %v", err)
 	}
 
 	// Always turn on dashboard power when entering parked state

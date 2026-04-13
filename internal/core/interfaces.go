@@ -22,6 +22,7 @@ type MessagingClient interface {
 	// Dashboard
 	GetDashboardPower() (bool, error)
 	SetDashboardPower(enabled bool) error
+	SetBacklightEnabled(enabled bool) error
 	DeleteDashboardReadyFlag() error
 
 	// OTA/DBC

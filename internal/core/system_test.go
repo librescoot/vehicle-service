@@ -50,6 +50,7 @@ func (m *mockMessagingClient) Close() error                                   { 
 func (m *mockMessagingClient) GetVehicleState() (types.SystemState, error)    { return m.vehicleState, m.vehicleStateErr }
 func (m *mockMessagingClient) GetDashboardPower() (bool, error)               { return m.dashboardPower, nil }
 func (m *mockMessagingClient) SetDashboardPower(enabled bool) error           { m.dashboardPower = enabled; return nil }
+func (m *mockMessagingClient) SetBacklightEnabled(enabled bool) error         { return nil }
 func (m *mockMessagingClient) DeleteDashboardReadyFlag() error                { return nil }
 func (m *mockMessagingClient) GetDbcUpdating() (bool, error)                  { return m.dbcUpdating, nil }
 func (m *mockMessagingClient) SetDbcUpdating(updating bool) error             { m.dbcUpdating = updating; return nil }

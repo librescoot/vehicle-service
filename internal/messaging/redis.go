@@ -669,6 +669,18 @@ func (r *RedisClient) PublishGovernorChange(governor string) error {
 	return nil
 }
 
+// SetBacklightEnabled sets the dashboard backlight-enabled flag in Redis
+func (r *RedisClient) SetBacklightEnabled(enabled bool) error {
+	value := "false"
+	if enabled {
+		value = "true"
+	}
+	if err := r.dashboardPub.Set("backlight-enabled", value); err != nil {
+		return fmt.Errorf("failed to set backlight-enabled: %w", err)
+	}
+	return nil
+}
+
 // DeleteDashboardReadyFlag deletes the dashboard ready flag from Redis and publishes the change
 func (r *RedisClient) DeleteDashboardReadyFlag() error {
 	r.logger.Infof("Deleting dashboard ready flag from Redis")
