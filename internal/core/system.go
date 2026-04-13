@@ -35,17 +35,17 @@ const (
 	keycardTapMaxInterval   = 3 * time.Second // Max interval between taps to be part of a sequence
 
 	// Hardware timing constants
-	blinkerInterval              = 800 * time.Millisecond
-	handlebarPositionDebounce    = 250 * time.Millisecond
-	brakeDebounce                = 20 * time.Millisecond
-	handlebarLockDuration        = 1100 * time.Millisecond
-	handlebarLockWindow   = 60 * time.Second
+	blinkerInterval           = 800 * time.Millisecond
+	handlebarPositionDebounce = 250 * time.Millisecond
+	brakeDebounce             = 20 * time.Millisecond
+	handlebarLockDuration     = 1100 * time.Millisecond
+	handlebarLockWindow       = 60 * time.Second
 	handlebarLockRetries      = 3
 	handlebarLockRetryDelay   = 500 * time.Millisecond
 	handlebarUnlockRetries    = 3
 	handlebarUnlockRetryDelay = 500 * time.Millisecond
-	seatboxLockDuration   = 200 * time.Millisecond
-	parkDebounceTime      = 1 * time.Second
+	seatboxLockDuration       = 200 * time.Millisecond
+	parkDebounceTime          = 1 * time.Second
 
 	// DBC update watchdog — reset on every OTA status write from DBC
 	dbcUpdateWatchdogTimeout = 15 * time.Minute
@@ -60,16 +60,16 @@ type VehicleSystem struct {
 	mu                      sync.RWMutex
 	blinkerState            BlinkerState
 	blinkerStopChan         chan struct{}
-	blinkerStartNanos       atomic.Int64       // UnixNano when blinker goroutine started (0 if inactive)
-	blinkerCueIndex         atomic.Int32       // Currently playing blinker cue index (-1 if none)
-	ledCurves               *led.CurveLibrary  // LED fade/cue metadata for timing
+	blinkerStartNanos       atomic.Int64      // UnixNano when blinker goroutine started (0 if inactive)
+	blinkerCueIndex         atomic.Int32      // Currently playing blinker cue index (-1 if none)
+	ledCurves               *led.CurveLibrary // LED fade/cue metadata for timing
 	initialized             bool
 	handlebarUnlocked       bool          // Track if handlebar has been unlocked in this power cycle
 	handlebarTimer          *time.Timer   // Timer for handlebar position window
-	handlebarDone           chan struct{}  // Done channel for handlebar lock goroutine
-	handlebarUnlockDone     chan struct{}  // Done channel for handlebar unlock goroutine
-	readyToDriveEntryTime   time.Time    // Track when we entered ready-to-drive state for park debounce
-	kickstandDebounceTimer  *time.Timer  // Deferred kickstand-down check after debounce window
+	handlebarDone           chan struct{} // Done channel for handlebar lock goroutine
+	handlebarUnlockDone     chan struct{} // Done channel for handlebar unlock goroutine
+	readyToDriveEntryTime   time.Time     // Track when we entered ready-to-drive state for park debounce
+	kickstandDebounceTimer  *time.Timer   // Deferred kickstand-down check after debounce window
 	keycardTapCount         int
 	lastKeycardTapTime      time.Time
 	forceStandbyNoLock      bool
@@ -129,18 +129,18 @@ func (v *VehicleSystem) Start() error {
 
 	// Set up Redis callbacks
 	v.redis.SetCallbacks(messaging.Callbacks{
-		DashboardCallback: v.handleDashboardReady,
-		KeycardCallback:   v.keycardAuthPassed,
-		SeatboxCallback:   v.handleSeatboxRequest,
-		HornCallback:      v.handleHornRequest,
-		BlinkerCallback:   v.handleBlinkerRequest,
-		StateCallback:     v.handleStateRequest,
-		ForceLockCallback: v.handleForceLockRequest,
-		LedCueCallback:    v.handleLedCueRequest,
-		LedFadeCallback:   v.handleLedFadeRequest,
-		UpdateCallback:    v.handleUpdateRequest,
-		HardwareCallback:  v.handleHardwareRequest,
-		SettingsCallback:        v.handleSettingsUpdate,
+		DashboardCallback:      v.handleDashboardReady,
+		KeycardCallback:        v.keycardAuthPassed,
+		SeatboxCallback:        v.handleSeatboxRequest,
+		HornCallback:           v.handleHornRequest,
+		BlinkerCallback:        v.handleBlinkerRequest,
+		StateCallback:          v.handleStateRequest,
+		ForceLockCallback:      v.handleForceLockRequest,
+		LedCueCallback:         v.handleLedCueRequest,
+		LedFadeCallback:        v.handleLedFadeRequest,
+		UpdateCallback:         v.handleUpdateRequest,
+		HardwareCallback:       v.handleHardwareRequest,
+		SettingsCallback:       v.handleSettingsUpdate,
 		OtaDbcActivityCallback: v.resetDbcWatchdog,
 		HopOnCallback:          v.handleHopOnRequest,
 	})

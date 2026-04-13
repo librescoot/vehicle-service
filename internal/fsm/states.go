@@ -38,9 +38,9 @@ const (
 	EvDashboardReady    librefsm.EventID = "dashboard-ready"
 	EvDashboardNotReady librefsm.EventID = "dashboard-not-ready"
 	EvKeycardAuth       librefsm.EventID = "keycard-auth"
-	EvUpdateStart        librefsm.EventID = "update-start"
-	EvUpdateComplete     librefsm.EventID = "update-complete"
-	EvDbcUpdateComplete  librefsm.EventID = "dbc-update-complete"
+	EvUpdateStart       librefsm.EventID = "update-start"
+	EvUpdateComplete    librefsm.EventID = "update-complete"
+	EvDbcUpdateComplete librefsm.EventID = "dbc-update-complete"
 
 	// Physical inputs
 	EvKickstandDown  librefsm.EventID = "kickstand-down"

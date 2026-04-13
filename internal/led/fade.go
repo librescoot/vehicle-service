@@ -20,15 +20,15 @@ const (
 
 // Fade represents a parsed LED fade curve
 type Fade struct {
-	Index       int             // Fade index (parsed from filename)
-	Name        string          // Human-readable name
-	Samples     []uint16        // Raw duty cycle samples (0-12000)
-	Duration    time.Duration   // Total duration of the fade
-	ZeroPoints  []time.Duration // Times where the fade crosses or reaches zero
-	FirstZero   time.Duration   // Time of first zero point (-1 if none)
-	LastZero    time.Duration   // Time of last zero point (-1 if none)
-	EndsAtZero  bool            // Whether the fade ends at zero duty
-	StartsAtZero bool           // Whether the fade starts at zero duty
+	Index        int             // Fade index (parsed from filename)
+	Name         string          // Human-readable name
+	Samples      []uint16        // Raw duty cycle samples (0-12000)
+	Duration     time.Duration   // Total duration of the fade
+	ZeroPoints   []time.Duration // Times where the fade crosses or reaches zero
+	FirstZero    time.Duration   // Time of first zero point (-1 if none)
+	LastZero     time.Duration   // Time of last zero point (-1 if none)
+	EndsAtZero   bool            // Whether the fade ends at zero duty
+	StartsAtZero bool            // Whether the fade starts at zero duty
 }
 
 // LoadFade loads a fade from a binary file

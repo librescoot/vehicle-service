@@ -15,20 +15,20 @@ import (
 )
 
 type Callbacks struct {
-	DashboardCallback func(bool) error
-	KeycardCallback   func() error
-	SeatboxCallback   func(bool) error   // true for "on", false for "off"
-	HornCallback      func(bool) error   // true for "on", false for "off"
-	BlinkerCallback   func(string) error // "off", "left", "right", "both"
-	StateCallback     func(string) error // "unlock", "lock", "lock-hibernate"
-	ForceLockCallback func() error       // New callback for force-lock
-	LedCueCallback    func(int) error
-	LedFadeCallback   func(int, int) error
-	UpdateCallback    func(string) error // "start", "complete"
-	HardwareCallback  func(string) error // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
-	SettingsCallback  func(string) error // setting key that was updated (e.g., "scooter.brake-hibernation")
-	OtaDbcActivityCallback func() error  // Called on any OTA hash field change for DBC component
-	HopOnCallback     func(string) error // "engage", "release"
+	DashboardCallback      func(bool) error
+	KeycardCallback        func() error
+	SeatboxCallback        func(bool) error   // true for "on", false for "off"
+	HornCallback           func(bool) error   // true for "on", false for "off"
+	BlinkerCallback        func(string) error // "off", "left", "right", "both"
+	StateCallback          func(string) error // "unlock", "lock", "lock-hibernate"
+	ForceLockCallback      func() error       // New callback for force-lock
+	LedCueCallback         func(int) error
+	LedFadeCallback        func(int, int) error
+	UpdateCallback         func(string) error // "start", "complete"
+	HardwareCallback       func(string) error // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
+	SettingsCallback       func(string) error // setting key that was updated (e.g., "scooter.brake-hibernation")
+	OtaDbcActivityCallback func() error       // Called on any OTA hash field change for DBC component
+	HopOnCallback          func(string) error // "engage", "release"
 }
 
 type RedisClient struct {
@@ -311,7 +311,6 @@ func (r *RedisClient) handleHopOnCommand(value string) error {
 	}
 }
 
-
 func (r *RedisClient) PublishVehicleState(state types.SystemState) error {
 	r.logger.Infof("Publishing vehicle state: %s", state)
 	stateStr := string(state)
@@ -377,7 +376,7 @@ func (r *RedisClient) SetBlinkerState(state string, startNanos int64) error {
 		// can compute the correct phase offset for animation synchronization.
 		err := r.vehiclePub.SetManyPublishOne(
 			map[string]any{
-				"blinker:state":      blinkerStr,
+				"blinker:state":       blinkerStr,
 				"blinker:start_nanos": startNanos,
 			},
 			"blinker:state",

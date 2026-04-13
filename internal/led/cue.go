@@ -29,9 +29,9 @@ type CueAction struct {
 
 // Cue represents a parsed LED cue sequence
 type Cue struct {
-	Index    int          // Cue index (parsed from filename)
-	Name     string       // Human-readable name
-	Actions  []CueAction  // List of actions in the cue
+	Index    int           // Cue index (parsed from filename)
+	Name     string        // Human-readable name
+	Actions  []CueAction   // List of actions in the cue
 	Duration time.Duration // Calculated duration (max of referenced fades)
 }
 

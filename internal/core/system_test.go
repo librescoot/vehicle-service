@@ -19,9 +19,12 @@ type mockMessagingClient struct {
 	callbacks messaging.Callbacks
 
 	// Track method calls
-	publishedStates        []types.SystemState
-	setHandlebarPositions  []bool
-	setBrakeStates         []struct{ side string; pressed bool }
+	publishedStates       []types.SystemState
+	setHandlebarPositions []bool
+	setBrakeStates        []struct {
+		side    string
+		pressed bool
+	}
 	setBlinkerSwitches     []string
 	setBlinkerStates       []string
 	publishedButtonEvents  []string
@@ -43,29 +46,39 @@ func newMockMessagingClient() *mockMessagingClient {
 	}
 }
 
-func (m *mockMessagingClient) SetCallbacks(callbacks messaging.Callbacks)     { m.callbacks = callbacks }
-func (m *mockMessagingClient) Connect() error                                 { return nil }
-func (m *mockMessagingClient) StartListening() error                          { return nil }
-func (m *mockMessagingClient) Close() error                                   { return nil }
-func (m *mockMessagingClient) GetVehicleState() (types.SystemState, error)    { return m.vehicleState, m.vehicleStateErr }
-func (m *mockMessagingClient) GetDashboardPower() (bool, error)               { return m.dashboardPower, nil }
-func (m *mockMessagingClient) SetDashboardPower(enabled bool) error           { m.dashboardPower = enabled; return nil }
-func (m *mockMessagingClient) SetBacklightEnabled(enabled bool) error         { return nil }
-func (m *mockMessagingClient) DeleteDashboardReadyFlag() error                { return nil }
-func (m *mockMessagingClient) GetDbcUpdating() (bool, error)                  { return m.dbcUpdating, nil }
-func (m *mockMessagingClient) SetDbcUpdating(updating bool) error             { m.dbcUpdating = updating; return nil }
+func (m *mockMessagingClient) SetCallbacks(callbacks messaging.Callbacks) { m.callbacks = callbacks }
+func (m *mockMessagingClient) Connect() error                             { return nil }
+func (m *mockMessagingClient) StartListening() error                      { return nil }
+func (m *mockMessagingClient) Close() error                               { return nil }
+func (m *mockMessagingClient) GetVehicleState() (types.SystemState, error) {
+	return m.vehicleState, m.vehicleStateErr
+}
+func (m *mockMessagingClient) GetDashboardPower() (bool, error) { return m.dashboardPower, nil }
+func (m *mockMessagingClient) SetDashboardPower(enabled bool) error {
+	m.dashboardPower = enabled
+	return nil
+}
+func (m *mockMessagingClient) SetBacklightEnabled(enabled bool) error { return nil }
+func (m *mockMessagingClient) DeleteDashboardReadyFlag() error        { return nil }
+func (m *mockMessagingClient) GetDbcUpdating() (bool, error)          { return m.dbcUpdating, nil }
+func (m *mockMessagingClient) SetDbcUpdating(updating bool) error {
+	m.dbcUpdating = updating
+	return nil
+}
 func (m *mockMessagingClient) GetOtaStatus(component string) (string, error)  { return m.otaStatus, nil }
 func (m *mockMessagingClient) SetInhibitor(id, inhibitType, why string) error { return nil }
 func (m *mockMessagingClient) RemoveInhibitor(id string) error                { return nil }
-func (m *mockMessagingClient) GetHashField(hash, field string) (string, error) { return m.hashFieldValue, nil }
+func (m *mockMessagingClient) GetHashField(hash, field string) (string, error) {
+	return m.hashFieldValue, nil
+}
 func (m *mockMessagingClient) PublishAutoStandbyDeadline(deadline time.Time) error { return nil }
-func (m *mockMessagingClient) ClearAutoStandbyDeadline() error                { return nil }
-func (m *mockMessagingClient) SetHopOnActive(active bool) error               { return nil }
-func (m *mockMessagingClient) SetKickstandState(deployed bool) error          { return nil }
-func (m *mockMessagingClient) SetHandlebarLockState(locked bool) error        { return nil }
-func (m *mockMessagingClient) SetSeatboxLockState(locked bool) error          { return nil }
-func (m *mockMessagingClient) SetHornButton(pressed bool) error               { return nil }
-func (m *mockMessagingClient) SetSeatboxButton(pressed bool) error            { return nil }
+func (m *mockMessagingClient) ClearAutoStandbyDeadline() error                     { return nil }
+func (m *mockMessagingClient) SetHopOnActive(active bool) error                    { return nil }
+func (m *mockMessagingClient) SetKickstandState(deployed bool) error               { return nil }
+func (m *mockMessagingClient) SetHandlebarLockState(locked bool) error             { return nil }
+func (m *mockMessagingClient) SetSeatboxLockState(locked bool) error               { return nil }
+func (m *mockMessagingClient) SetHornButton(pressed bool) error                    { return nil }
+func (m *mockMessagingClient) SetSeatboxButton(pressed bool) error                 { return nil }
 func (m *mockMessagingClient) SendCommand(channel, command string) error {
 	m.sendCommands = append(m.sendCommands, struct{ channel, command string }{channel, command})
 	return nil
@@ -78,7 +91,10 @@ func (m *mockMessagingClient) PublishVehicleState(state types.SystemState) error
 }
 
 func (m *mockMessagingClient) SetBrakeState(side string, pressed bool) error {
-	m.setBrakeStates = append(m.setBrakeStates, struct{ side string; pressed bool }{side, pressed})
+	m.setBrakeStates = append(m.setBrakeStates, struct {
+		side    string
+		pressed bool
+	}{side, pressed})
 	return nil
 }
 
@@ -577,9 +593,9 @@ func TestEnterReadyToDrive_EngineBrakeDisabled(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
 	// Set up initial conditions: kickstand up, no brakes pressed
-	mockIO.digitalInputs["kickstand"] = false        // up
-	mockIO.digitalInputs["brake_left"] = false       // not pressed
-	mockIO.digitalInputs["brake_right"] = false      // not pressed
+	mockIO.digitalInputs["kickstand"] = false   // up
+	mockIO.digitalInputs["brake_left"] = false  // not pressed
+	mockIO.digitalInputs["brake_right"] = false // not pressed
 	mockIO.digitalInputs["handlebar_position"] = false
 	mockIO.digitalInputs["seatbox_lock_sensor"] = true // closed
 
@@ -617,9 +633,9 @@ func TestEnterReadyToDrive_EngineBrakeFollowsBrakes(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
 	// Set up initial conditions: kickstand up, LEFT brake pressed
-	mockIO.digitalInputs["kickstand"] = false        // up
-	mockIO.digitalInputs["brake_left"] = true        // pressed
-	mockIO.digitalInputs["brake_right"] = false      // not pressed
+	mockIO.digitalInputs["kickstand"] = false   // up
+	mockIO.digitalInputs["brake_left"] = true   // pressed
+	mockIO.digitalInputs["brake_right"] = false // not pressed
 	mockIO.digitalInputs["handlebar_position"] = false
 	mockIO.digitalInputs["seatbox_lock_sensor"] = true
 
@@ -650,9 +666,9 @@ func TestEnterParked_EngineBrakeEnabled(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
 	// Set up initial conditions: start with kickstand up, then will put it down
-	mockIO.digitalInputs["kickstand"] = false        // up (will change to down)
-	mockIO.digitalInputs["brake_left"] = false       // not pressed
-	mockIO.digitalInputs["brake_right"] = false      // not pressed
+	mockIO.digitalInputs["kickstand"] = false   // up (will change to down)
+	mockIO.digitalInputs["brake_left"] = false  // not pressed
+	mockIO.digitalInputs["brake_right"] = false // not pressed
 	mockIO.digitalInputs["handlebar_position"] = false
 	mockIO.digitalInputs["seatbox_lock_sensor"] = true
 
@@ -693,7 +709,7 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	// The bug caused engine_brake to be inverted after transitions.
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true         // down (parked)
+	mockIO.digitalInputs["kickstand"] = true // down (parked)
 	mockIO.digitalInputs["brake_left"] = false
 	mockIO.digitalInputs["brake_right"] = false
 	mockIO.digitalInputs["handlebar_position"] = false

@@ -84,12 +84,12 @@ type LinuxHardwareIO struct {
 	dbcLed            *DbcLed
 	mu                sync.RWMutex
 	stopChan          chan struct{}
-	activeKeys        map[uint16]bool            // Track key states
-	initialValues     map[string]bool            // Initial values for outputs
-	debounceDurations map[string]time.Duration   // Debounce duration per channel
-	debounceTimers    map[string]*time.Timer     // Active debounce timer per channel
-	debounceLast      map[string]bool            // Last seen value per channel (for debounce)
-	debounceGen       map[string]uint64          // Generation counter per debounced channel
+	activeKeys        map[uint16]bool          // Track key states
+	initialValues     map[string]bool          // Initial values for outputs
+	debounceDurations map[string]time.Duration // Debounce duration per channel
+	debounceTimers    map[string]*time.Timer   // Active debounce timer per channel
+	debounceLast      map[string]bool          // Last seen value per channel (for debounce)
+	debounceGen       map[string]uint64        // Generation counter per debounced channel
 }
 
 func NewLinuxHardwareIO(l *logger.Logger) *LinuxHardwareIO {

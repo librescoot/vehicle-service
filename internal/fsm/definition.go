@@ -91,7 +91,7 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 
 		// From Standby - unlock events transition to Parked
 		Transition(StateStandby, EvUnlock, StateParked).
-		Transition(StateStandby, EvKeycardAuth, StateParked).    // Keycard tap unlocks from standby
+		Transition(StateStandby, EvKeycardAuth, StateParked).             // Keycard tap unlocks from standby
 		Transition(StateStandby, EvDbcUpdateComplete, StateShuttingDown). // DBC update complete, give DBC time to poweroff
 
 		// From Parked - unlock/kickstand-up/dashboard-ready to ReadyToDrive if conditions met.

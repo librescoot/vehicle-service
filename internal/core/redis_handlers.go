@@ -612,4 +612,3 @@ func (v *VehicleSystem) handleDbcWatchdogTimeout() {
 		})
 	}
 }
-
