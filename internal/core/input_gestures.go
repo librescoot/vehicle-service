@@ -6,9 +6,9 @@ import (
 )
 
 const (
-	gestureLongTapThreshold   = 500 * time.Millisecond
-	gestureHoldThreshold      = 2 * time.Second
-	gestureDoubleTapThreshold = 500 * time.Millisecond
+	gestureLongTapThreshold   = 800 * time.Millisecond
+	gestureHoldThreshold      = 3 * time.Second
+	gestureDoubleTapThreshold = 800 * time.Millisecond
 )
 
 type gestureState struct {
