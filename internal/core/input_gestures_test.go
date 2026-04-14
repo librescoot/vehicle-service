@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	testLongTap = 50 * time.Millisecond
-	testHold    = 200 * time.Millisecond
+	testLongTap   = 50 * time.Millisecond
+	testHold      = 200 * time.Millisecond
+	testDoubleTap = 50 * time.Millisecond
 )
 
 type eventRecorder struct {
@@ -32,7 +33,7 @@ func (r *eventRecorder) get() []string {
 
 func TestGestureTap(t *testing.T) {
 	rec := &eventRecorder{}
-	gd := newGestureDetector(rec.record, testLongTap, testHold)
+	gd := newGestureDetector(rec.record, testLongTap, testHold, testDoubleTap)
 	defer gd.Stop()
 
 	gd.OnChange("btn", true)
@@ -54,7 +55,7 @@ func TestGestureTap(t *testing.T) {
 
 func TestGestureLongTap(t *testing.T) {
 	rec := &eventRecorder{}
-	gd := newGestureDetector(rec.record, testLongTap, testHold)
+	gd := newGestureDetector(rec.record, testLongTap, testHold, testDoubleTap)
 	defer gd.Stop()
 
 	gd.OnChange("btn", true)
@@ -76,7 +77,7 @@ func TestGestureLongTap(t *testing.T) {
 
 func TestGestureHold(t *testing.T) {
 	rec := &eventRecorder{}
-	gd := newGestureDetector(rec.record, testLongTap, testHold)
+	gd := newGestureDetector(rec.record, testLongTap, testHold, testDoubleTap)
 	defer gd.Stop()
 
 	gd.OnChange("btn", true)
@@ -98,7 +99,7 @@ func TestGestureHold(t *testing.T) {
 
 func TestGestureReleaseWithoutPress(t *testing.T) {
 	rec := &eventRecorder{}
-	gd := newGestureDetector(rec.record, testLongTap, testHold)
+	gd := newGestureDetector(rec.record, testLongTap, testHold, testDoubleTap)
 	defer gd.Stop()
 
 	gd.OnChange("btn", false)
@@ -112,7 +113,7 @@ func TestGestureReleaseWithoutPress(t *testing.T) {
 
 func TestGestureMultipleInputs(t *testing.T) {
 	rec := &eventRecorder{}
-	gd := newGestureDetector(rec.record, testLongTap, testHold)
+	gd := newGestureDetector(rec.record, testLongTap, testHold, testDoubleTap)
 	defer gd.Stop()
 
 	gd.OnChange("a", true)
@@ -162,7 +163,7 @@ func TestGestureMultipleInputs(t *testing.T) {
 
 func TestGestureStop(t *testing.T) {
 	rec := &eventRecorder{}
-	gd := newGestureDetector(rec.record, testLongTap, testHold)
+	gd := newGestureDetector(rec.record, testLongTap, testHold, testDoubleTap)
 
 	gd.OnChange("btn", true)
 	gd.Stop()
@@ -172,6 +173,86 @@ func TestGestureStop(t *testing.T) {
 	for _, e := range events {
 		if e == "btn:long-tap" || e == "btn:hold" {
 			t.Errorf("timer fired after Stop(): got %q", e)
+		}
+	}
+}
+
+func TestGestureDoubleTap(t *testing.T) {
+	rec := &eventRecorder{}
+	gd := newGestureDetector(rec.record, testLongTap, testHold, testDoubleTap)
+	defer gd.Stop()
+
+	// Two quick taps within the double-tap window.
+	gd.OnChange("btn", true)
+	time.Sleep(10 * time.Millisecond)
+	gd.OnChange("btn", false)
+	time.Sleep(10 * time.Millisecond)
+	gd.OnChange("btn", true)
+	time.Sleep(10 * time.Millisecond)
+	gd.OnChange("btn", false)
+	time.Sleep(10 * time.Millisecond)
+
+	events := rec.get()
+	expected := []string{
+		"btn:press", "btn:release", "btn:tap",
+		"btn:press", "btn:release", "btn:tap", "btn:double-tap",
+	}
+	if len(events) != len(expected) {
+		t.Fatalf("expected %v, got %v", expected, events)
+	}
+	for i, e := range expected {
+		if events[i] != e {
+			t.Errorf("event[%d]: expected %q, got %q", i, e, events[i])
+		}
+	}
+}
+
+func TestGestureDoubleTapWindowExpires(t *testing.T) {
+	rec := &eventRecorder{}
+	gd := newGestureDetector(rec.record, testLongTap, testHold, testDoubleTap)
+	defer gd.Stop()
+
+	gd.OnChange("btn", true)
+	time.Sleep(10 * time.Millisecond)
+	gd.OnChange("btn", false)
+	// Wait past the double-tap window before the second tap.
+	time.Sleep(testDoubleTap + 20*time.Millisecond)
+	gd.OnChange("btn", true)
+	time.Sleep(10 * time.Millisecond)
+	gd.OnChange("btn", false)
+	time.Sleep(10 * time.Millisecond)
+
+	for _, e := range rec.get() {
+		if e == "btn:double-tap" {
+			t.Fatalf("double-tap fired outside window")
+		}
+	}
+}
+
+func TestGestureLongTapBetweenTapsBreaksDoubleTap(t *testing.T) {
+	rec := &eventRecorder{}
+	gd := newGestureDetector(rec.record, testLongTap, testHold, testDoubleTap)
+	defer gd.Stop()
+
+	// Tap, long-tap, tap — the long press must break the double-tap window.
+	gd.OnChange("btn", true)
+	time.Sleep(10 * time.Millisecond)
+	gd.OnChange("btn", false)
+	time.Sleep(10 * time.Millisecond)
+
+	gd.OnChange("btn", true)
+	time.Sleep(testLongTap + 20*time.Millisecond)
+	gd.OnChange("btn", false)
+	time.Sleep(10 * time.Millisecond)
+
+	gd.OnChange("btn", true)
+	time.Sleep(10 * time.Millisecond)
+	gd.OnChange("btn", false)
+	time.Sleep(10 * time.Millisecond)
+
+	for _, e := range rec.get() {
+		if e == "btn:double-tap" {
+			t.Fatalf("double-tap fired across a long-tap")
 		}
 	}
 }

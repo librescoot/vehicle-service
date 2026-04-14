@@ -113,7 +113,7 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		if err := vs.redis.PublishInputEvent(event); err != nil {
 			vs.logger.Debugf("Failed to publish input event: %v", err)
 		}
-	}, gestureLongTapThreshold, gestureHoldThreshold)
+	}, gestureLongTapThreshold, gestureHoldThreshold, gestureDoubleTapThreshold)
 	return vs
 }
 

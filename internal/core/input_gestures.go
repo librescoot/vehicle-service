@@ -6,8 +6,9 @@ import (
 )
 
 const (
-	gestureLongTapThreshold = 500 * time.Millisecond
-	gestureHoldThreshold    = 2 * time.Second
+	gestureLongTapThreshold   = 500 * time.Millisecond
+	gestureHoldThreshold      = 2 * time.Second
+	gestureDoubleTapThreshold = 500 * time.Millisecond
 )
 
 type gestureState struct {
@@ -17,22 +18,31 @@ type gestureState struct {
 	holdTimer    *time.Timer
 	longTapFired bool
 	holdFired    bool
+
+	// Tracks the most recent emitted tap so the second tap within
+	// the double-tap window triggers an additional double-tap event.
+	// Cleared by any long-tap / hold emission so a long press between
+	// two taps does not glue them together.
+	lastTapAt    time.Time
+	lastTapValid bool
 }
 
 type gestureDetector struct {
-	mu            sync.Mutex
-	inputs        map[string]*gestureState
-	emit          func(event string)
-	longTapDelay  time.Duration
-	holdDelay     time.Duration
+	mu             sync.Mutex
+	inputs         map[string]*gestureState
+	emit           func(event string)
+	longTapDelay   time.Duration
+	holdDelay      time.Duration
+	doubleTapDelay time.Duration
 }
 
-func newGestureDetector(emit func(string), longTapThreshold, holdThreshold time.Duration) *gestureDetector {
+func newGestureDetector(emit func(string), longTapThreshold, holdThreshold, doubleTapThreshold time.Duration) *gestureDetector {
 	return &gestureDetector{
-		inputs:       make(map[string]*gestureState),
-		emit:         emit,
-		longTapDelay: longTapThreshold,
-		holdDelay:    holdThreshold,
+		inputs:         make(map[string]*gestureState),
+		emit:           emit,
+		longTapDelay:   longTapThreshold,
+		holdDelay:      holdThreshold,
+		doubleTapDelay: doubleTapThreshold,
 	}
 }
 
@@ -60,6 +70,8 @@ func (g *gestureDetector) OnChange(name string, pressed bool) {
 			stillPressed := gs.pressed
 			if stillPressed {
 				gs.longTapFired = true
+				// Long press between taps breaks the double-tap window.
+				gs.lastTapValid = false
 			}
 			g.mu.Unlock()
 			if stillPressed {
@@ -72,6 +84,7 @@ func (g *gestureDetector) OnChange(name string, pressed bool) {
 			stillPressed := gs.pressed
 			if stillPressed {
 				gs.holdFired = true
+				gs.lastTapValid = false
 			}
 			g.mu.Unlock()
 			if stillPressed {
@@ -88,7 +101,16 @@ func (g *gestureDetector) OnChange(name string, pressed bool) {
 			g.emit(name + ":release")
 
 			if !gs.longTapFired && !gs.holdFired {
+				now := time.Now()
 				g.emit(name + ":tap")
+
+				if gs.lastTapValid && now.Sub(gs.lastTapAt) <= g.doubleTapDelay {
+					gs.lastTapValid = false
+					g.emit(name + ":double-tap")
+				} else {
+					gs.lastTapAt = now
+					gs.lastTapValid = true
+				}
 			}
 		}
 	}
