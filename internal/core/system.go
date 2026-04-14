@@ -37,6 +37,7 @@ const (
 	// Hardware timing constants
 	blinkerInterval              = 800 * time.Millisecond
 	handlebarPositionDebounce    = 250 * time.Millisecond
+	brakeDebounce                = 20 * time.Millisecond
 	handlebarLockDuration        = 1100 * time.Millisecond
 	handlebarLockWindow   = 60 * time.Second
 	handlebarLockRetries      = 3
@@ -339,6 +340,8 @@ func (v *VehicleSystem) Start() error {
 
 	// Configure per-channel debounce before registering callbacks
 	v.io.SetDebounce("handlebar_position", handlebarPositionDebounce)
+	v.io.SetDebounce("brake_left", brakeDebounce)
+	v.io.SetDebounce("brake_right", brakeDebounce)
 
 	// Restore saved FSM state now that hardware is initialized
 	if err := v.restoreFSMState(savedState); err != nil {
