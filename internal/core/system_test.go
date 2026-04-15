@@ -35,6 +35,7 @@ type mockMessagingClient struct {
 	vehicleState    types.SystemState
 	vehicleStateErr error
 	dashboardPower  bool
+	usb0Override    string
 	dbcUpdating     bool
 	otaStatus       string
 	hashFieldValue  string
@@ -60,6 +61,8 @@ func (m *mockMessagingClient) SetDashboardPower(enabled bool) error {
 }
 func (m *mockMessagingClient) SetBacklightEnabled(enabled bool) error { return nil }
 func (m *mockMessagingClient) DeleteDashboardReadyFlag() error        { return nil }
+func (m *mockMessagingClient) GetUsb0Override() (string, error)       { return m.usb0Override, nil }
+func (m *mockMessagingClient) SetUsb0Override(value string) error     { m.usb0Override = value; return nil }
 func (m *mockMessagingClient) GetDbcUpdating() (bool, error)          { return m.dbcUpdating, nil }
 func (m *mockMessagingClient) SetDbcUpdating(updating bool) error {
 	m.dbcUpdating = updating

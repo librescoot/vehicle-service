@@ -581,6 +581,40 @@ func (r *RedisClient) GetDashboardPower() (bool, error) {
 	return value == "on", nil
 }
 
+// GetUsb0Override reads the persistent usb0 link override from the vehicle hash.
+// Returns "on", "off", or "" (no override — link follows dashboard_power).
+func (r *RedisClient) GetUsb0Override() (string, error) {
+	value, err := r.client.HGet("vehicle", "usb0-override")
+	if err != nil {
+		return "", err
+	}
+	if value != "on" && value != "off" {
+		return "", nil
+	}
+	return value, nil
+}
+
+// SetUsb0Override persists the usb0 link override. Passing "" clears the
+// override so the link resumes tracking dashboard_power.
+func (r *RedisClient) SetUsb0Override(value string) error {
+	if value == "" {
+		raw := r.client.Raw()
+		if err := raw.HDel(context.Background(), "vehicle", "usb0-override").Err(); err != nil {
+			return fmt.Errorf("failed to clear usb0-override: %w", err)
+		}
+		r.logger.Infof("Cleared usb0-override")
+		return nil
+	}
+	if value != "on" && value != "off" {
+		return fmt.Errorf("invalid usb0-override value: %s", value)
+	}
+	if err := r.vehiclePub.Set("usb0-override", value); err != nil {
+		return fmt.Errorf("failed to set usb0-override: %w", err)
+	}
+	r.logger.Infof("Set usb0-override=%s", value)
+	return nil
+}
+
 // SetHopOnActive publishes the hop-on / hop-off mode flag to the vehicle hash.
 // While true, the FSM blocks Parked->ReadyToDrive transitions so the scooter
 // stays powered up but cannot be ridden away.

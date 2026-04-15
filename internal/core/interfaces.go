@@ -25,6 +25,10 @@ type MessagingClient interface {
 	SetBacklightEnabled(enabled bool) error
 	DeleteDashboardReadyFlag() error
 
+	// usb0 link override ("on" / "off" / "" for auto)
+	GetUsb0Override() (string, error)
+	SetUsb0Override(value string) error
+
 	// OTA/DBC
 	GetDbcUpdating() (bool, error)
 	SetDbcUpdating(updating bool) error

@@ -343,6 +343,18 @@ func (v *VehicleSystem) Start() error {
 	v.io.SetDebounce("brake_left", brakeDebounce)
 	v.io.SetDebounce("brake_right", brakeDebounce)
 
+	// Apply persistent usb0 override if set, so an installer reboot keeps the
+	// MDB<->DBC link in the requested state even before the FSM touches
+	// dashboard_power. If no override, the FSM will drive usb0 via setPower.
+	if override, err := v.redis.GetUsb0Override(); err != nil {
+		v.logger.Warnf("Failed to read usb0 override at startup: %v", err)
+	} else if override != "" {
+		v.logger.Infof("Applying persistent usb0 override=%s at startup", override)
+		if err := v.io.SetUsb0Enabled(override == "on"); err != nil {
+			v.logger.Warnf("Failed to apply usb0 override at startup: %v", err)
+		}
+	}
+
 	// Restore saved FSM state now that hardware is initialized
 	if err := v.restoreFSMState(savedState); err != nil {
 		return fmt.Errorf("failed to restore FSM state: %w", err)
@@ -1199,13 +1211,21 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 		return fmt.Errorf("failed to %s %s: %w", action, component, err)
 	}
 
-	// Persist dashboard_power state to Redis and mirror the usb0 link to DBC
+	// Persist dashboard_power state to Redis and mirror the usb0 link to DBC,
+	// unless a persistent override is pinning usb0 to a specific state.
 	if component == "dashboard_power" {
 		if err := v.redis.SetDashboardPower(enabled); err != nil {
 			v.logger.Warnf("Failed to persist dashboard power state to Redis: %v", err)
 			// Don't return error - hardware state was set successfully
 		}
-		if err := v.io.SetUsb0Enabled(enabled); err != nil {
+		override, err := v.redis.GetUsb0Override()
+		if err != nil {
+			v.logger.Warnf("Failed to read usb0 override, following dashboard_power: %v", err)
+			override = ""
+		}
+		if override != "" {
+			v.logger.Debugf("usb0 override=%s active, not tracking dashboard_power=%v", override, enabled)
+		} else if err := v.io.SetUsb0Enabled(enabled); err != nil {
 			v.logger.Warnf("Failed to set usb0 link: %v", err)
 			// Don't return error - dashboard power state was set successfully
 		}
