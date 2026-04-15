@@ -25,10 +25,6 @@ type MessagingClient interface {
 	SetBacklightEnabled(enabled bool) error
 	DeleteDashboardReadyFlag() error
 
-	// usb0 link policy ("always-on" default, "auto" tracks dashboard_power)
-	GetUsb0Policy() (string, error)
-	SetUsb0Policy(value string) error
-
 	// OTA/DBC
 	GetDbcUpdating() (bool, error)
 	SetDbcUpdating(updating bool) error
