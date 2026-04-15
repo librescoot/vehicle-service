@@ -30,6 +30,7 @@ type mockMessagingClient struct {
 	publishedButtonEvents  []string
 	publishedSeatboxOpened int
 	sendCommands           []struct{ channel, command string }
+	publishedMessages      []struct{ channel, message string }
 
 	// Return values
 	vehicleState    types.SystemState
@@ -83,7 +84,10 @@ func (m *mockMessagingClient) SendCommand(channel, command string) error {
 	m.sendCommands = append(m.sendCommands, struct{ channel, command string }{channel, command})
 	return nil
 }
-func (m *mockMessagingClient) PublishMessage(channel, message string) error { return nil }
+func (m *mockMessagingClient) PublishMessage(channel, message string) error {
+	m.publishedMessages = append(m.publishedMessages, struct{ channel, message string }{channel, message})
+	return nil
+}
 
 func (m *mockMessagingClient) PublishVehicleState(state types.SystemState) error {
 	m.publishedStates = append(m.publishedStates, state)
@@ -934,5 +938,290 @@ func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
 	if mockIO.digitalOutputs["engine_power"] != false {
 		t.Errorf("Engine power should be FALSE during shutdown, got %v",
 			mockIO.digitalOutputs["engine_power"])
+	}
+}
+
+// ===== Shutdown abort / deferred unlock tests =====
+
+// Helper to find a published message on a given channel.
+func findPublishedMessage(mock *mockMessagingClient, channel string) (string, bool) {
+	for _, m := range mock.publishedMessages {
+		if m.channel == channel {
+			return m.message, true
+		}
+	}
+	return "", false
+}
+
+func countPublishedMessages(mock *mockMessagingClient, channel, message string) int {
+	n := 0
+	for _, m := range mock.publishedMessages {
+		if m.channel == channel && m.message == message {
+			n++
+		}
+	}
+	return n
+}
+
+// Plain lock sets dbcPoweroffSent; the unlock handler then defers the unlock
+// instead of transitioning back to Parked.
+func TestUnlockDuringShutdown_PoweroffSent_Defers(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.initialized = true
+
+	// Transition into ShuttingDown via lock.
+	system.machine.Send(librefsm.Event{ID: fsm.EvLock})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateShuttingDown {
+		t.Fatalf("expected ShuttingDown, got %v", system.getCurrentState())
+	}
+	if !system.dbcPoweroffSent.Load() {
+		t.Fatalf("expected dbcPoweroffSent=true after normal lock, got false")
+	}
+	if countPublishedMessages(mockRedis, "dbc:command", "poweroff") != 1 {
+		t.Fatalf("expected exactly one dbc:command poweroff, got %d",
+			countPublishedMessages(mockRedis, "dbc:command", "poweroff"))
+	}
+
+	// User sends unlock during the 5s window. Handler should defer.
+	if err := system.handleStateRequest("unlock"); err != nil {
+		t.Fatalf("handleStateRequest unlock: %v", err)
+	}
+	if !system.pendingUnlock.Load() {
+		t.Fatalf("expected pendingUnlock=true after deferred unlock, got false")
+	}
+	if system.getCurrentState() != types.StateShuttingDown {
+		t.Errorf("FSM should stay in ShuttingDown after deferred unlock, got %v",
+			system.getCurrentState())
+	}
+}
+
+// Update-in-progress lock skips the poweroff publish; unlock during shutdown
+// should transition straight back to Parked without queuing.
+func TestUnlockDuringShutdown_DbcUpdating_AbortsCleanly(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.initialized = true
+
+	// Simulate an active DBC update so EnterShuttingDown skips the poweroff.
+	system.mu.Lock()
+	system.dbcUpdating = true
+	system.mu.Unlock()
+
+	system.machine.Send(librefsm.Event{ID: fsm.EvLock})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateShuttingDown {
+		t.Fatalf("expected ShuttingDown, got %v", system.getCurrentState())
+	}
+	if system.dbcPoweroffSent.Load() {
+		t.Fatalf("expected dbcPoweroffSent=false with update in progress, got true")
+	}
+	if countPublishedMessages(mockRedis, "dbc:command", "poweroff") != 0 {
+		t.Fatalf("expected zero dbc:command poweroff with update in progress, got %d",
+			countPublishedMessages(mockRedis, "dbc:command", "poweroff"))
+	}
+
+	// Unlock during shutdown aborts back to Parked immediately.
+	if err := system.handleStateRequest("unlock"); err != nil {
+		t.Fatalf("handleStateRequest unlock: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateParked {
+		t.Errorf("expected Parked after safe abort, got %v", system.getCurrentState())
+	}
+	if system.pendingUnlock.Load() {
+		t.Errorf("pendingUnlock should be false on safe abort, got true")
+	}
+}
+
+// Going all the way through to Standby clears dbcPoweroffSent and — when no
+// deferred unlock is queued — does not auto-send EvUnlock.
+func TestShutdownToStandby_ClearsFlag_NoAutoUnlock(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.initialized = true
+
+	system.machine.Send(librefsm.Event{ID: fsm.EvLock})
+	time.Sleep(50 * time.Millisecond)
+	if !system.dbcPoweroffSent.Load() {
+		t.Fatalf("expected dbcPoweroffSent=true after lock")
+	}
+
+	// Drive the shutdown timeout manually.
+	system.machine.Send(librefsm.Event{ID: fsm.EvShutdownTimeout})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateStandby {
+		t.Fatalf("expected Standby, got %v", system.getCurrentState())
+	}
+	if system.dbcPoweroffSent.Load() {
+		t.Errorf("EnterStandby should clear dbcPoweroffSent")
+	}
+	if system.pendingUnlock.Load() {
+		t.Errorf("pendingUnlock should be false when no unlock was queued")
+	}
+}
+
+// Unlock during a committed shutdown is queued, shutdown timer fires to
+// Standby, EnterStandby replays the EvUnlock, and we end up in Parked.
+func TestDeferredUnlock_ReplayedFromStandby(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.initialized = true
+	system.dashboardReady = true
+
+	// Lock -> ShuttingDown -> poweroff sent.
+	system.machine.Send(librefsm.Event{ID: fsm.EvLock})
+	time.Sleep(50 * time.Millisecond)
+	if !system.dbcPoweroffSent.Load() {
+		t.Fatalf("setup: expected dbcPoweroffSent=true")
+	}
+
+	// Unlock is queued, not forwarded.
+	if err := system.handleStateRequest("unlock"); err != nil {
+		t.Fatalf("handleStateRequest unlock: %v", err)
+	}
+	if !system.pendingUnlock.Load() {
+		t.Fatalf("unlock should have been queued")
+	}
+
+	// Shutdown timer fires; we reach Standby and the queued unlock replays.
+	system.machine.Send(librefsm.Event{ID: fsm.EvShutdownTimeout})
+	// EnterStandby runs synchronously, but the replay is a goroutine that
+	// hits the machine's event channel. Give it time to be processed.
+	time.Sleep(100 * time.Millisecond)
+
+	if system.pendingUnlock.Load() {
+		t.Errorf("pendingUnlock should be cleared after replay")
+	}
+	if system.getCurrentState() != types.StateParked {
+		t.Errorf("expected Parked after replayed unlock, got %v", system.getCurrentState())
+	}
+}
+
+// Re-entering ShuttingDown (a second lock during a queued-unlock window)
+// drops the queued unlock — user's most recent intent wins.
+func TestReEnterShuttingDown_ClearsPendingUnlock(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateShuttingDown); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.initialized = true
+	system.pendingUnlock.Store(true) // pretend an unlock was queued
+
+	// Re-enter ShuttingDown (e.g., through a lock command that loops us via
+	// a timeout path). Directly re-run EnterShuttingDown by setting state.
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState Parked: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if err := system.machine.SetState(fsm.StateShuttingDown); err != nil {
+		t.Fatalf("SetState ShuttingDown: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	if system.pendingUnlock.Load() {
+		t.Errorf("EnterShuttingDown should clear pendingUnlock; got true")
+	}
+}
+
+// EnterParked from ShuttingDown (safe abort path) replays cue 1 or 2 to
+// bring the lights back on.
+func TestEnterParked_FromShuttingDown_ReplaysLightsCue(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateShuttingDown); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.initialized = true
+
+	// Clear recorded cues accumulated from EnterShuttingDown so we can
+	// assert cleanly on what EnterParked emits.
+	mockIO.pwmCues = nil
+
+	// Abort path: EvUnlock during ShuttingDown goes back to Parked.
+	system.machine.Send(librefsm.Event{ID: fsm.EvUnlock})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateParked {
+		t.Fatalf("expected Parked, got %v", system.getCurrentState())
+	}
+
+	// Brakes off -> cue 1 should be played.
+	found := false
+	for _, idx := range mockIO.pwmCues {
+		if idx == 1 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected cue 1 (lights-on) to be played on abort, got cues=%v",
+			mockIO.pwmCues)
 	}
 }

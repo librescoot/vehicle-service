@@ -285,6 +285,20 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 		}
 	}
 
+	// Aborted shutdown: EnterShuttingDown played cue 7/8 (lights fading off).
+	// Replay cue 1/2 to bring them back. This branch only runs when the DBC
+	// was NOT told to halt (dbcPoweroffSent=false) — the unlock handler
+	// queues the unlock otherwise, so we never arrive here with a halted
+	// DBC.
+	if prevState == types.StateShuttingDown {
+		brakeLeft, brakeRight, _ := v.readBrakeStates()
+		if brakeLeft || brakeRight {
+			v.playLedCue(2, "shutting-down to parked brake on (unlock aborted shutdown)")
+		} else {
+			v.playLedCue(1, "shutting-down to parked brake off (unlock aborted shutdown)")
+		}
+	}
+
 	// Start (or resume) the auto-standby timer.
 	//
 	// When transitioning back from hop-on we resume from the saved
