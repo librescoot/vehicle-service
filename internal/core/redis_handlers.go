@@ -551,6 +551,37 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 		v.mu.Unlock()
 		v.logger.Infof("DBC blinker LED setting updated to: %s", value)
 
+	case "scooter.usb0-policy":
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+		policy := "always-on"
+		if value == "auto" {
+			policy = "auto"
+		} else if value != "" && value != "always-on" {
+			v.logger.Warnf("Unknown usb0 policy %q, falling back to always-on", value)
+		}
+		v.mu.Lock()
+		v.usb0Policy = policy
+		v.mu.Unlock()
+		v.logger.Infof("usb0 policy updated to: %s", policy)
+		// Apply immediately so the link reflects the new policy without
+		// waiting for the next dashboard transition.
+		if policy == "auto" {
+			dashboardPower, dpErr := v.redis.GetDashboardPower()
+			if dpErr != nil {
+				v.logger.Warnf("Failed to read dashboard power while applying usb0=auto: %v", dpErr)
+			} else if ioErr := v.io.SetUsb0Enabled(dashboardPower); ioErr != nil {
+				v.logger.Warnf("Failed to sync usb0 to dashboard_power=%v: %v", dashboardPower, ioErr)
+			}
+		} else {
+			if ioErr := v.io.SetUsb0Enabled(true); ioErr != nil {
+				v.logger.Warnf("Failed to bring usb0 up: %v", ioErr)
+			}
+		}
+
 	default:
 		// Only log unknown settings if they're in the scooter namespace
 		// Silently ignore settings for other services (e.g., updates.*, battery.*, etc.)

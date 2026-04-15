@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"os/exec"
 	"sync"
 	"syscall"
 	"time"
@@ -510,6 +511,20 @@ func (io *LinuxHardwareIO) PlayPwmCue(idx int) error {
 
 func (io *LinuxHardwareIO) PlayPwmFade(ch int, idx int) error {
 	return io.pwmLed.PlayFade(ch, idx)
+}
+
+func (io *LinuxHardwareIO) SetUsb0Enabled(enabled bool) error {
+	action := "down"
+	if enabled {
+		action = "up"
+	}
+	cmd := exec.Command("ip", "link", "set", "usb0", action)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ip link set usb0 %s: %w (%s)", action, err, string(out))
+	}
+	io.logger.Debugf("usb0 link set %s", action)
+	return nil
 }
 
 func (io *LinuxHardwareIO) SetDbcLed(color string) error {
