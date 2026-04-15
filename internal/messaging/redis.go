@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"vehicle-service/internal/types"
 
 	ipc "github.com/librescoot/redis-ipc"
+	"github.com/redis/go-redis/v9"
 )
 
 type Callbacks struct {
@@ -584,11 +586,15 @@ func (r *RedisClient) GetDashboardPower() (bool, error) {
 // GetUsb0Policy reads the persistent usb0 link policy from the vehicle hash.
 // Returns "always-on" or "auto". Defaults to "always-on" when unset, which
 // keeps usb0 reachable across lock cycles for installer/diag tooling. Use
-// "auto" (opt-in) to have usb0 track dashboard_power — only safe on units
+// "auto" (opt-in) to have usb0 track dashboard_power, only safe on units
 // with a working backup channel (WWAN) in case the link gets stuck down.
+// A missing hash field is the normal default state, not an error.
 func (r *RedisClient) GetUsb0Policy() (string, error) {
 	value, err := r.client.HGet("vehicle", "usb0-policy")
 	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return "always-on", nil
+		}
 		return "always-on", err
 	}
 	if value == "auto" {
