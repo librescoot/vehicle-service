@@ -397,6 +397,17 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 	// tracker so the next ShuttingDown entry starts fresh.
 	v.dbcPoweroffSent.Store(false)
 
+	// Replay any unlock that was deferred during a committed shutdown.
+	// The GPIO is now cut and the DBC has had its 5s to halt cleanly;
+	// a fresh EvUnlock from Standby will cycle the GPIO back on via
+	// EnterParked's setPower("dashboard_power", true). Dispatched on a
+	// goroutine so machine.Send doesn't re-enter the FSM from inside an
+	// onEnter callback.
+	if v.pendingUnlock.CompareAndSwap(true, false) {
+		v.logger.Infof("Replaying deferred unlock from shutdown")
+		go v.machine.Send(librefsm.Event{ID: fsm.EvUnlock})
+	}
+
 	return nil
 }
 
@@ -408,6 +419,10 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 	// successful publish below so the unlock handler can gate the
 	// abort path accurately.
 	v.dbcPoweroffSent.Store(false)
+
+	// A new lock intent overrides any unlock that was queued during a
+	// previous committed shutdown — user's most recent action wins.
+	v.pendingUnlock.Store(false)
 
 	v.cancelHandlebarUnlock()
 

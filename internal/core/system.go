@@ -63,6 +63,7 @@ type VehicleSystem struct {
 	blinkerStartNanos       atomic.Int64      // UnixNano when blinker goroutine started (0 if inactive)
 	blinkerCueIndex         atomic.Int32      // Currently playing blinker cue index (-1 if none)
 	dbcPoweroffSent         atomic.Bool       // True once EnterShuttingDown published dbc:command poweroff; cleared on EnterShuttingDown entry and EnterStandby
+	pendingUnlock           atomic.Bool       // True when an unlock arrived during a committed shutdown; replayed from EnterStandby
 	ledCurves               *led.CurveLibrary // LED fade/cue metadata for timing
 	initialized             bool
 	handlebarUnlocked       bool          // Track if handlebar has been unlocked in this power cycle

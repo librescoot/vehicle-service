@@ -109,10 +109,20 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 
 	switch state {
 	case "unlock":
+		// If we're in shutting-down and have already told the DBC to halt,
+		// the abort path is no longer safe: the DBC kernel is dying and
+		// setPower("dashboard_power", true) in EnterParked would be a no-op
+		// on a GPIO that was never cut. Queue the unlock; EnterStandby
+		// will replay it once the GPIO has been cycled.
+		if currentState == types.StateShuttingDown && v.dbcPoweroffSent.Load() {
+			v.pendingUnlock.Store(true)
+			v.logger.Infof("Unlock deferred: DBC shutdown in progress, will replay from standby")
+			return nil
+		}
 		// Send EvUnlock - FSM handles the logic:
 		// - From Standby: goes to Parked (dashboard booting)
 		// - From Parked: goes to ReadyToDrive if kickstand is up (via guard)
-		// - From ShuttingDown: goes to Parked (cancel shutdown)
+		// - From ShuttingDown: goes to Parked (safe abort — DBC not halted yet)
 		return v.machine.SendSync(librefsm.Event{ID: fsm.EvUnlock})
 
 	case "lock":
