@@ -392,11 +392,22 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 	// Final "all off" cue for standby
 	v.playLedCue(0, "all off")
 
+	// DBC is definitively off now (either via poweroff + GPIO cut, or just
+	// the GPIO cut when an update deferral kept the flag clear). Reset the
+	// tracker so the next ShuttingDown entry starts fresh.
+	v.dbcPoweroffSent.Store(false)
+
 	return nil
 }
 
 func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: EnterShuttingDown")
+
+	// Reset the DBC poweroff tracker. We may or may not publish this
+	// cycle (update-in-progress path skips); set it true only on a
+	// successful publish below so the unlock handler can gate the
+	// abort path accurately.
+	v.dbcPoweroffSent.Store(false)
 
 	v.cancelHandlebarUnlock()
 
@@ -438,12 +449,16 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 
 	// Ask DBC to shut down cleanly via Redis PUBSUB.
 	// dbc-dispatcher on the DBC executes the poweroff.
-	// GPIO cut in EnterStandby (10s later) is the hard backstop.
+	// GPIO cut in EnterStandby (5s later) is the hard backstop.
 	//
 	// If a DBC update is in progress, skip the poweroff so the DBC can keep
 	// updating during standby. But if hibernation was requested, the MDB is
 	// about to power off and the DBC will lose power anyway, so shut it down
 	// cleanly instead of deferring.
+	//
+	// Once the publish succeeds, dbcPoweroffSent is set and the abort path
+	// (ShuttingDown -> Parked on EvUnlock) is gated off in the unlock
+	// handler: a late unlock gets queued and replayed from Standby.
 	v.mu.RLock()
 	updating := v.dbcUpdating
 	hibernating := v.hibernationRequest
@@ -461,6 +476,13 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 		}
 		if err := v.redis.PublishMessage("dbc:command", "poweroff"); err != nil {
 			v.logger.Warnf("Failed to send DBC poweroff: %v", err)
+		} else {
+			// The DBC is now halting. This commit is irreversible: even if
+			// the user sends unlock within the 5s shutdown window, we can
+			// no longer abort cleanly because the DBC kernel is already on
+			// its way out. The unlock handler reads this flag to decide
+			// whether to queue the request for post-standby replay.
+			v.dbcPoweroffSent.Store(true)
 		}
 	} else {
 		v.logger.Infof("Skipping DBC poweroff, update in progress")
