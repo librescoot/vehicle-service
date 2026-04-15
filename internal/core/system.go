@@ -596,7 +596,10 @@ func (v *VehicleSystem) startAutoStandbyTimer() {
 		return
 	}
 
-	v.logger.Infof("Starting auto-standby timer: %d seconds", seconds)
+	// Debug level: this fires on every resetAutoStandbyTimer call (brake,
+	// kickstand, seatbox). The meaningful "timer armed" log is emitted once
+	// from EnterParked. See fsm_actions.go `Started auto-standby timer`.
+	v.logger.Debugf("Starting auto-standby timer: %d seconds", seconds)
 
 	duration := time.Duration(seconds) * time.Second
 	v.machine.StartTimer(fsm.TimerAutoStandby, duration, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
@@ -606,8 +609,6 @@ func (v *VehicleSystem) startAutoStandbyTimer() {
 	if err := v.redis.PublishAutoStandbyDeadline(deadline); err != nil {
 		v.logger.Warnf("Failed to publish auto-standby deadline: %v", err)
 	}
-
-	v.logger.Infof("Auto-standby timer started successfully")
 }
 
 // cancelAutoStandbyTimer cancels the auto-standby timer
