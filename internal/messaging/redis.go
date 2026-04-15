@@ -582,20 +582,23 @@ func (r *RedisClient) GetDashboardPower() (bool, error) {
 }
 
 // GetUsb0Override reads the persistent usb0 link override from the vehicle hash.
-// Returns "on", "off", or "" (no override — link follows dashboard_power).
+// Returns "on" or "" (no override — link follows dashboard_power). Only
+// force-on is supported; force-off has no legitimate production use and
+// would just brick MDB<->DBC communication.
 func (r *RedisClient) GetUsb0Override() (string, error) {
 	value, err := r.client.HGet("vehicle", "usb0-override")
 	if err != nil {
 		return "", err
 	}
-	if value != "on" && value != "off" {
+	if value != "on" {
 		return "", nil
 	}
 	return value, nil
 }
 
 // SetUsb0Override persists the usb0 link override. Passing "" clears the
-// override so the link resumes tracking dashboard_power.
+// override so the link resumes tracking dashboard_power. Only "on" and ""
+// are accepted.
 func (r *RedisClient) SetUsb0Override(value string) error {
 	if value == "" {
 		raw := r.client.Raw()
@@ -605,13 +608,13 @@ func (r *RedisClient) SetUsb0Override(value string) error {
 		r.logger.Infof("Cleared usb0-override")
 		return nil
 	}
-	if value != "on" && value != "off" {
-		return fmt.Errorf("invalid usb0-override value: %s", value)
+	if value != "on" {
+		return fmt.Errorf("invalid usb0-override value: %s (only 'on' or '' supported)", value)
 	}
 	if err := r.vehiclePub.Set("usb0-override", value); err != nil {
 		return fmt.Errorf("failed to set usb0-override: %w", err)
 	}
-	r.logger.Infof("Set usb0-override=%s", value)
+	r.logger.Infof("Set usb0-override=on")
 	return nil
 }
 

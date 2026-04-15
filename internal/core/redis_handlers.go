@@ -341,17 +341,16 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 		}
 	case "usb0":
 		switch action {
-		case "on", "off":
-			enabled := action == "on"
-			if err := v.redis.SetUsb0Override(action); err != nil {
+		case "on":
+			if err := v.redis.SetUsb0Override("on"); err != nil {
 				v.logger.Errorf("Failed to persist usb0 override: %v", err)
 				return err
 			}
-			if err := v.io.SetUsb0Enabled(enabled); err != nil {
+			if err := v.io.SetUsb0Enabled(true); err != nil {
 				v.logger.Errorf("Failed to apply usb0 override: %v", err)
 				return err
 			}
-			v.logger.Infof("usb0 override=%s applied (persistent)", action)
+			v.logger.Infof("usb0 override=on applied (persistent)")
 		case "auto":
 			if err := v.redis.SetUsb0Override(""); err != nil {
 				v.logger.Errorf("Failed to clear usb0 override: %v", err)
@@ -367,7 +366,7 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 			}
 			v.logger.Infof("usb0 override cleared, tracking dashboard_power")
 		default:
-			return fmt.Errorf("invalid usb0 action: %s (expected on|off|auto)", action)
+			return fmt.Errorf("invalid usb0 action: %s (expected on|auto)", action)
 		}
 	case "engine":
 		switch action {

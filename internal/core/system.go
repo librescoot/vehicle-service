@@ -348,9 +348,9 @@ func (v *VehicleSystem) Start() error {
 	// dashboard_power. If no override, the FSM will drive usb0 via setPower.
 	if override, err := v.redis.GetUsb0Override(); err != nil {
 		v.logger.Warnf("Failed to read usb0 override at startup: %v", err)
-	} else if override != "" {
-		v.logger.Infof("Applying persistent usb0 override=%s at startup", override)
-		if err := v.io.SetUsb0Enabled(override == "on"); err != nil {
+	} else if override == "on" {
+		v.logger.Infof("Applying persistent usb0 force-on override at startup")
+		if err := v.io.SetUsb0Enabled(true); err != nil {
 			v.logger.Warnf("Failed to apply usb0 override at startup: %v", err)
 		}
 	}
@@ -1223,8 +1223,14 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 			v.logger.Warnf("Failed to read usb0 override, following dashboard_power: %v", err)
 			override = ""
 		}
-		if override != "" {
-			v.logger.Debugf("usb0 override=%s active, not tracking dashboard_power=%v", override, enabled)
+		if override == "on" {
+			// Force-on override is the only one supported; keep usb0 up
+			// regardless of dashboard_power so installer/diag tools keep
+			// their link.
+			v.logger.Debugf("usb0 force-on override active, ignoring dashboard_power=%v", enabled)
+			if err := v.io.SetUsb0Enabled(true); err != nil {
+				v.logger.Warnf("Failed to reassert usb0 force-on: %v", err)
+			}
 		} else if err := v.io.SetUsb0Enabled(enabled); err != nil {
 			v.logger.Warnf("Failed to set usb0 link: %v", err)
 			// Don't return error - dashboard power state was set successfully
