@@ -84,4 +84,7 @@ type HardwareIO interface {
 
 	// DBC boot LED
 	SetDbcLed(color string) error
+
+	// Network link (usb0 to DBC)
+	SetUsb0Enabled(enabled bool) error
 }

@@ -1199,11 +1199,15 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 		return fmt.Errorf("failed to %s %s: %w", action, component, err)
 	}
 
-	// Persist dashboard_power state to Redis
+	// Persist dashboard_power state to Redis and mirror the usb0 link to DBC
 	if component == "dashboard_power" {
 		if err := v.redis.SetDashboardPower(enabled); err != nil {
 			v.logger.Warnf("Failed to persist dashboard power state to Redis: %v", err)
 			// Don't return error - hardware state was set successfully
+		}
+		if err := v.io.SetUsb0Enabled(enabled); err != nil {
+			v.logger.Warnf("Failed to set usb0 link: %v", err)
+			// Don't return error - dashboard power state was set successfully
 		}
 	}
 
