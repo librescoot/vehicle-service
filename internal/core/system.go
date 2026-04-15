@@ -343,15 +343,19 @@ func (v *VehicleSystem) Start() error {
 	v.io.SetDebounce("brake_left", brakeDebounce)
 	v.io.SetDebounce("brake_right", brakeDebounce)
 
-	// Apply persistent usb0 override if set, so an installer reboot keeps the
-	// MDB<->DBC link in the requested state even before the FSM touches
-	// dashboard_power. If no override, the FSM will drive usb0 via setPower.
-	if override, err := v.redis.GetUsb0Override(); err != nil {
-		v.logger.Warnf("Failed to read usb0 override at startup: %v", err)
-	} else if override == "on" {
-		v.logger.Infof("Applying persistent usb0 force-on override at startup")
+	// Apply usb0 policy up front so an installer reboot has a reachable
+	// interface before the FSM restore runs setPower. Default (always-on)
+	// keeps usb0 up regardless of dashboard_power; only "auto" hands the
+	// wheel to setPower.
+	policy, policyErr := v.redis.GetUsb0Policy()
+	if policyErr != nil {
+		v.logger.Warnf("Failed to read usb0 policy at startup, defaulting to always-on: %v", policyErr)
+		policy = "always-on"
+	}
+	v.logger.Infof("usb0 policy=%s", policy)
+	if policy != "auto" {
 		if err := v.io.SetUsb0Enabled(true); err != nil {
-			v.logger.Warnf("Failed to apply usb0 override at startup: %v", err)
+			v.logger.Warnf("Failed to bring usb0 up at startup: %v", err)
 		}
 	}
 
@@ -1218,22 +1222,24 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 			v.logger.Warnf("Failed to persist dashboard power state to Redis: %v", err)
 			// Don't return error - hardware state was set successfully
 		}
-		override, err := v.redis.GetUsb0Override()
+		policy, err := v.redis.GetUsb0Policy()
 		if err != nil {
-			v.logger.Warnf("Failed to read usb0 override, following dashboard_power: %v", err)
-			override = ""
+			v.logger.Warnf("Failed to read usb0 policy, defaulting to always-on: %v", err)
+			policy = "always-on"
 		}
-		if override == "on" {
-			// Force-on override is the only one supported; keep usb0 up
-			// regardless of dashboard_power so installer/diag tools keep
-			// their link.
-			v.logger.Debugf("usb0 force-on override active, ignoring dashboard_power=%v", enabled)
-			if err := v.io.SetUsb0Enabled(true); err != nil {
-				v.logger.Warnf("Failed to reassert usb0 force-on: %v", err)
+		if policy == "auto" {
+			if err := v.io.SetUsb0Enabled(enabled); err != nil {
+				v.logger.Warnf("Failed to set usb0 link: %v", err)
+				// Don't return error - dashboard power state was set successfully
 			}
-		} else if err := v.io.SetUsb0Enabled(enabled); err != nil {
-			v.logger.Warnf("Failed to set usb0 link: %v", err)
-			// Don't return error - dashboard power state was set successfully
+		} else {
+			// always-on: keep usb0 up regardless of dashboard_power so
+			// installer/diag tools retain reachability. Reassert here so a
+			// transient interface bounce gets corrected on the next state
+			// transition.
+			if err := v.io.SetUsb0Enabled(true); err != nil {
+				v.logger.Warnf("Failed to reassert usb0 always-on: %v", err)
+			}
 		}
 	}
 

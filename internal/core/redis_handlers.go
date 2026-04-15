@@ -342,29 +342,29 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 	case "usb0":
 		switch action {
 		case "on":
-			if err := v.redis.SetUsb0Override("on"); err != nil {
-				v.logger.Errorf("Failed to persist usb0 override: %v", err)
+			if err := v.redis.SetUsb0Policy("always-on"); err != nil {
+				v.logger.Errorf("Failed to persist usb0 policy: %v", err)
 				return err
 			}
 			if err := v.io.SetUsb0Enabled(true); err != nil {
-				v.logger.Errorf("Failed to apply usb0 override: %v", err)
+				v.logger.Errorf("Failed to bring usb0 up: %v", err)
 				return err
 			}
-			v.logger.Infof("usb0 override=on applied (persistent)")
+			v.logger.Infof("usb0 policy=always-on")
 		case "auto":
-			if err := v.redis.SetUsb0Override(""); err != nil {
-				v.logger.Errorf("Failed to clear usb0 override: %v", err)
+			if err := v.redis.SetUsb0Policy("auto"); err != nil {
+				v.logger.Errorf("Failed to persist usb0 policy: %v", err)
 				return err
 			}
 			// Re-sync usb0 with current dashboard_power so the link matches
-			// reality now that the override is gone.
+			// state now that it's tracking.
 			dashboardPower, err := v.redis.GetDashboardPower()
 			if err != nil {
-				v.logger.Warnf("Failed to read dashboard power while clearing usb0 override: %v", err)
+				v.logger.Warnf("Failed to read dashboard power while setting usb0=auto: %v", err)
 			} else if err := v.io.SetUsb0Enabled(dashboardPower); err != nil {
-				v.logger.Warnf("Failed to re-sync usb0 to dashboard_power=%v: %v", dashboardPower, err)
+				v.logger.Warnf("Failed to sync usb0 to dashboard_power=%v: %v", dashboardPower, err)
 			}
-			v.logger.Infof("usb0 override cleared, tracking dashboard_power")
+			v.logger.Infof("usb0 policy=auto (tracks dashboard_power)")
 		default:
 			return fmt.Errorf("invalid usb0 action: %s (expected on|auto)", action)
 		}
