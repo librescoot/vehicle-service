@@ -54,6 +54,7 @@ type MessagingClient interface {
 	SetBlinkerState(state string, startNanos int64) error
 	SetHornButton(pressed bool) error
 	SetSeatboxButton(pressed bool) error
+	SetMainPower(on bool) error
 
 	// Events
 	PublishButtonEvent(event string) error

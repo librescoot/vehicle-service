@@ -31,6 +31,7 @@ type mockMessagingClient struct {
 	publishedSeatboxOpened int
 	sendCommands           []struct{ channel, command string }
 	publishedMessages      []struct{ channel, message string }
+	mainPowerSets          []bool
 
 	// Return values
 	vehicleState    types.SystemState
@@ -80,6 +81,10 @@ func (m *mockMessagingClient) SetHandlebarLockState(locked bool) error          
 func (m *mockMessagingClient) SetSeatboxLockState(locked bool) error               { return nil }
 func (m *mockMessagingClient) SetHornButton(pressed bool) error                    { return nil }
 func (m *mockMessagingClient) SetSeatboxButton(pressed bool) error                 { return nil }
+func (m *mockMessagingClient) SetMainPower(on bool) error {
+	m.mainPowerSets = append(m.mainPowerSets, on)
+	return nil
+}
 func (m *mockMessagingClient) SendCommand(channel, command string) error {
 	m.sendCommands = append(m.sendCommands, struct{ channel, command string }{channel, command})
 	return nil
@@ -943,6 +948,38 @@ func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
 	if mockIO.digitalOutputs["engine_power"] != false {
 		t.Errorf("Engine power should be FALSE during shutdown, got %v",
 			mockIO.digitalOutputs["engine_power"])
+	}
+}
+
+// ===== 48v_detect / main-power publish =====
+
+func TestHandleInputChange_48vDetect_PublishesMainPower(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("Failed to set initial state: %v", err)
+	}
+	system.initialized = true
+
+	if err := system.handleInputChange("48v_detect", true); err != nil {
+		t.Fatalf("handleInputChange(48v_detect, true): %v", err)
+	}
+	if err := system.handleInputChange("48v_detect", false); err != nil {
+		t.Fatalf("handleInputChange(48v_detect, false): %v", err)
+	}
+
+	if got, want := mockRedis.mainPowerSets, []bool{true, false}; len(got) != len(want) {
+		t.Fatalf("mainPowerSets = %v, want %v", got, want)
+	}
+	for i, v := range []bool{true, false} {
+		if mockRedis.mainPowerSets[i] != v {
+			t.Errorf("mainPowerSets[%d] = %v, want %v", i, mockRedis.mainPowerSets[i], v)
+		}
 	}
 }
 

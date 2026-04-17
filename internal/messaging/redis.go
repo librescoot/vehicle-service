@@ -421,6 +421,18 @@ func (r *RedisClient) SetBrakeState(side string, isPressed bool) error {
 	return nil
 }
 
+func (r *RedisClient) SetMainPower(on bool) error {
+	state := "off"
+	if on {
+		state = "on"
+	}
+	if err := r.vehiclePub.Set("main-power", state); err != nil {
+		r.logger.Warnf("Failed to set main-power: %v", err)
+		return err
+	}
+	return nil
+}
+
 func (r *RedisClient) SetHornButton(isPressed bool) error {
 	r.logger.Debugf("Setting horn button state: %v", isPressed)
 	state := "off"

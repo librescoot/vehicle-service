@@ -434,6 +434,7 @@ func (v *VehicleSystem) Start() error {
 		"handlebar_lock_sensor": func(val bool) error { return v.redis.SetHandlebarLockState(!val) }, // Invert: sensor true = unlocked, Redis true = locked
 		"seatbox_lock_sensor":   v.redis.SetSeatboxLockState,
 		"handlebar_position":    v.redis.SetHandlebarPosition,
+		"48v_detect":            v.redis.SetMainPower,
 	}
 
 	for sensor, publisher := range sensorPublishers {
@@ -979,6 +980,11 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		v.mu.Lock()
 		v.handlebarUnlocked = value // sensor true = unlocked
 		v.mu.Unlock()
+
+	case "48v_detect":
+		if err := v.redis.SetMainPower(value); err != nil {
+			return fmt.Errorf("failed to set main-power in Redis: %w", err)
+		}
 	}
 	return nil
 }
