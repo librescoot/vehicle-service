@@ -91,6 +91,8 @@ type LinuxHardwareIO struct {
 	debounceTimers    map[string]*time.Timer   // Active debounce timer per channel
 	debounceLast      map[string]bool          // Last seen value per channel (for debounce)
 	debounceGen       map[string]uint64        // Generation counter per debounced channel
+	lastReported      map[string]bool          // Last value delivered to a callback
+	lastReportedSet   map[string]bool          // Whether lastReported has been seeded
 }
 
 func NewLinuxHardwareIO(l *logger.Logger) *LinuxHardwareIO {
@@ -107,6 +109,8 @@ func NewLinuxHardwareIO(l *logger.Logger) *LinuxHardwareIO {
 		debounceTimers:    make(map[string]*time.Timer),
 		debounceLast:      make(map[string]bool),
 		debounceGen:       make(map[string]uint64),
+		lastReported:      make(map[string]bool),
+		lastReportedSet:   make(map[string]bool),
 	}
 }
 
@@ -122,22 +126,40 @@ func (io *LinuxHardwareIO) SetDebounce(channel string, duration time.Duration) {
 	io.debounceDurations[channel] = duration
 }
 
+// deliver dedupes against lastReported so phantom resume edges (driver
+// resyncs the same state we already delivered) don't re-fire callbacks.
+// Must be called with io.mu held. Releases the lock before invoking the
+// callback to avoid holding the mutex across user code.
+func (io *LinuxHardwareIO) deliver(channel string, value bool) {
+	if io.lastReportedSet[channel] && io.lastReported[channel] == value {
+		io.mu.Unlock()
+		if io.logger != nil {
+			io.logger.Debugf("Skipping no-op callback for %s (value=%v)", channel, value)
+		}
+		return
+	}
+	io.lastReported[channel] = value
+	io.lastReportedSet[channel] = true
+	callback, exists := io.inputCallbacks[channel]
+	io.mu.Unlock()
+
+	if exists {
+		if io.logger != nil {
+			io.logger.Debugf("Executing callback for channel %s (value=%v)", channel, value)
+		}
+		if err := callback(channel, value); err != nil {
+			if io.logger != nil {
+				io.logger.Warnf("Error in callback for %s: %v", channel, err)
+			}
+		}
+	}
+}
+
 func (io *LinuxHardwareIO) debounceInput(channel string, value bool) {
 	io.mu.Lock()
 	duration, hasDuration := io.debounceDurations[channel]
 	if !hasDuration {
-		callback, exists := io.inputCallbacks[channel]
-		io.mu.Unlock()
-		if exists {
-			if io.logger != nil {
-				io.logger.Debugf("Executing callback for channel %s (value=%v)", channel, value)
-			}
-			if err := callback(channel, value); err != nil {
-				if io.logger != nil {
-					io.logger.Warnf("Error in callback for %s: %v", channel, err)
-				}
-			}
-		}
+		io.deliver(channel, value)
 		return
 	}
 
@@ -154,19 +176,7 @@ func (io *LinuxHardwareIO) debounceInput(channel string, value bool) {
 			return
 		}
 		settled := io.debounceLast[channel]
-		callback, exists := io.inputCallbacks[channel]
-		io.mu.Unlock()
-
-		if exists {
-			if io.logger != nil {
-				io.logger.Debugf("Debounced callback for channel %s (value=%v)", channel, settled)
-			}
-			if err := callback(channel, settled); err != nil {
-				if io.logger != nil {
-					io.logger.Warnf("Error in debounced callback for %s: %v", channel, err)
-				}
-			}
-		}
+		io.deliver(channel, settled)
 	})
 	io.mu.Unlock()
 }
@@ -297,8 +307,12 @@ func (io *LinuxHardwareIO) readInitialState() error {
 		if byteOffset < len(buffer) {
 			isPressed := (buffer[byteOffset] & (1 << bitOffset)) != 0
 			io.activeKeys[code] = isPressed
+			channel := io.mapKeycode(code)
+			if channel != "" {
+				io.lastReported[channel] = isPressed
+				io.lastReportedSet[channel] = true
+			}
 			if isPressed {
-				channel := io.mapKeycode(code)
 				io.logger.Infof("Initial state: %s (code %d) is pressed", channel, code)
 			}
 		}

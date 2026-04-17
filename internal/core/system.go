@@ -38,6 +38,12 @@ const (
 	blinkerInterval           = 800 * time.Millisecond
 	handlebarPositionDebounce = 250 * time.Millisecond
 	brakeDebounce             = 20 * time.Millisecond
+	// Short debounce on keys affected by spurious resume edges. gpio-keys
+	// re-reads every line in gpio_keys_resume() and can emit a
+	// release-then-press pair within milliseconds when the pad reads
+	// differently across the sleep boundary. The debounce collapses the
+	// pair; hardware IO then dedupes against the last-delivered value.
+	resumeSettleDebounce = 50 * time.Millisecond
 	handlebarLockDuration     = 1100 * time.Millisecond
 	handlebarLockWindow       = 60 * time.Second
 	handlebarLockRetries      = 3
@@ -346,6 +352,8 @@ func (v *VehicleSystem) Start() error {
 	v.io.SetDebounce("handlebar_position", handlebarPositionDebounce)
 	v.io.SetDebounce("brake_left", brakeDebounce)
 	v.io.SetDebounce("brake_right", brakeDebounce)
+	v.io.SetDebounce("kickstand", resumeSettleDebounce)
+	v.io.SetDebounce("seatbox_lock_sensor", resumeSettleDebounce)
 
 	// Apply usb0 policy up front so an installer reboot has a reachable
 	// interface before the FSM restore runs setPower. Default (always-on)

@@ -142,6 +142,67 @@ func TestDebounce_StableInputFiresOnce(t *testing.T) {
 	}
 }
 
+func TestDebounce_DedupsAgainstLastDelivered(t *testing.T) {
+	io := NewLinuxHardwareIO(nil)
+	io.SetDebounce("kickstand", 50*time.Millisecond)
+
+	var callCount int32
+	io.mu.Lock()
+	io.inputCallbacks["kickstand"] = func(channel string, value bool) error {
+		atomic.AddInt32(&callCount, 1)
+		return nil
+	}
+	// Seed as if readInitialState had observed kickstand=true
+	io.lastReported["kickstand"] = true
+	io.lastReportedSet["kickstand"] = true
+	io.mu.Unlock()
+
+	// Simulate the gpio-keys resume pair: release then press in quick
+	// succession, netting to the same state we last delivered.
+	io.debounceInput("kickstand", false)
+	time.Sleep(5 * time.Millisecond)
+	io.debounceInput("kickstand", true)
+
+	time.Sleep(150 * time.Millisecond)
+
+	if got := atomic.LoadInt32(&callCount); got != 0 {
+		t.Errorf("expected no callback (settled value matches last delivered), got %d", got)
+	}
+
+	// A genuine change to the opposite state must still fire.
+	io.debounceInput("kickstand", false)
+	time.Sleep(150 * time.Millisecond)
+	if got := atomic.LoadInt32(&callCount); got != 1 {
+		t.Errorf("expected 1 callback after real state change, got %d", got)
+	}
+}
+
+func TestDeliver_SkipsSameValueWhenSeeded(t *testing.T) {
+	io := NewLinuxHardwareIO(nil)
+
+	var callCount int32
+	io.mu.Lock()
+	io.inputCallbacks["horn_button"] = func(channel string, value bool) error {
+		atomic.AddInt32(&callCount, 1)
+		return nil
+	}
+	io.lastReported["horn_button"] = false
+	io.lastReportedSet["horn_button"] = true
+	io.mu.Unlock()
+
+	// Non-debounced path: same-value event (phantom duplicate) should be dropped.
+	io.debounceInput("horn_button", false)
+	if got := atomic.LoadInt32(&callCount); got != 0 {
+		t.Errorf("expected 0 callbacks for same-value event, got %d", got)
+	}
+
+	// Different value fires.
+	io.debounceInput("horn_button", true)
+	if got := atomic.LoadInt32(&callCount); got != 1 {
+		t.Errorf("expected 1 callback after value change, got %d", got)
+	}
+}
+
 func TestRequestLineWithRetry_ReturnsOnSuccess(t *testing.T) {
 	calls := 0
 	request := func() (*gpiocdev.Line, error) {
