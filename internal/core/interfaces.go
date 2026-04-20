@@ -78,6 +78,7 @@ type HardwareIO interface {
 	SetInitialValue(name string, value bool)
 	RegisterInputCallback(channel string, callback hardware.InputCallback)
 	SetDebounce(channel string, duration time.Duration)
+	ResyncInputs() error
 
 	// PWM control
 	PlayPwmCue(idx int) error

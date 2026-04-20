@@ -29,6 +29,7 @@ type Callbacks struct {
 	SettingsCallback       func(string) error // setting key that was updated (e.g., "scooter.brake-hibernation")
 	OtaDbcActivityCallback func() error       // Called on any OTA hash field change for DBC component
 	HopOnCallback          func(string) error // "engage", "release"
+	PowerStateCallback     func(string) error // power-manager state: "running", "suspend-pending", ...
 }
 
 type RedisClient struct {
@@ -47,11 +48,12 @@ type RedisClient struct {
 	buttonsPub   *ipc.HashPublisher
 
 	// Watchers
-	vehicleWatcher   *ipc.HashWatcher
-	dashboardWatcher *ipc.HashWatcher
-	keycardWatcher   *ipc.HashWatcher
-	settingsWatcher  *ipc.HashWatcher
-	otaWatcher       *ipc.HashWatcher
+	vehicleWatcher      *ipc.HashWatcher
+	dashboardWatcher    *ipc.HashWatcher
+	keycardWatcher      *ipc.HashWatcher
+	settingsWatcher     *ipc.HashWatcher
+	otaWatcher          *ipc.HashWatcher
+	powerManagerWatcher *ipc.HashWatcher
 
 	// Fault handling
 	faultSet    *ipc.FaultSet
@@ -157,6 +159,17 @@ func (r *RedisClient) StartListening() error {
 		return nil
 	})
 	r.otaWatcher.Start()
+
+	// Watch power-manager state so we can re-read GPIO inputs after resume
+	// from suspend (the kernel may mask edges that occurred while asleep).
+	r.powerManagerWatcher = r.client.NewHashWatcher("power-manager")
+	r.powerManagerWatcher.OnField("state", func(value string) error {
+		if r.callbacks.PowerStateCallback != nil {
+			return r.callbacks.PowerStateCallback(value)
+		}
+		return nil
+	})
+	r.powerManagerWatcher.Start()
 
 	// Start queue command listeners
 	ipc.HandleRequests(r.client, "scooter:seatbox", r.handleSeatboxCommand)

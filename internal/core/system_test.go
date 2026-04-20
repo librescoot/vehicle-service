@@ -144,6 +144,7 @@ type mockHardwareIO struct {
 	inputCallbacks map[string]hardware.InputCallback
 	pwmCues        []int
 	pwmFades       []struct{ ch, idx int }
+	resyncCount    int
 }
 
 func newMockHardwareIO() *mockHardwareIO {
@@ -180,6 +181,16 @@ func (m *mockHardwareIO) RegisterInputCallback(channel string, callback hardware
 }
 
 func (m *mockHardwareIO) SetDebounce(channel string, duration time.Duration) {}
+
+func (m *mockHardwareIO) ResyncInputs() error {
+	m.resyncCount++
+	for channel, cb := range m.inputCallbacks {
+		if err := cb(channel, m.digitalInputs[channel]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func (m *mockHardwareIO) PlayPwmCue(idx int) error {
 	m.pwmCues = append(m.pwmCues, idx)

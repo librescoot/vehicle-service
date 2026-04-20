@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	EV_SYN = 0x00
-	EV_KEY = 0x01
+	EV_SYN      = 0x00
+	EV_KEY      = 0x01
+	SYN_DROPPED = 3
 
 	KEY_A = 30 // brake_right
 	KEY_B = 48 // brake_left
@@ -321,6 +322,58 @@ func (io *LinuxHardwareIO) readInitialState() error {
 	return nil
 }
 
+// ResyncInputs re-reads every known input pin via EVIOCGKEY and dispatches
+// callbacks for any channel whose kernel-reported value differs from what
+// was last delivered. Use after events may have been missed — resume from
+// suspend, SYN_DROPPED, or an evdev read error. Routes through debounceInput
+// so per-channel debounces still apply and deliver()'s dedup suppresses
+// no-op callbacks.
+func (io *LinuxHardwareIO) ResyncInputs() error {
+	buffer := make([]byte, 128)
+	_, _, errno := syscall.Syscall(
+		syscall.SYS_IOCTL,
+		uintptr(io.inputFile.Fd()),
+		uintptr(0x80804518), // EVIOCGKEY(len)
+		uintptr(unsafe.Pointer(&buffer[0])),
+	)
+	if errno != 0 {
+		return fmt.Errorf("EVIOCGKEY ioctl failed: %v", errno)
+	}
+
+	type kv struct {
+		channel string
+		value   bool
+	}
+	var pending []kv
+
+	io.mu.Lock()
+	for code, channel := range keycodeToChannel {
+		byteOffset := int(code / 8)
+		bitOffset := code % 8
+		if byteOffset >= len(buffer) {
+			continue
+		}
+		isPressed := (buffer[byteOffset] & (1 << bitOffset)) != 0
+		if isPressed {
+			io.activeKeys[code] = true
+		} else {
+			delete(io.activeKeys, code)
+		}
+		if _, hasCallback := io.inputCallbacks[channel]; hasCallback {
+			pending = append(pending, kv{channel, isPressed})
+		}
+	}
+	io.mu.Unlock()
+
+	if io.logger != nil {
+		io.logger.Infof("Input resync: dispatching %d channels via EVIOCGKEY", len(pending))
+	}
+	for _, p := range pending {
+		io.debounceInput(p.channel, p.value)
+	}
+	return nil
+}
+
 func (io *LinuxHardwareIO) monitorInputs() {
 	defer io.inputFile.Close()
 
@@ -361,6 +414,13 @@ func (io *LinuxHardwareIO) monitorInputs() {
 					Code:  code,
 					Value: val,
 				})
+			} else if typ == EV_SYN && code == SYN_DROPPED {
+				if io.logger != nil {
+					io.logger.Warnf("evdev SYN_DROPPED, resyncing inputs")
+				}
+				if err := io.ResyncInputs(); err != nil && io.logger != nil {
+					io.logger.Warnf("Resync after SYN_DROPPED failed: %v", err)
+				}
 			}
 		}
 	}

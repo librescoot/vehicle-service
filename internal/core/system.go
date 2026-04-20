@@ -153,6 +153,7 @@ func (v *VehicleSystem) Start() error {
 		SettingsCallback:       v.handleSettingsUpdate,
 		OtaDbcActivityCallback: v.resetDbcWatchdog,
 		HopOnCallback:          v.handleHopOnRequest,
+		PowerStateCallback:     v.handlePowerStateChange,
 	})
 
 	// Connect to Redis first so we can retrieve saved state
@@ -1346,6 +1347,23 @@ func (v *VehicleSystem) resetDbcWatchdog() error {
 	defer v.mu.Unlock()
 	if v.dbcWatchdogTimer != nil {
 		v.dbcWatchdogTimer.Reset(dbcUpdateWatchdogTimeout)
+	}
+	return nil
+}
+
+// handlePowerStateChange reacts to pm-service publishing power-manager.state.
+// On the transition to "running" (resume from suspend), re-read GPIO inputs
+// via EVIOCGKEY so any edges the kernel masked during sleep surface as
+// synthetic events. Without this, inputs like 48v_detect can stay stuck at
+// the pre-suspend value even after the rail comes back up.
+func (v *VehicleSystem) handlePowerStateChange(state string) error {
+	if state != "running" {
+		return nil
+	}
+	v.logger.Infof("Power state -> running, resyncing GPIO inputs")
+	if err := v.io.ResyncInputs(); err != nil {
+		v.logger.Warnf("Failed to resync inputs on resume: %v", err)
+		return err
 	}
 	return nil
 }
