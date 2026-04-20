@@ -446,6 +446,21 @@ func (r *RedisClient) SetMainPower(on bool) error {
 	return nil
 }
 
+// SetEnginePower publishes the commanded state of the engine_power GPIO
+// output so other services (ecu-service) can gate their expectations on
+// whether the ECU was told to power up, independent of vehicle FSM state.
+func (r *RedisClient) SetEnginePower(on bool) error {
+	state := "off"
+	if on {
+		state = "on"
+	}
+	if err := r.vehiclePub.Set("engine-power", state); err != nil {
+		r.logger.Warnf("Failed to set engine-power: %v", err)
+		return err
+	}
+	return nil
+}
+
 func (r *RedisClient) SetHornButton(isPressed bool) error {
 	r.logger.Debugf("Setting horn button state: %v", isPressed)
 	state := "off"

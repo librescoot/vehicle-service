@@ -55,6 +55,7 @@ type MessagingClient interface {
 	SetHornButton(pressed bool) error
 	SetSeatboxButton(pressed bool) error
 	SetMainPower(on bool) error
+	SetEnginePower(on bool) error
 
 	// Events
 	PublishButtonEvent(event string) error

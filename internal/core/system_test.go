@@ -32,6 +32,7 @@ type mockMessagingClient struct {
 	sendCommands           []struct{ channel, command string }
 	publishedMessages      []struct{ channel, message string }
 	mainPowerSets          []bool
+	enginePowerSets        []bool
 
 	// Return values
 	vehicleState    types.SystemState
@@ -83,6 +84,10 @@ func (m *mockMessagingClient) SetHornButton(pressed bool) error                 
 func (m *mockMessagingClient) SetSeatboxButton(pressed bool) error                 { return nil }
 func (m *mockMessagingClient) SetMainPower(on bool) error {
 	m.mainPowerSets = append(m.mainPowerSets, on)
+	return nil
+}
+func (m *mockMessagingClient) SetEnginePower(on bool) error {
+	m.enginePowerSets = append(m.enginePowerSets, on)
 	return nil
 }
 func (m *mockMessagingClient) SendCommand(channel, command string) error {

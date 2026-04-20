@@ -323,6 +323,9 @@ func (v *VehicleSystem) Start() error {
 		// Also set engine power initial value
 		enginePower := (savedState == types.StateReadyToDrive || savedState == types.StateParked)
 		v.io.SetInitialValue("engine_power", enginePower)
+		if err := v.redis.SetEnginePower(enginePower); err != nil {
+			v.logger.Warnf("Failed to publish initial engine power state to Redis: %v", err)
+		}
 	}
 
 	// Reload PWM LED kernel module, log outcomes for diagnostics
@@ -1267,6 +1270,16 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 			if err := v.io.SetUsb0Enabled(true); err != nil {
 				v.logger.Warnf("Failed to reassert usb0 always-on: %v", err)
 			}
+		}
+	}
+
+	// Persist engine_power commanded state to Redis so ecu-service can gate
+	// its stale-frame detection on what vehicle-service actually commanded,
+	// not on an inferred proxy like vehicle state.
+	if component == "engine_power" {
+		if err := v.redis.SetEnginePower(enabled); err != nil {
+			v.logger.Warnf("Failed to persist engine power state to Redis: %v", err)
+			// Don't return error - hardware state was set successfully
 		}
 	}
 
