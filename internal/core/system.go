@@ -14,6 +14,7 @@ import (
 	"github.com/librescoot/librefsm"
 
 	"vehicle-service/internal/fsm"
+	"vehicle-service/internal/hardware"
 	"vehicle-service/internal/led"
 	"vehicle-service/internal/logger"
 	"vehicle-service/internal/messaging"
@@ -452,7 +453,7 @@ func (v *VehicleSystem) Start() error {
 			v.logger.Infof("Warning: Failed to read initial state for %s: %v", sensor, err)
 			continue
 		}
-		v.logger.Infof("Initial state %s: %v", sensor, value)
+		v.logger.Infof("Initial state %s: %s", sensor, hardware.LabelValue(sensor, value))
 
 		if err := publisher(value); err != nil {
 			v.logger.Infof("Warning: Failed to publish initial state for %s to Redis: %v", sensor, err)

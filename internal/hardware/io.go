@@ -67,6 +67,41 @@ var keycodeToChannel = map[uint16]string{
 // Reverse map built at initialization
 var channelToKeycode map[string]uint16
 
+// channelLabels maps each input channel to {falseLabel, trueLabel} pairs so
+// log lines can say "kickstand: down" instead of the cryptic "kickstand: true".
+var channelLabels = map[string][2]string{
+	//                        false        true
+	"brake_right":           {"released", "pulled"},
+	"brake_left":            {"released", "pulled"},
+	"horn_button":           {"released", "pressed"},
+	"seatbox_button":        {"released", "pressed"},
+	"kickstand":             {"up", "down"},
+	"blinker_right":         {"off", "on"},
+	"blinker_left":          {"off", "on"},
+	"ecu_power":             {"low", "high"}, // TODO: confirm polarity — no handler reads it, "ecu_power" is just a name
+	"di2_0":                 {"low", "high"},
+	"seatbox_lock_sensor":   {"open", "closed"},
+	"handlebar_lock_sensor": {"locked", "unlocked"}, // sensor true = unlocked
+	"handlebar_position":    {"off-place", "on-place"},
+	"external_charger":      {"disconnected", "connected"},
+	"48v_detect":            {"off", "on"},
+}
+
+// LabelValue returns a human-readable label for a channel's boolean value.
+// Falls back to "true"/"false" for unknown channels.
+func LabelValue(channel string, value bool) string {
+	if labels, ok := channelLabels[channel]; ok {
+		if value {
+			return labels[1]
+		}
+		return labels[0]
+	}
+	if value {
+		return "true"
+	}
+	return "false"
+}
+
 func init() {
 	// Build reverse map from forward map
 	channelToKeycode = make(map[string]uint16, len(keycodeToChannel))
@@ -314,7 +349,7 @@ func (io *LinuxHardwareIO) readInitialState() error {
 				io.lastReportedSet[channel] = true
 			}
 			if isPressed {
-				io.logger.Infof("Initial state: %s (code %d) is pressed", channel, code)
+				io.logger.Infof("Initial state: %s = %s (code %d)", channel, LabelValue(channel, true), code)
 			}
 		}
 	}
