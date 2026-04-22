@@ -192,14 +192,6 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateHibernationInitialHold, EvSeatboxButton, StateReadyToDrive,
 			librefsm.WithGuards(actions.IsKickstandUp, actions.AreBrakesPressed),
 		).
-		// Raising the kickstand while the brake-hold timer is counting down
-		// means the rider wants to drive, not hibernate. Route straight to
-		// RTD — otherwise the parent's EvKickstandUp->Parked fallback wins
-		// and the (already-raised) kickstand never produces a fresh edge to
-		// re-trigger the Parked->RTD transition.
-		Transition(StateHibernationInitialHold, EvKickstandUp, StateReadyToDrive,
-			librefsm.WithGuards(actions.IsDashboardReady, actions.IsHandlebarUnlocked),
-		).
 		// Initial hold -> either advance (timeout) or cancel (brakes released)
 		Transition(StateHibernationInitialHold, EvHibernationInitialTimeout, StateHibernationAwaitingConfirm).
 		Transition(StateHibernationInitialHold, EvBrakesReleased, StateParked).
@@ -226,6 +218,14 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// Global transitions from any hibernation state (via parent)
 		// Physical events that cancel hibernation from any substate
 		Transition(StateHibernation, EvUnlock, StateParked).
+		// Raising the kickstand cancels hibernation. If the rider is also
+		// ready to drive (dashboard up, handlebar unlocked) skip the Parked
+		// hop and go straight to RTD — otherwise the parent fallback to
+		// Parked would land us in a state where the (already-raised)
+		// kickstand can never produce a fresh edge to fire Parked->RTD.
+		Transition(StateHibernation, EvKickstandUp, StateReadyToDrive,
+			librefsm.WithGuards(actions.IsDashboardReady, actions.IsHandlebarUnlocked),
+		).
 		Transition(StateHibernation, EvKickstandUp, StateParked).
 
 		// Initial state
