@@ -69,6 +69,7 @@ type VehicleSystem struct {
 	blinkerStopChan         chan struct{}
 	blinkerStartNanos       atomic.Int64      // UnixNano when blinker goroutine started (0 if inactive)
 	blinkerCueIndex         atomic.Int32      // Currently playing blinker cue index (-1 if none)
+	menuOpen                atomic.Bool       // True while scootui-qt reports its menu is open; suppresses brake-light LED cues
 	dbcPoweroffSent         atomic.Bool       // True once EnterShuttingDown published dbc:command poweroff; cleared on EnterShuttingDown entry and EnterStandby
 	pendingUnlock           atomic.Bool       // True when an unlock arrived during a committed shutdown; replayed from EnterStandby
 	ledCurves               *led.CurveLibrary // LED fade/cue metadata for timing
@@ -155,6 +156,10 @@ func (v *VehicleSystem) Start() error {
 		OtaDbcActivityCallback: v.resetDbcWatchdog,
 		HopOnCallback:          v.handleHopOnRequest,
 		PowerStateCallback:     v.handlePowerStateChange,
+		MenuOpenCallback: func(open bool) error {
+			v.menuOpen.Store(open)
+			return nil
+		},
 	})
 
 	// Connect to Redis first so we can retrieve saved state
@@ -931,21 +936,26 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			v.resetAutoStandbyTimer()
 		}
 
-		if value {
-			// A brake was just pressed — only play on-cue if the other wasn't already held
-			otherHeld := brakeLeft
-			if channel == "brake_left" {
-				otherHeld = brakeRight
-			}
-			if !otherHeld {
-				if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
+		// Suppress brake-light LED cues while the scootui-qt menu is open:
+		// it's navigated with the brake levers, and each tap would otherwise
+		// flash the brake light on a parked scooter.
+		if !v.menuOpen.Load() {
+			if value {
+				// A brake was just pressed — only play on-cue if the other wasn't already held
+				otherHeld := brakeLeft
+				if channel == "brake_left" {
+					otherHeld = brakeRight
+				}
+				if !otherHeld {
+					if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
+						return err
+					}
+				}
+			} else if !eitherBrakePressed {
+				// Last brake released
+				if err := v.io.PlayPwmCue(5); err != nil { // LED_BRAKE_ON_TO_BRAKE_OFF
 					return err
 				}
-			}
-		} else if !eitherBrakePressed {
-			// Last brake released
-			if err := v.io.PlayPwmCue(5); err != nil { // LED_BRAKE_ON_TO_BRAKE_OFF
-				return err
 			}
 		}
 

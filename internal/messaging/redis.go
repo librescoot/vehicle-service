@@ -30,6 +30,7 @@ type Callbacks struct {
 	OtaDbcActivityCallback func() error       // Called on any OTA hash field change for DBC component
 	HopOnCallback          func(string) error // "engage", "release"
 	PowerStateCallback     func(string) error // power-manager state: "running", "suspend-pending", ...
+	MenuOpenCallback       func(bool) error   // scootui-qt menu open/closed
 }
 
 type RedisClient struct {
@@ -118,6 +119,16 @@ func (r *RedisClient) Connect() error {
 		}
 	}
 
+	// Pick up the menu-open flag so suppression state is correct across a
+	// vehicle-service restart while scootui-qt is already running.
+	if menuOpen, err := r.client.HGet("dashboard", "menu-open"); err == nil && menuOpen != "" {
+		if r.callbacks.MenuOpenCallback != nil {
+			if err := r.callbacks.MenuOpenCallback(menuOpen == "true"); err != nil {
+				r.logger.Infof("Failed to handle initial menu-open state: %v", err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -130,6 +141,12 @@ func (r *RedisClient) StartListening() error {
 	r.dashboardWatcher.OnField("ready", func(value string) error {
 		r.logger.Infof("Processing dashboard ready state: %v", value == "true")
 		return r.callbacks.DashboardCallback(value == "true")
+	})
+	r.dashboardWatcher.OnField("menu-open", func(value string) error {
+		if r.callbacks.MenuOpenCallback != nil {
+			return r.callbacks.MenuOpenCallback(value == "true")
+		}
+		return nil
 	})
 	r.dashboardWatcher.Start()
 
