@@ -137,13 +137,16 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// Hop-on / hop-off engage
 		Transition(StateParked, EvHopOnEngage, StateHopOn).
 
-		// From HopOn — the only "normal" exit is the explicit release
-		// (combo matched on the dashboard). Standard escape paths still
-		// work: lock, force-lock, keycard, auto-standby timeout. Inputs
-		// like kickstand-up are deliberately NOT routed here because
-		// handleInputChange suppresses every FSM event send while in
-		// StateHopOn — the inputs are published but not processed.
+		// From HopOn — the "normal" exit is either the explicit release
+		// (combo matched on the dashboard) or an unlock command from the
+		// mobile app (which sees the scooter as stand-by while hop-on is
+		// active). Standard escape paths still work: lock, force-lock,
+		// keycard, auto-standby timeout. Inputs like kickstand-up are
+		// deliberately NOT routed here because handleInputChange
+		// suppresses every FSM event send while in StateHopOn — the
+		// inputs are published but not processed.
 		Transition(StateHopOn, EvHopOnRelease, StateParked).
+		Transition(StateHopOn, EvUnlock, StateParked).
 		Transition(StateHopOn, EvAutoStandbyTimeout, StateShuttingDown).
 		Transition(StateHopOn, EvLock, StateShuttingDown,
 			librefsm.WithGuard(actions.IsSeatboxClosed),
