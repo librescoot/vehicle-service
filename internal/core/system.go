@@ -1053,17 +1053,18 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		return err
 	}
 
-	// Start blinker routine
+	// Start blinker routine. runBlinker captures blinker:start_nanos itself
+	// immediately before the first PlayPwmCue ioctl, so the published anchor
+	// reflects when the hardware fade actually begins rather than when we
+	// queued the goroutine. It also publishes blinker:state from inside the
+	// goroutine for the same reason.
 	v.blinkerCueIndex.Store(int32(cue))
-	v.blinkerStartNanos.Store(time.Now().UnixNano())
 	stopChan := make(chan struct{})
 	v.mu.Lock()
 	v.blinkerStopChan = stopChan
 	v.mu.Unlock()
 	go v.runBlinker(cue, switchState, stopChan)
-
-	// Update blinker state in Redis so DBC/scootui can display it
-	return v.redis.SetBlinkerState(switchState, v.blinkerStartNanos.Load())
+	return nil
 }
 
 func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}) {
@@ -1092,29 +1093,53 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}
 		setDbcLed(ledColor)
 	}
 
-	playCue()
+	// Anchor the cycle schedule right before the first ioctl so
+	// blinker:start_nanos matches when the hardware fade actually begins.
+	startNanos := time.Now().UnixNano()
+	v.blinkerStartNanos.Store(startNanos)
+	if err := v.redis.SetBlinkerState(state, startNanos); err != nil {
+		v.logger.Warnf("Failed to publish blinker state: %v", err)
+	}
 
-	ticker := time.NewTicker(blinkerInterval)
-	halfTimer := time.NewTimer(blinkerInterval / 2)
-	defer ticker.Stop()
-	defer halfTimer.Stop()
+	// Absolute-scheduled loop: cycle N fires at startNanos + N*blinkerInterval.
+	// This collapses the "first playCue then create ticker" pattern into a
+	// single mechanism where cycle 0 is no different from cycle 1+.
+	for cycle := int64(0); ; cycle++ {
+		cycleStart := startNanos + cycle*int64(blinkerInterval)
 
-	for {
-		select {
-		case <-stopChan:
-			setDbcLed("off")
-			return
-		case <-halfTimer.C:
-			setDbcLed("off")
-		case <-ticker.C:
+		// Sleep until this cycle's scheduled start (no-op for cycle 0).
+		if wait := time.Duration(cycleStart - time.Now().UnixNano()); wait > 0 {
+			select {
+			case <-stopChan:
+				setDbcLed("off")
+				return
+			case <-time.After(wait):
+			}
+		} else {
 			select {
 			case <-stopChan:
 				setDbcLed("off")
 				return
 			default:
 			}
-			playCue()
-			halfTimer.Reset(blinkerInterval / 2)
+		}
+
+		playCue()
+
+		// Half-way through the cycle, drop the DBC sync LED. Using the
+		// absolute half-point (not Timer.Reset off of "now") keeps this
+		// in phase with the cycle schedule regardless of playCue latency.
+		halfAt := cycleStart + int64(blinkerInterval/2)
+		if wait := time.Duration(halfAt - time.Now().UnixNano()); wait > 0 {
+			select {
+			case <-stopChan:
+				setDbcLed("off")
+				return
+			case <-time.After(wait):
+				setDbcLed("off")
+			}
+		} else {
+			setDbcLed("off")
 		}
 	}
 }
