@@ -636,11 +636,11 @@ func (io *LinuxHardwareIO) SetUsb0Enabled(enabled bool) error {
 	return nil
 }
 
-func (io *LinuxHardwareIO) SetDbcLed(color string) error {
+func (io *LinuxHardwareIO) SetDbcLed(color string, brightness uint8) error {
 	if io.dbcLed == nil {
 		return nil
 	}
-	return io.dbcLed.Set(color)
+	return io.dbcLed.Set(color, brightness)
 }
 
 func (io *LinuxHardwareIO) Cleanup() {

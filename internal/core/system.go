@@ -37,6 +37,7 @@ const (
 
 	// Hardware timing constants
 	blinkerInterval           = 800 * time.Millisecond
+	dbcLedSampleInterval      = 33 * time.Millisecond // ~30 Hz DBC LED brightness updates
 	handlebarPositionDebounce = 250 * time.Millisecond
 	brakeDebounce             = 20 * time.Millisecond
 	// Short debounce on keys affected by spurious resume edges. gpio-keys
@@ -1104,25 +1105,36 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}
 	dbcLed := v.dbcBlinkerLed
 	v.mu.RUnlock()
 
-	ledColor := "green"
+	ledColor := "blinker_green"
 	if state == "both" {
-		ledColor = "red"
+		ledColor = "blinker_red"
 	}
 
-	setDbcLed := func(color string) {
+	// Resolve the fade behind this cue once. Cues 10/11/12 (left/right/both)
+	// all reference fade10 on at least one channel; we sample whichever fade
+	// the cue's first fade-action points at. If anything's missing we fall
+	// back to a square envelope (full-bright until cycle midpoint).
+	var fade *led.Fade
+	if v.ledCurves != nil {
+		if c := v.ledCurves.GetCue(cue); c != nil {
+			for _, action := range c.Actions {
+				if action.ActionType == led.ActionTypeFade {
+					fade = v.ledCurves.GetFade(action.FadeIndex)
+					if fade != nil {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	setDbcBrightness := func(b uint8) {
 		if !dbcLed {
 			return
 		}
-		if err := v.io.SetDbcLed(color); err != nil {
+		if err := v.io.SetDbcLed(ledColor, b); err != nil {
 			v.logger.Warnf("Error setting DBC LED: %v", err)
 		}
-	}
-
-	playCue := func() {
-		if err := v.io.PlayPwmCue(cue); err != nil {
-			v.logger.Warnf("Error playing blinker cue: %v", err)
-		}
-		setDbcLed(ledColor)
 	}
 
 	// Anchor the cycle schedule right before the first ioctl so
@@ -1133,45 +1145,62 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}
 		v.logger.Warnf("Failed to publish blinker state: %v", err)
 	}
 
-	// Absolute-scheduled loop: cycle N fires at startNanos + N*blinkerInterval.
-	// This collapses the "first playCue then create ticker" pattern into a
-	// single mechanism where cycle 0 is no different from cycle 1+.
-	for cycle := int64(0); ; cycle++ {
-		cycleStart := startNanos + cycle*int64(blinkerInterval)
+	// Fire the first cue immediately; subsequent cues are scheduled on the
+	// absolute grid (startNanos + N*blinkerInterval) so phase doesn't drift
+	// regardless of sample-loop jitter.
+	if err := v.io.PlayPwmCue(cue); err != nil {
+		v.logger.Warnf("Error playing blinker cue: %v", err)
+	}
+	nextCueAt := startNanos + int64(blinkerInterval)
 
-		// Sleep until this cycle's scheduled start (no-op for cycle 0).
-		if wait := time.Duration(cycleStart - time.Now().UnixNano()); wait > 0 {
-			select {
-			case <-stopChan:
-				setDbcLed("off")
-				return
-			case <-time.After(wait):
-			}
-		} else {
-			select {
-			case <-stopChan:
-				setDbcLed("off")
-				return
-			default:
-			}
+	ticker := time.NewTicker(dbcLedSampleInterval)
+	defer ticker.Stop()
+
+	var lastBrightness uint8
+	first := true
+	for {
+		// Non-blocking stop check before any side-effecting work this tick,
+		// so a close that races with the ticker can't trigger one extra
+		// PlayPwmCue after stopBlinker has returned.
+		select {
+		case <-stopChan:
+			setDbcBrightness(0)
+			return
+		default:
 		}
 
-		playCue()
+		now := time.Now().UnixNano()
 
-		// Half-way through the cycle, drop the DBC sync LED. Using the
-		// absolute half-point (not Timer.Reset off of "now") keeps this
-		// in phase with the cycle schedule regardless of playCue latency.
-		halfAt := cycleStart + int64(blinkerInterval/2)
-		if wait := time.Duration(halfAt - time.Now().UnixNano()); wait > 0 {
-			select {
-			case <-stopChan:
-				setDbcLed("off")
-				return
-			case <-time.After(wait):
-				setDbcLed("off")
+		if now >= nextCueAt {
+			if err := v.io.PlayPwmCue(cue); err != nil {
+				v.logger.Warnf("Error playing blinker cue: %v", err)
 			}
-		} else {
-			setDbcLed("off")
+			nextCueAt += int64(blinkerInterval)
+		}
+
+		cyclePos := time.Duration((now - startNanos) % int64(blinkerInterval))
+		var brightness uint8
+		if fade != nil {
+			// Square the normalised duty: the LP5662 is a lot brighter than
+			// the front lamp, so a linear ramp looks pinned-on while the
+			// lamp is still mid-fade. Gamma 2 keeps the indicator visibly
+			// dark through the early rise / late fall.
+			duty := fade.DutyAt(cyclePos)
+			brightness = uint8(duty * duty * 255.0)
+		} else if cyclePos < blinkerInterval/2 {
+			brightness = 255
+		}
+		if first || brightness != lastBrightness {
+			setDbcBrightness(brightness)
+			lastBrightness = brightness
+			first = false
+		}
+
+		select {
+		case <-stopChan:
+			setDbcBrightness(0)
+			return
+		case <-ticker.C:
 		}
 	}
 }

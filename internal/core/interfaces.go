@@ -86,7 +86,7 @@ type HardwareIO interface {
 	PlayPwmFade(ch int, idx int) error
 
 	// DBC boot LED
-	SetDbcLed(color string) error
+	SetDbcLed(color string, brightness uint8) error
 
 	// Network link (usb0 to DBC)
 	SetUsb0Enabled(enabled bool) error

@@ -207,7 +207,7 @@ func (m *mockHardwareIO) PlayPwmFade(ch int, idx int) error {
 	return nil
 }
 
-func (m *mockHardwareIO) SetDbcLed(color string) error      { return nil }
+func (m *mockHardwareIO) SetDbcLed(color string, brightness uint8) error { return nil }
 func (m *mockHardwareIO) SetUsb0Enabled(enabled bool) error { return nil }
 
 // SimulateInput triggers an input callback
