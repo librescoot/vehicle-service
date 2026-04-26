@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"vehicle-service/internal/types"
 
 	ipc "github.com/librescoot/redis-ipc"
+	"github.com/redis/go-redis/v9"
 )
 
 type Callbacks struct {
@@ -106,9 +108,10 @@ func (r *RedisClient) SetCallbacks(callbacks Callbacks) {
 func (r *RedisClient) Connect() error {
 	r.logger.Infof("Attempting to connect to Redis")
 
-	// Check initial dashboard state
+	// Check initial dashboard state. redis.Nil means scootui-qt hasn't
+	// published its readiness flag yet — expected on cold boot.
 	ready, err := r.client.HGet("dashboard", "ready")
-	if err != nil {
+	if err != nil && !errors.Is(err, redis.Nil) {
 		r.logger.Infof("Failed to get initial dashboard state: %v", err)
 	} else if ready != "" {
 		r.logger.Infof("Initial dashboard ready state: %v", ready == "true")
@@ -423,13 +426,13 @@ func (r *RedisClient) SetBlinkerState(state string, startNanos int64) error {
 func (r *RedisClient) GetVehicleState() (types.SystemState, error) {
 	r.logger.Infof("Getting vehicle state from Redis")
 	stateStr, err := r.client.HGet("vehicle", "state")
+	if errors.Is(err, redis.Nil) || (err == nil && stateStr == "") {
+		r.logger.Infof("No vehicle state found in Redis")
+		return types.StateInit, nil
+	}
 	if err != nil {
 		r.logger.Infof("Failed to get vehicle state: %v", err)
 		return types.StateInit, err
-	}
-	if stateStr == "" {
-		r.logger.Infof("No vehicle state found in Redis")
-		return types.StateInit, nil
 	}
 	r.logger.Infof("Successfully retrieved vehicle state: %s", stateStr)
 	return types.SystemState(stateStr), nil
@@ -601,11 +604,11 @@ func (r *RedisClient) SetDbcUpdating(updating bool) error {
 // GetDbcUpdating gets the DBC updating state from Redis
 func (r *RedisClient) GetDbcUpdating() (bool, error) {
 	value, err := r.client.HGet("vehicle", "dbc-updating")
+	if errors.Is(err, redis.Nil) || (err == nil && value == "") {
+		return false, nil // Field doesn't exist, default to false
+	}
 	if err != nil {
 		return false, err
-	}
-	if value == "" {
-		return false, nil // Field doesn't exist, default to false
 	}
 	return value == "true", nil
 }
@@ -629,11 +632,11 @@ func (r *RedisClient) SetDashboardPower(enabled bool) error {
 // GetDashboardPower gets the dashboard power state from Redis
 func (r *RedisClient) GetDashboardPower() (bool, error) {
 	value, err := r.client.HGet("vehicle", "dashboard:power")
+	if errors.Is(err, redis.Nil) || (err == nil && value == "") {
+		return false, nil // Field doesn't exist, default to false/off
+	}
 	if err != nil {
 		return false, err
-	}
-	if value == "" {
-		return false, nil // Field doesn't exist, default to false/off
 	}
 	return value == "on", nil
 }
@@ -753,12 +756,12 @@ func (r *RedisClient) DeleteDashboardReadyFlag() error {
 func (r *RedisClient) GetOtaStatus(component string) (string, error) {
 	statusKey := fmt.Sprintf("status:%s", component)
 	status, err := r.client.HGet("ota", statusKey)
+	if errors.Is(err, redis.Nil) || (err == nil && status == "") {
+		// Status field doesn't exist (no OTA in progress), return idle
+		return "", nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to get OTA status for component %s: %w", component, err)
-	}
-	if status == "" {
-		// Status field doesn't exist, return empty string (idle)
-		return "", nil
 	}
 	return status, nil
 }
@@ -838,15 +841,16 @@ func (r *RedisClient) ReportFaultAbsent(code int) error {
 	return nil
 }
 
-// GetHashField reads a field from a Redis hash using HGET
+// GetHashField reads a field from a Redis hash using HGET. A missing
+// hash/field returns ("", nil) — callers distinguish "unset" from
+// "real error" by checking err.
 func (r *RedisClient) GetHashField(hash, field string) (string, error) {
 	value, err := r.client.HGet(hash, field)
+	if errors.Is(err, redis.Nil) || (err == nil && value == "") {
+		return "", nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to get hash field %s from %s: %w", field, hash, err)
-	}
-	if value == "" {
-		// Field doesn't exist, return empty string
-		return "", nil
 	}
 	return value, nil
 }
