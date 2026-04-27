@@ -803,6 +803,8 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			v.handlebarUnlocked = value // sensor true = unlocked
 			v.mu.Unlock()
 			return v.redis.SetHandlebarLockState(isLocked)
+		case "48v_detect":
+			return v.redis.SetMainPower(value)
 		}
 		return nil
 	}
