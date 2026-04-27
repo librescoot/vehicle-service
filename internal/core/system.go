@@ -76,6 +76,8 @@ type VehicleSystem struct {
 	ledCurves               *led.CurveLibrary // LED fade/cue metadata for timing
 	initialized             bool
 	handlebarUnlocked       bool          // Track if handlebar has been unlocked in this power cycle
+	handlebarLatchedLocked  bool          // Last commanded/confirmed lock state, immune to spurious sensor edges
+	handlebarLatchInit      bool          // True once latch has been seeded from sensor or actuation
 	handlebarTimer          *time.Timer   // Timer for handlebar position window
 	handlebarDone           chan struct{} // Done channel for handlebar lock goroutine
 	handlebarUnlockDone     chan struct{} // Done channel for handlebar unlock goroutine
@@ -468,6 +470,10 @@ func (v *VehicleSystem) Start() error {
 			v.logger.Infof("Warning: Failed to publish initial state for %s to Redis: %v", sensor, err)
 		}
 	}
+
+	// Seed the latched lock state from the raw sensor. Subsequent updates
+	// only happen on confirmed actuations and on Standby entry.
+	v.resyncHandlebarLatchFromSensor()
 
 	// Now that hardware is initialized, set engine brake based on state
 	if savedState != types.StateInit && savedState != types.StateShuttingDown {
@@ -1365,6 +1371,37 @@ func (v *VehicleSystem) pulseOutput(name string, duration time.Duration) error {
 		return err
 	}
 	return nil
+}
+
+// resyncHandlebarLatchFromSensor re-seeds the latched lock state from the raw
+// sensor and publishes it. Called at boot and on Standby entry, where we have
+// to trust the sensor as ground truth (no actuation history available).
+func (v *VehicleSystem) resyncHandlebarLatchFromSensor() {
+	sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+	if err != nil {
+		v.logger.Warnf("Handlebar latch resync: sensor read failed: %v", err)
+		return
+	}
+	isLocked := !sensorVal
+	v.mu.Lock()
+	v.handlebarLatchedLocked = isLocked
+	v.handlebarLatchInit = true
+	v.mu.Unlock()
+	if err := v.redis.SetHandlebarLockLatched(isLocked); err != nil {
+		v.logger.Warnf("Handlebar latch publish failed: %v", err)
+	}
+}
+
+// setHandlebarLatch updates the latched lock state from a confirmed actuation
+// and publishes it.
+func (v *VehicleSystem) setHandlebarLatch(isLocked bool) {
+	v.mu.Lock()
+	v.handlebarLatchedLocked = isLocked
+	v.handlebarLatchInit = true
+	v.mu.Unlock()
+	if err := v.redis.SetHandlebarLockLatched(isLocked); err != nil {
+		v.logger.Warnf("Handlebar latch publish failed: %v", err)
+	}
 }
 
 // pulseHandlebarLock drives the handlebar lock solenoid H-bridge.

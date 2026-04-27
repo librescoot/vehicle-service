@@ -48,6 +48,7 @@ type MessagingClient interface {
 	SetBrakeState(side string, pressed bool) error
 	SetKickstandState(deployed bool) error
 	SetHandlebarLockState(locked bool) error
+	SetHandlebarLockLatched(locked bool) error
 	SetHandlebarPosition(isOnPlace bool) error
 	SetSeatboxLockState(locked bool) error
 	SetBlinkerSwitch(state string) error

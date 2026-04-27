@@ -385,6 +385,7 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 				if sensorVal {
 					v.logger.Warnf("Handlebar lock command sent but sensor still shows unlocked")
 				} else {
+					v.setHandlebarLatch(true)
 					v.logger.Infof("Handlebar locked via hardware command")
 				}
 			}
@@ -405,6 +406,7 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 				if !sensorVal {
 					v.logger.Warnf("Handlebar unlock command sent but sensor still shows locked")
 				} else {
+					v.setHandlebarLatch(false)
 					v.logger.Infof("Handlebar unlocked via hardware command")
 				}
 			}

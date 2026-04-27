@@ -208,6 +208,7 @@ func (v *VehicleSystem) lockHandlebarWithRetry(done chan struct{}) {
 		v.mu.Unlock()
 
 		if locked {
+			v.setHandlebarLatch(true)
 			v.logger.Infof("Handlebar locked successfully (attempt %d/%d)", attempt, handlebarLockRetries)
 			return
 		}
@@ -275,6 +276,7 @@ func (v *VehicleSystem) unlockHandlebar() {
 			v.mu.Unlock()
 
 			if unlocked {
+				v.setHandlebarLatch(false)
 				v.logger.Infof("Handlebar unlocked successfully (attempt %d)", attempt)
 				return
 			}

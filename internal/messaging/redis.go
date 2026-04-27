@@ -585,6 +585,21 @@ func (r *RedisClient) SetHandlebarLockState(isLocked bool) error {
 	return nil
 }
 
+// SetHandlebarLockLatched publishes the latched (commanded/confirmed) lock state.
+// Updated only on confirmed actuations and on Standby entry; immune to spurious
+// edges of the raw lock sensor while in active states.
+func (r *RedisClient) SetHandlebarLockLatched(isLocked bool) error {
+	state := "unlocked"
+	if isLocked {
+		state = "locked"
+	}
+	if err := r.vehiclePub.Set("handlebar:lock-state", state); err != nil {
+		r.logger.Warnf("Failed to set handlebar latched lock state: %v", err)
+		return err
+	}
+	return nil
+}
+
 // SetDbcUpdating sets the DBC updating state in Redis
 func (r *RedisClient) SetDbcUpdating(updating bool) error {
 	r.logger.Debugf("Setting DBC updating state: %v", updating)

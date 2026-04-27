@@ -354,6 +354,11 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 
 	v.cancelHandlebarUnlock()
 
+	// Re-trust the lock sensor on standby entry. Covers OTA, vehicle-service
+	// crash/restart, or manual physical intervention while powered off.
+	// The async lockHandlebar() below will refine this once it completes.
+	v.resyncHandlebarLatchFromSensor()
+
 	// Turn off any active blinkers
 	if err := v.handleBlinkerRequest("off"); err != nil {
 		v.logger.Warnf("Failed to turn off blinkers on standby: %v", err)
@@ -719,6 +724,7 @@ func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
 			if sensorVal {
 				v.logger.Warnf("hop-on: lock pulse fired but sensor still reads unlocked")
 			} else {
+				v.setHandlebarLatch(true)
 				v.logger.Infof("hop-on: steering lock engaged")
 			}
 		}()
@@ -793,6 +799,7 @@ func (v *VehicleSystem) ExitHopOn(c *librefsm.Context) error {
 			if !sensorVal {
 				v.logger.Warnf("hop-on: unlock pulse fired but sensor still reads locked")
 			} else {
+				v.setHandlebarLatch(false)
 				v.logger.Infof("hop-on: steering lock released")
 			}
 		}()

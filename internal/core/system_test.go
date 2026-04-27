@@ -79,6 +79,7 @@ func (m *mockMessagingClient) ClearAutoStandbyDeadline() error                  
 func (m *mockMessagingClient) SetHopOnActive(active bool) error                    { return nil }
 func (m *mockMessagingClient) SetKickstandState(deployed bool) error               { return nil }
 func (m *mockMessagingClient) SetHandlebarLockState(locked bool) error             { return nil }
+func (m *mockMessagingClient) SetHandlebarLockLatched(locked bool) error           { return nil }
 func (m *mockMessagingClient) SetSeatboxLockState(locked bool) error               { return nil }
 func (m *mockMessagingClient) SetHornButton(pressed bool) error                    { return nil }
 func (m *mockMessagingClient) SetSeatboxButton(pressed bool) error                 { return nil }
