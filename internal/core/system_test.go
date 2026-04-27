@@ -33,6 +33,9 @@ type mockMessagingClient struct {
 	publishedMessages      []struct{ channel, message string }
 	mainPowerSets          []bool
 	enginePowerSets        []bool
+	kickstandStates        []bool
+	hornButtonStates       []bool
+	seatboxButtonStates    []bool
 
 	// Return values
 	vehicleState    types.SystemState
@@ -77,11 +80,20 @@ func (m *mockMessagingClient) GetHashField(hash, field string) (string, error) {
 func (m *mockMessagingClient) PublishAutoStandbyDeadline(deadline time.Time) error { return nil }
 func (m *mockMessagingClient) ClearAutoStandbyDeadline() error                     { return nil }
 func (m *mockMessagingClient) SetHopOnActive(active bool) error                    { return nil }
-func (m *mockMessagingClient) SetKickstandState(deployed bool) error               { return nil }
-func (m *mockMessagingClient) SetHandlebarLockState(locked bool) error             { return nil }
-func (m *mockMessagingClient) SetSeatboxLockState(locked bool) error               { return nil }
-func (m *mockMessagingClient) SetHornButton(pressed bool) error                    { return nil }
-func (m *mockMessagingClient) SetSeatboxButton(pressed bool) error                 { return nil }
+func (m *mockMessagingClient) SetKickstandState(deployed bool) error {
+	m.kickstandStates = append(m.kickstandStates, deployed)
+	return nil
+}
+func (m *mockMessagingClient) SetHandlebarLockState(locked bool) error { return nil }
+func (m *mockMessagingClient) SetSeatboxLockState(locked bool) error   { return nil }
+func (m *mockMessagingClient) SetHornButton(pressed bool) error {
+	m.hornButtonStates = append(m.hornButtonStates, pressed)
+	return nil
+}
+func (m *mockMessagingClient) SetSeatboxButton(pressed bool) error {
+	m.seatboxButtonStates = append(m.seatboxButtonStates, pressed)
+	return nil
+}
 func (m *mockMessagingClient) SetMainPower(on bool) error {
 	m.mainPowerSets = append(m.mainPowerSets, on)
 	return nil
@@ -1519,4 +1531,211 @@ func TestRegression_UnlockInStandbyIsNotQueued(t *testing.T) {
 		t.Errorf("unlock from Standby should transition to Parked, got %v",
 			system.getCurrentState())
 	}
+}
+
+// ===== Input publish-in-Standby tests (bean librescoot-x189) =====
+//
+// In Standby, vehicle.kickstand, vehicle.brake:{left,right}, vehicle.horn-button,
+// vehicle.seatbox:button and the buttons PUBSUB channel must reflect ground
+// truth so alarm-service (and other observers) can see input edges without
+// having to wake the FSM. Actions (GPIO drives, motor pulses, LED cues, FSM
+// transitions out of Standby) must stay gated.
+
+func standbyInputSystem(t *testing.T) (*VehicleSystem, *mockHardwareIO, *mockMessagingClient) {
+	t.Helper()
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["handlebar_lock_sensor"] = false
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateStandby); err != nil {
+		t.Fatalf("SetState Standby: %v", err)
+	}
+	system.initialized = true
+
+	// Clear outputs/cues recorded during entry actions so the tests assert
+	// only on what handleInputChange does.
+	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.pwmCues = nil
+	mockRedis.publishedButtonEvents = nil
+	mockRedis.setBrakeStates = nil
+	mockRedis.setBlinkerSwitches = nil
+	mockRedis.setBlinkerStates = nil
+	mockRedis.hornButtonStates = nil
+	mockRedis.seatboxButtonStates = nil
+	mockRedis.kickstandStates = nil
+	return system, mockIO, mockRedis
+}
+
+func TestStandbyInput_HornButton_PublishesHashAndEventButDoesNotDriveGPIO(t *testing.T) {
+	system, mockIO, mockRedis := standbyInputSystem(t)
+
+	if err := system.handleInputChange("horn_button", true); err != nil {
+		t.Fatalf("handleInputChange horn_button on: %v", err)
+	}
+	if err := system.handleInputChange("horn_button", false); err != nil {
+		t.Fatalf("handleInputChange horn_button off: %v", err)
+	}
+
+	// PUBSUB event fired at the top of the function (pre-gate).
+	wantEvents := []string{"horn:on", "horn:off"}
+	if !equalStringSlice(mockRedis.publishedButtonEvents, wantEvents) {
+		t.Errorf("publishedButtonEvents = %v, want %v",
+			mockRedis.publishedButtonEvents, wantEvents)
+	}
+
+	// Hash reflects ground truth.
+	if !equalBoolSlice(mockRedis.hornButtonStates, []bool{true, false}) {
+		t.Errorf("hornButtonStates = %v, want [true false]",
+			mockRedis.hornButtonStates)
+	}
+
+	// Horn GPIO must NEVER have been written.
+	if _, ok := mockIO.digitalOutputs["horn"]; ok {
+		t.Errorf("horn GPIO must not be touched in Standby, got %v",
+			mockIO.digitalOutputs["horn"])
+	}
+}
+
+func TestStandbyInput_SeatboxButton_PublishesHashButDoesNotSendFSMEvent(t *testing.T) {
+	system, _, mockRedis := standbyInputSystem(t)
+
+	if err := system.handleInputChange("seatbox_button", true); err != nil {
+		t.Fatalf("handleInputChange seatbox_button on: %v", err)
+	}
+
+	if !equalBoolSlice(mockRedis.seatboxButtonStates, []bool{true}) {
+		t.Errorf("seatboxButtonStates = %v, want [true]",
+			mockRedis.seatboxButtonStates)
+	}
+
+	// Seatbox must not have been opened — no PublishSeatboxOpened, no seatbox:open
+	// send command, FSM still in Standby.
+	if mockRedis.publishedSeatboxOpened != 0 {
+		t.Errorf("PublishSeatboxOpened must not fire in Standby, got %d",
+			mockRedis.publishedSeatboxOpened)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if system.getCurrentState() != types.StateStandby {
+		t.Errorf("FSM must stay in Standby after seatbox press, got %v",
+			system.getCurrentState())
+	}
+}
+
+func TestStandbyInput_BrakeLeft_PublishesHashButDoesNotTouchEngineBrakeOrCues(t *testing.T) {
+	system, mockIO, mockRedis := standbyInputSystem(t)
+
+	if err := system.handleInputChange("brake_left", true); err != nil {
+		t.Fatalf("handleInputChange brake_left on: %v", err)
+	}
+
+	want := []struct {
+		side    string
+		pressed bool
+	}{{"left", true}}
+	if len(mockRedis.setBrakeStates) != 1 ||
+		mockRedis.setBrakeStates[0] != want[0] {
+		t.Errorf("setBrakeStates = %v, want %v", mockRedis.setBrakeStates, want)
+	}
+
+	if _, ok := mockIO.digitalOutputs["engine_brake"]; ok {
+		t.Errorf("engine_brake GPIO must not be driven in Standby, got %v",
+			mockIO.digitalOutputs["engine_brake"])
+	}
+	if len(mockIO.pwmCues) != 0 {
+		t.Errorf("PWM cues must not play in Standby, got %v", mockIO.pwmCues)
+	}
+}
+
+func TestStandbyInput_BrakeRight_PublishesHash(t *testing.T) {
+	system, _, mockRedis := standbyInputSystem(t)
+
+	if err := system.handleInputChange("brake_right", true); err != nil {
+		t.Fatalf("handleInputChange brake_right on: %v", err)
+	}
+	if len(mockRedis.setBrakeStates) != 1 ||
+		mockRedis.setBrakeStates[0].side != "right" ||
+		mockRedis.setBrakeStates[0].pressed != true {
+		t.Errorf("setBrakeStates = %v, want [{right true}]",
+			mockRedis.setBrakeStates)
+	}
+}
+
+func TestStandbyInput_Blinker_PublishesEventAndSwitchHashButNoActuation(t *testing.T) {
+	system, mockIO, mockRedis := standbyInputSystem(t)
+
+	if err := system.handleInputChange("blinker_left", true); err != nil {
+		t.Fatalf("handleInputChange blinker_left on: %v", err)
+	}
+	if err := system.handleInputChange("blinker_left", false); err != nil {
+		t.Fatalf("handleInputChange blinker_left off: %v", err)
+	}
+
+	wantEvents := []string{"blinker:left:on", "blinker:left:off"}
+	if !equalStringSlice(mockRedis.publishedButtonEvents, wantEvents) {
+		t.Errorf("publishedButtonEvents = %v, want %v",
+			mockRedis.publishedButtonEvents, wantEvents)
+	}
+	if !equalStringSlice(mockRedis.setBlinkerSwitches, []string{"left", "off"}) {
+		t.Errorf("setBlinkerSwitches = %v, want [left off]",
+			mockRedis.setBlinkerSwitches)
+	}
+
+	// No blinker actuation: no PWM cues, no blinker state published,
+	// no blinker goroutine started.
+	if len(mockIO.pwmCues) != 0 {
+		t.Errorf("no PWM cues expected, got %v", mockIO.pwmCues)
+	}
+	if len(mockRedis.setBlinkerStates) != 0 {
+		t.Errorf("no blinker state publish expected, got %v",
+			mockRedis.setBlinkerStates)
+	}
+	if system.blinkerStopChan != nil {
+		t.Errorf("blinker goroutine must not start in Standby")
+	}
+}
+
+func TestStandbyInput_Kickstand_PublishesHash(t *testing.T) {
+	system, _, mockRedis := standbyInputSystem(t)
+
+	if err := system.handleInputChange("kickstand", false); err != nil {
+		t.Fatalf("handleInputChange kickstand up: %v", err)
+	}
+	if err := system.handleInputChange("kickstand", true); err != nil {
+		t.Fatalf("handleInputChange kickstand down: %v", err)
+	}
+
+	if !equalBoolSlice(mockRedis.kickstandStates, []bool{false, true}) {
+		t.Errorf("kickstandStates = %v, want [false true]",
+			mockRedis.kickstandStates)
+	}
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalBoolSlice(a, b []bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

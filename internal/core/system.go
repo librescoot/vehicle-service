@@ -804,13 +804,33 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 	// First check if we should handle this input in current state
 	currentState := v.getCurrentState()
 
-	// Handle inputs that should only work when not in standby
+	// Standby: publish input state to Redis so observers (alarm-service etc.)
+	// see ground truth, but skip all side-effects (GPIO drives, FSM events,
+	// motor pulses, LED cues). A locked scooter must not honk, blink, or
+	// open the seatbox because of ghost edges at resume time.
 	if currentState == types.StateStandby {
 		switch channel {
-		case "horn_button", "seatbox_button", "brake_right", "brake_left",
-			"blinker_right", "blinker_left":
-			v.logger.Infof("Ignoring %s in standby state", channel)
-			return nil
+		case "horn_button":
+			return v.redis.SetHornButton(value)
+		case "seatbox_button":
+			return v.redis.SetSeatboxButton(value)
+		case "brake_left":
+			return v.redis.SetBrakeState("left", value)
+		case "brake_right":
+			return v.redis.SetBrakeState("right", value)
+		case "blinker_left", "blinker_right":
+			// Mirror the hop-on path: publish the button event and the
+			// switch hash so the dashboard and alarm see the edge.
+			position := strings.TrimPrefix(channel, "blinker_")
+			evt := fmt.Sprintf("blinker:%s:%s", position, state)
+			if err := v.redis.PublishButtonEvent(evt); err != nil {
+				v.logger.Warnf("standby: failed to publish %s: %v", evt, err)
+			}
+			switchState := "off"
+			if value {
+				switchState = position
+			}
+			return v.redis.SetBlinkerSwitch(switchState)
 		}
 	}
 
@@ -848,11 +868,8 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		// Reset auto-standby timer on kickstand movement
 		v.resetAutoStandbyTimer()
 
-		// Update Redis (skip in standby to avoid noise)
-		if currentState != types.StateStandby {
-			if err := v.redis.SetKickstandState(value); err != nil {
-				return err
-			}
+		if err := v.redis.SetKickstandState(value); err != nil {
+			return err
 		}
 
 		// Cancel any pending deferred kickstand-down check
