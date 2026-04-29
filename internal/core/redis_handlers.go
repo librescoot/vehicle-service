@@ -578,10 +578,11 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 		v.mu.Lock()
 		v.usb0Policy = policy
 		v.mu.Unlock()
-		v.logger.Infof("usb0 policy updated to: %s", policy)
+		effective := v.usb0AutoEffective()
+		v.logger.Infof("usb0 policy updated to: %s (auto-effective=%v)", policy, effective)
 		// Apply immediately so the link reflects the new policy without
 		// waiting for the next dashboard transition.
-		if policy == "auto" {
+		if effective {
 			dashboardPower, dpErr := v.redis.GetDashboardPower()
 			if dpErr != nil {
 				v.logger.Warnf("Failed to read dashboard power while applying usb0=auto: %v", dpErr)
