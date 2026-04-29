@@ -385,8 +385,9 @@ func (v *VehicleSystem) Start() error {
 	v.mu.RLock()
 	policy := v.usb0Policy
 	v.mu.RUnlock()
-	v.logger.Infof("usb0 policy=%s", policy)
-	if policy != "auto" {
+	effective := v.usb0AutoEffective()
+	v.logger.Infof("usb0 policy=%s, auto-effective=%v", policy, effective)
+	if !effective {
 		if err := v.io.SetUsb0Enabled(true); err != nil {
 			v.logger.Warnf("Failed to bring usb0 up at startup: %v", err)
 		}
@@ -1326,19 +1327,17 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 			v.logger.Warnf("Failed to persist dashboard power state to Redis: %v", err)
 			// Don't return error - hardware state was set successfully
 		}
-		v.mu.RLock()
-		policy := v.usb0Policy
-		v.mu.RUnlock()
-		if policy == "auto" {
+		if v.usb0AutoEffective() {
 			if err := v.io.SetUsb0Enabled(enabled); err != nil {
 				v.logger.Warnf("Failed to set usb0 link: %v", err)
 				// Don't return error - dashboard power state was set successfully
 			}
 		} else {
-			// always-on: keep usb0 up regardless of dashboard_power so
-			// installer/diag tools retain reachability. Reassert here so a
-			// transient interface bounce gets corrected on the next state
-			// transition.
+			// Keep usb0 up regardless of dashboard_power: either the user
+			// picked always-on, or auto is gated by insufficient keycard
+			// pairings. Either way installer/diag tools need reachability.
+			// Reassert so a transient bounce gets corrected on the next
+			// state transition.
 			if err := v.io.SetUsb0Enabled(true); err != nil {
 				v.logger.Warnf("Failed to reassert usb0 always-on: %v", err)
 			}
@@ -1511,6 +1510,47 @@ func (v *VehicleSystem) stopDbcWatchdog() {
 		v.dbcWatchdogTimer.Stop()
 		v.dbcWatchdogTimer = nil
 	}
+}
+
+// usb0AutoEffective reports whether the usb0=auto policy should actually
+// take effect right now. Even when the user has opted in to auto, we keep
+// usb0 up until enough keycards are paired to recover from a lockout —
+// otherwise a bad pairing could leave the scooter unreachable to both the
+// owner (no working card) and the installer (no usb0).
+//
+// Threshold: (master >= 1 AND authorized >= 1) OR authorized >= 2.
+// Counts are published to the "system" hash by keycard-service.
+func (v *VehicleSystem) usb0AutoEffective() bool {
+	v.mu.RLock()
+	policy := v.usb0Policy
+	v.mu.RUnlock()
+	if policy != "auto" {
+		return false
+	}
+
+	master := v.readKeycardCount("keycard-master-count")
+	authorized := v.readKeycardCount("keycard-authorized-count")
+
+	if master >= 1 && authorized >= 1 {
+		return true
+	}
+	if authorized >= 2 {
+		return true
+	}
+	return false
+}
+
+func (v *VehicleSystem) readKeycardCount(field string) int {
+	raw, err := v.redis.GetHashField("system", field)
+	if err != nil || raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		v.logger.Warnf("Bad %s in system hash: %q (%v)", field, raw, err)
+		return 0
+	}
+	return n
 }
 
 func (v *VehicleSystem) Shutdown() {
