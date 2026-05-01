@@ -10,8 +10,8 @@ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/r
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
 github.com/klauspost/cpuid/v2 v2.0.9 h1:lgaqFMSdTdQYdZ04uHyN2d/eKdOMyi2YLSvlQIBFYa4=
 github.com/klauspost/cpuid/v2 v2.0.9/go.mod h1:FInQzS24/EEf25PyTYn52gqo7WaD8xa0213Md/qVLRg=
-github.com/librescoot/librefsm v0.4.0 h1:jZ65DBemEkw7ru6U+skDraAFW1Bzn17CXmZv76BUnK0=
-github.com/librescoot/librefsm v0.4.0/go.mod h1:2fZNHRvoQMCPVgGbb31vgawzMaaPyazAPIgQRCiQ+Qw=
+github.com/librescoot/librefsm v0.5.0 h1:6QTzJpIbeY1/4OpzWJeLo1UTsx/iIpkDkxu7t/uDGPc=
+github.com/librescoot/librefsm v0.5.0/go.mod h1:2fZNHRvoQMCPVgGbb31vgawzMaaPyazAPIgQRCiQ+Qw=
 github.com/librescoot/redis-ipc v0.10.3 h1:VAcw2ATlR3E7ntkFVmov3xaakXxomNQk95ch2UQQDPE=
 github.com/librescoot/redis-ipc v0.10.3/go.mod h1:4mRG3+cC+llhsjwyRvNT5bF+bsn0ueaKFf70eqq0IzQ=
 github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
