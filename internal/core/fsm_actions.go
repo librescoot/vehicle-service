@@ -682,16 +682,20 @@ func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
 		return nil
 	}
 
-	// Publish the hop-on flag so the dashboard renders the lock screen.
-	if err := v.redis.SetHopOnActive(true); err != nil {
-		v.logger.Warnf("Failed to publish hop-on-active=true: %v", err)
-	}
-
 	// Visually the scooter "powers down" — kill the backlight immediately
 	// so the dashboard goes dark alongside the LED cue. EnterParked /
 	// EnterReadyToDrive will re-enable it on exit.
+	//
+	// Backlight goes off BEFORE we publish hop-on-active so the display
+	// has darkened by the time the dashboard reacts to the flag and paints
+	// the lock overlay — avoids a brief flash of the lock screen.
 	if err := v.redis.SetBacklightEnabled(false); err != nil {
 		v.logger.Warnf("Failed to disable backlight on hop-on: %v", err)
+	}
+
+	// Publish the hop-on flag so the dashboard renders the lock screen.
+	if err := v.redis.SetHopOnActive(true); err != nil {
+		v.logger.Warnf("Failed to publish hop-on-active=true: %v", err)
 	}
 
 	// Play the same LED cue we use for parked->standby (cue 7/8 picked
