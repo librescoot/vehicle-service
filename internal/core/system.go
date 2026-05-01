@@ -101,13 +101,10 @@ type VehicleSystem struct {
 	machine                 *librefsm.Machine // librefsm state machine
 	gestures                *gestureDetector
 
-	// Hop-on / hop-off mode (runtime-only — does NOT survive a power cycle).
-	// State is implicit in the FSM (StateHopOn). The fields below are
-	// transient bookkeeping carried across the engage/release transitions.
-	hopOnLockedHandlebar    bool      // True when WE engaged the steering lock on hop-on entry
-	hopOnSilent             bool      // True when StateHopOn was entered silently (learning mode): no LED cue, no steering lock, no hop-on-active publish
-	autoStandbyDeadline     time.Time // Live auto-standby deadline (set by EnterParked / EnterHopOn)
-	hopOnSavedAutoStandbyDl time.Time // Captured by handleHopOnRequest before ExitParked clears the live one
+	// Hop-on bookkeeping: only the steering-lock latch survives across
+	// the EnterHopOn / ExitHopOn pair so we know whether to release on exit.
+	hopOnLockedHandlebar bool
+	autoStandbyDeadline  time.Time // Live auto-standby deadline (set by EnterAtRest, cleared by ExitAtRest)
 }
 
 func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *VehicleSystem {
@@ -410,25 +407,6 @@ func (v *VehicleSystem) Start() error {
 		v.logger.Infof("Initial state: handlebar is unlocked")
 	}
 
-	// Recover hop-on across crashes: external state in Redis is the source
-	// of truth here. If vehicle:hop-on-active=true while we just restored to
-	// Parked (StateHopOn is published as Parked, so savedState can never be
-	// HopOn), drag the FSM into StateHopOn so the dashboard's lock screen
-	// remains authoritative and a future "release" actually does something.
-	// We don't restore hopOnSavedAutoStandbyDl (in-memory only, lost on
-	// crash) — EnterHopOn's `if !saved.IsZero()` guard then skips the
-	// auto-standby timer. Net effect: the lock survives the restart and
-	// holds indefinitely until the user releases it.
-	hopOnActiveStr, err := v.redis.GetHashField("vehicle", "hop-on-active")
-	if err != nil {
-		v.logger.Warnf("Failed to read hop-on-active for restore: %v", err)
-	} else if hopOnActiveStr == "true" && v.machine != nil && v.machine.CurrentState() == fsm.StateParked {
-		v.logger.Infof("Restoring StateHopOn from persisted vehicle:hop-on-active=true")
-		if err := v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnEngage, Payload: false}); err != nil {
-			v.logger.Warnf("Failed to restore StateHopOn: %v", err)
-		}
-	}
-
 	// Note: We do NOT read/sync dashboard power to Redis here
 	// Dashboard power is preserved from Redis during power restoration later
 	// Only state transitions should change dashboard power in Redis
@@ -691,6 +669,18 @@ func (v *VehicleSystem) resetAutoStandbyTimer() {
 	v.startAutoStandbyTimer()
 }
 
+// isInHopOnFamily reports whether the FSM is currently in the locked
+// (StateHopOn) or learning (StateHopOnLearning) sub-state. Used to gate
+// hardware side-effects (horn output, brake LED, blinker LED, seatbox
+// open) so the scooter stays "quiet" while the dashboard drives a
+// combo-matching UI on top.
+func (v *VehicleSystem) isInHopOnFamily() bool {
+	if v.machine == nil {
+		return false
+	}
+	return v.machine.IsInState(fsm.StateHopOn) || v.machine.IsInState(fsm.StateHopOnLearning)
+}
+
 // isHornAllowed checks if horn activation is permitted based on current setting and vehicle state
 func (v *VehicleSystem) isHornAllowed() bool {
 	v.mu.RLock()
@@ -783,15 +773,14 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		v.gestures.OnChange("horn", value)
 	}
 
-	// Hop-on / hop-off mode: publish input state but skip ALL action
-	// processing. The dashboard uses these inputs to match the unlock
-	// combo via the buttons PUBSUB channel and the vehicle hash sync;
-	// the scooter must NOT honk, blink, open the seatbox, or transition
-	// out of HopOn except via an explicit hop-on release (or one of the
-	// standard escape transitions defined on StateHopOn: lock, force-lock,
-	// keycard, auto-standby timeout). FSM events are deliberately not
-	// sent here so the FSM never sees kickstand-up etc. while in HopOn.
-	if v.machine != nil && v.machine.CurrentState() == fsm.StateHopOn {
+	// Hop-on family (locked or learning): suppress hardware side-effects
+	// (horn, brake LED cue, blinker LED, seatbox open) while still
+	// publishing input state to Redis so the dashboard's combo matcher
+	// sees every press. FSM-level transitions are handled declaratively
+	// by BlockedEvents on StateHopOn/StateHopOnLearning (see
+	// fsm/definition.go) — sending the events here is harmless because
+	// the FSM drops them.
+	if v.isInHopOnFamily() {
 		switch channel {
 		case "brake_left":
 			return v.redis.SetBrakeState("left", value)
@@ -804,9 +793,9 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		case "kickstand":
 			return v.redis.SetKickstandState(value)
 		case "blinker_left", "blinker_right":
-			// The top of this function skipped the PUBSUB publish for
-			// blinker channels (handleBlinkerChange normally handles them)
-			// — emit it manually so the dashboard's matcher sees it.
+			// handleBlinkerChange would normally publish the button
+			// event; emit it manually here since we're skipping that
+			// path to avoid driving the LED.
 			position := strings.TrimPrefix(channel, "blinker_")
 			evt := fmt.Sprintf("blinker:%s:%s", position, state)
 			if err := v.redis.PublishButtonEvent(evt); err != nil {
@@ -820,7 +809,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		case "handlebar_lock_sensor":
 			isLocked := !value
 			v.mu.Lock()
-			v.handlebarUnlocked = value // sensor true = unlocked
+			v.handlebarUnlocked = value
 			v.mu.Unlock()
 			return v.redis.SetHandlebarLockState(isLocked)
 		case "48v_detect":

@@ -76,7 +76,6 @@ func (m *mockMessagingClient) GetHashField(hash, field string) (string, error) {
 }
 func (m *mockMessagingClient) PublishAutoStandbyDeadline(deadline time.Time) error { return nil }
 func (m *mockMessagingClient) ClearAutoStandbyDeadline() error                     { return nil }
-func (m *mockMessagingClient) SetHopOnActive(active bool) error                    { return nil }
 func (m *mockMessagingClient) SetKickstandState(deployed bool) error               { return nil }
 func (m *mockMessagingClient) SetHandlebarLockState(locked bool) error             { return nil }
 func (m *mockMessagingClient) SetHandlebarLockLatched(locked bool) error           { return nil }
@@ -1519,5 +1518,172 @@ func TestRegression_UnlockInStandbyIsNotQueued(t *testing.T) {
 	if system.getCurrentState() != types.StateParked {
 		t.Errorf("unlock from Standby should transition to Parked, got %v",
 			system.getCurrentState())
+	}
+}
+
+// ===== Hop-on / hop-off mode tests =====
+
+// Parked -> HopOn -> Parked must NOT re-arm the auto-standby timer: the
+// timer is owned by StateAtRest, and sibling transitions inside the group
+// don't fire OnEnter on the parent. The captured deadline should survive
+// the detour intact.
+func TestHopOn_AutoStandbyDeadlinePreserved(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["handlebar_lock_sensor"] = true
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	system.autoStandbySeconds = 900 // mirror the production default
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState Parked: %v", err)
+	}
+	system.initialized = true
+
+	system.mu.RLock()
+	deadlineBefore := system.autoStandbyDeadline
+	system.mu.RUnlock()
+	if deadlineBefore.IsZero() {
+		t.Fatal("auto-standby deadline should be armed after entering Parked")
+	}
+
+	if err := system.handleHopOnRequest("engage"); err != nil {
+		t.Fatalf("hop-on engage: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if system.machine.CurrentState() != fsm.StateHopOn {
+		t.Fatalf("expected StateHopOn, got %v", system.machine.CurrentState())
+	}
+
+	if err := system.handleHopOnRequest("release"); err != nil {
+		t.Fatalf("hop-on release: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if system.machine.CurrentState() != fsm.StateParked {
+		t.Fatalf("expected StateParked after release, got %v", system.machine.CurrentState())
+	}
+
+	system.mu.RLock()
+	deadlineAfter := system.autoStandbyDeadline
+	system.mu.RUnlock()
+	if !deadlineAfter.Equal(deadlineBefore) {
+		t.Errorf("auto-standby deadline changed across hop-on detour: before=%v after=%v",
+			deadlineBefore, deadlineAfter)
+	}
+}
+
+// Sending kickstand events while in StateHopOn must not transition.
+// BlockedEvents on the state declaratively pre-empts the FSM event.
+func TestHopOn_KickstandEventsBlocked(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["handlebar_lock_sensor"] = true
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateHopOn); err != nil {
+		t.Fatalf("SetState HopOn: %v", err)
+	}
+	system.initialized = true
+	system.dashboardReady = true
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvKickstandUp}); err != nil {
+		t.Fatalf("send kickstand-up: %v", err)
+	}
+	if system.machine.CurrentState() != fsm.StateHopOn {
+		t.Errorf("kickstand-up must not transition out of HopOn; got %v", system.machine.CurrentState())
+	}
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvKickstandDown}); err != nil {
+		t.Fatalf("send kickstand-down: %v", err)
+	}
+	if system.machine.CurrentState() != fsm.StateHopOn {
+		t.Errorf("kickstand-down must not transition out of HopOn; got %v", system.machine.CurrentState())
+	}
+}
+
+// Lock command from HopOn fires the parent StateAtRest transition to
+// ShuttingDown (with seatbox-closed guard satisfied).
+func TestHopOn_LockTransitionsToShuttingDown(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true // closed -> guard passes
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateHopOn); err != nil {
+		t.Fatalf("SetState HopOn: %v", err)
+	}
+	system.initialized = true
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvLock}); err != nil {
+		t.Fatalf("send lock: %v", err)
+	}
+	if system.machine.CurrentState() != fsm.StateShuttingDown {
+		t.Errorf("lock from HopOn should reach ShuttingDown; got %v", system.machine.CurrentState())
+	}
+}
+
+// HopOnLearning enters without user-facing side-effects: no LED cue, no
+// backlight toggle. The dashboard renders its own learn overlay.
+func TestHopOnLearning_NoSideEffects(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["handlebar_lock_sensor"] = true
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState Parked: %v", err)
+	}
+	system.initialized = true
+
+	mockIO.pwmCues = nil // clear cues from EnterParked
+
+	if err := system.handleHopOnRequest("engage-learning"); err != nil {
+		t.Fatalf("engage-learning: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if system.machine.CurrentState() != fsm.StateHopOnLearning {
+		t.Fatalf("expected StateHopOnLearning, got %v", system.machine.CurrentState())
+	}
+	if len(mockIO.pwmCues) != 0 {
+		t.Errorf("learning entry should be silent; got pwmCues=%v", mockIO.pwmCues)
+	}
+}
+
+// Saved state "hop-on" in Redis at startup must land the FSM directly in
+// StateHopOn. The previous flag-based heuristic is gone; the leaf state
+// itself is authoritative across crashes.
+func TestHopOn_RestoreFromSavedState(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.vehicleState = types.StateHopOn
+	system.autoStandbySeconds = 900 // mirror the production default
+
+	initTestFSM(t, system)
+
+	if err := system.restoreFSMState(types.StateHopOn); err != nil {
+		t.Fatalf("restoreFSMState: %v", err)
+	}
+
+	if system.machine.CurrentState() != fsm.StateHopOn {
+		t.Errorf("expected StateHopOn after restore, got %v", system.machine.CurrentState())
+	}
+	// Parent OnEnter must have armed the auto-standby timer too — the
+	// hierarchical SetState fix guarantees this.
+	system.mu.RLock()
+	deadline := system.autoStandbyDeadline
+	system.mu.RUnlock()
+	if deadline.IsZero() {
+		t.Errorf("auto-standby timer should be armed after restoring into the at-rest group")
 	}
 }

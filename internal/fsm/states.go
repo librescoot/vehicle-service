@@ -19,13 +19,23 @@ const (
 	StateHibernationSeatbox         librefsm.StateID = "hibernation-seatbox"
 	StateHibernationConfirm         librefsm.StateID = "hibernation-confirm"
 
-	// Hop-on / hop-off mode: a sibling of Parked. While in this state the
-	// scooter stays powered up but ALL physical inputs are published only,
-	// never processed (no horn, no blinker, no kickstand->RTD, no seatbox
-	// open). The auto-standby timer's deadline is preserved across the
-	// engage/release transitions so a forgotten hop-on still drops to
-	// standby on schedule.
+	// At-rest parent grouping the parked-family leaves. Owns the
+	// auto-standby timer so sibling transitions (Parked <-> HopOn <->
+	// HopOnLearning) don't tear down or re-arm it.
+	StateAtRest librefsm.StateID = "at-rest"
+
+	// Hop-on / hop-off mode (locked): scooter stays powered up but every
+	// physical input is dropped at the FSM level via BlockedEvents (no
+	// horn, no blinker, no kickstand->RTD, no seatbox open). The dashboard
+	// renders a lock screen; only an explicit release combo, mobile-app
+	// unlock, or a standard escape (lock/keycard/force-lock/auto-standby)
+	// exits.
 	StateHopOn librefsm.StateID = "hop-on"
+
+	// Hop-on combo learning: same input gating as StateHopOn but no
+	// user-facing side-effects (no LED cue, no steering-lock attempt, no
+	// lock-screen). Used while the dashboard records the user's combo.
+	StateHopOnLearning librefsm.StateID = "hop-on-learning"
 )
 
 // Vehicle events
@@ -63,8 +73,9 @@ const (
 	EvSeatboxClosed librefsm.EventID = "seatbox-closed"
 
 	// Hop-on / hop-off mode events
-	EvHopOnEngage  librefsm.EventID = "hop-on-engage"
-	EvHopOnRelease librefsm.EventID = "hop-on-release"
+	EvHopOnEngage         librefsm.EventID = "hop-on-engage"
+	EvHopOnLearningEngage librefsm.EventID = "hop-on-learning-engage"
+	EvHopOnRelease        librefsm.EventID = "hop-on-release"
 )
 
 // Timer names for imperative timers

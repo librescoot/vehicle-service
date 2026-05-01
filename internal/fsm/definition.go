@@ -29,9 +29,21 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		State(StateStandby,
 			librefsm.WithOnEnter(actions.EnterStandby),
 		).
+
+		// At-rest parent grouping Parked, HopOn, HopOnLearning. Owns the
+		// auto-standby timer: armed once on entry from outside the group,
+		// cancelled once on exit to Drive/Shutdown. Sibling transitions
+		// inside the group don't fire OnEnter/OnExit on this parent
+		// (LCA-based transition semantics in librefsm), so the timer
+		// runs continuously across hop-on detours without manual handoff.
+		State(StateAtRest,
+			librefsm.WithDefaultChild(StateParked),
+			librefsm.WithOnEnter(actions.EnterAtRest),
+			librefsm.WithOnExit(actions.ExitAtRest),
+		).
 		State(StateParked,
+			librefsm.WithParent(StateAtRest),
 			librefsm.WithOnEnter(actions.EnterParked),
-			librefsm.WithOnExit(actions.ExitParked),
 		).
 		State(StateReadyToDrive,
 			librefsm.WithOnEnter(actions.EnterReadyToDrive),
@@ -73,15 +85,36 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 			librefsm.WithOnEnter(actions.EnterHibernationConfirm),
 		).
 
-		// Hop-on / hop-off mode (sibling of Parked).
-		// While in this state every physical input is published only,
-		// never processed — see handleInputChange's hop-on early-return.
-		// The auto-standby deadline is preserved across the engage and
-		// release transitions by VehicleSystem so a forgotten hop-on
-		// still drops to standby on the original schedule.
+		// Hop-on / hop-off mode (locked) — child of StateAtRest. Inputs
+		// declared here are dropped at the FSM level, equivalent to the
+		// pre-refactor handleInputChange early-return. The auto-standby
+		// timer keeps running on the parent across the engage/release
+		// detour without any manual deadline handoff.
 		State(StateHopOn,
+			librefsm.WithParent(StateAtRest),
 			librefsm.WithOnEnter(actions.EnterHopOn),
 			librefsm.WithOnExit(actions.ExitHopOn),
+			librefsm.WithBlockedEvents(
+				EvKickstandUp, EvKickstandDown,
+				EvBrakesPressed, EvBrakesReleased,
+				EvSeatboxButton, EvSeatboxClosed,
+				EvDashboardReady, EvDashboardNotReady,
+			),
+		).
+
+		// Hop-on combo learning — same input gating as StateHopOn but
+		// no user-facing side-effects. Used while the dashboard records
+		// the user's combo. Externally parked-equivalent.
+		State(StateHopOnLearning,
+			librefsm.WithParent(StateAtRest),
+			librefsm.WithOnEnter(actions.EnterHopOnLearning),
+			librefsm.WithOnExit(actions.ExitHopOnLearning),
+			librefsm.WithBlockedEvents(
+				EvKickstandUp, EvKickstandDown,
+				EvBrakesPressed, EvBrakesReleased,
+				EvSeatboxButton, EvSeatboxClosed,
+				EvDashboardReady, EvDashboardNotReady,
+			),
 		).
 
 		// === Transitions ===
@@ -94,6 +127,27 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateStandby, EvKeycardAuth, StateParked).             // Keycard tap unlocks from standby
 		Transition(StateStandby, EvDbcUpdateComplete, StateShuttingDown). // DBC update complete, give DBC time to poweroff
 
+		// === StateAtRest parent: family-wide transitions ===
+		// These apply uniformly to Parked, HopOn, and HopOnLearning.
+		// librefsm walks current state first then ancestors in
+		// findAllTransitions, so child-specific overrides (like
+		// Parked's EvUnlock -> RTD) win over these for the source
+		// state that defines them.
+		Transition(StateAtRest, EvLock, StateShuttingDown,
+			librefsm.WithGuard(actions.IsSeatboxClosed),
+		).
+		Transition(StateAtRest, EvLock, StateWaitingSeatbox). // Fallback if seatbox open
+		Transition(StateAtRest, EvForceLock, StateStandby,
+			librefsm.WithAction(actions.OnForceLock),
+		).
+		Transition(StateAtRest, EvKeycardAuth, StateShuttingDown, // Keycard tap locks
+			librefsm.WithGuards(actions.IsKickstandDown, actions.IsSeatboxClosed),
+		).
+		Transition(StateAtRest, EvKeycardAuth, StateWaitingSeatbox,
+			librefsm.WithGuard(actions.IsKickstandDown), // Seatbox open, kickstand down
+		).
+		Transition(StateAtRest, EvAutoStandbyTimeout, StateShuttingDown).
+
 		// From Parked - unlock/kickstand-up/dashboard-ready to ReadyToDrive if conditions met.
 		Transition(StateParked, EvUnlock, StateReadyToDrive,
 			librefsm.WithGuard(actions.CanEnterReadyToDrive), // Requires both kickstand up AND dashboard ready
@@ -104,23 +158,9 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateParked, EvDashboardReady, StateReadyToDrive,
 			librefsm.WithGuards(actions.IsKickstandUp, actions.IsHandlebarUnlocked),
 		).
-		Transition(StateParked, EvLock, StateShuttingDown,
-			librefsm.WithGuard(actions.IsSeatboxClosed),
-		).
-		Transition(StateParked, EvLock, StateWaitingSeatbox). // Fallback if seatbox open
 		Transition(StateParked, EvLockHibernate, StateShuttingDown,
 			librefsm.WithAction(actions.OnLockHibernate),
 		).
-		Transition(StateParked, EvForceLock, StateStandby,
-			librefsm.WithAction(actions.OnForceLock),
-		).
-		Transition(StateParked, EvKeycardAuth, StateShuttingDown, // Keycard tap locks from parked
-			librefsm.WithGuards(actions.IsKickstandDown, actions.IsSeatboxClosed),
-		).
-		Transition(StateParked, EvKeycardAuth, StateWaitingSeatbox,
-			librefsm.WithGuard(actions.IsKickstandDown), // Seatbox open, kickstand down
-		).
-		Transition(StateParked, EvAutoStandbyTimeout, StateShuttingDown).
 		// Manual ready-to-drive: seatbox button with kickstand up and both brakes pressed
 		Transition(StateParked, EvSeatboxButton, StateReadyToDrive,
 			librefsm.WithGuards(actions.IsKickstandUp, actions.AreBrakesPressed),
@@ -134,33 +174,22 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateParked, EvBrakesPressed, StateHibernationInitialHold,
 			librefsm.WithGuard(actions.AreBrakesPressed),
 		).
-		// Hop-on / hop-off engage
+		// Hop-on / hop-off engage variants
 		Transition(StateParked, EvHopOnEngage, StateHopOn).
+		Transition(StateParked, EvHopOnLearningEngage, StateHopOnLearning).
 
-		// From HopOn — the "normal" exit is either the explicit release
-		// (combo matched on the dashboard) or an unlock command from the
-		// mobile app (which sees the scooter as stand-by while hop-on is
-		// active). Standard escape paths still work: lock, force-lock,
-		// keycard, auto-standby timeout. Inputs like kickstand-up are
-		// deliberately NOT routed here because handleInputChange
-		// suppresses every FSM event send while in StateHopOn — the
-		// inputs are published but not processed.
+		// From HopOn — release (combo matched) or mobile-app unlock both
+		// drop back to the default child of StateAtRest. The standard
+		// escape paths (lock/force-lock/keycard/auto-standby) live on
+		// StateAtRest above and are inherited via the parent walk.
+		// Physical inputs like kickstand-up are pre-empted by
+		// BlockedEvents on the state itself.
 		Transition(StateHopOn, EvHopOnRelease, StateParked).
 		Transition(StateHopOn, EvUnlock, StateParked).
-		Transition(StateHopOn, EvAutoStandbyTimeout, StateShuttingDown).
-		Transition(StateHopOn, EvLock, StateShuttingDown,
-			librefsm.WithGuard(actions.IsSeatboxClosed),
-		).
-		Transition(StateHopOn, EvLock, StateWaitingSeatbox). // Fallback if seatbox open
-		Transition(StateHopOn, EvForceLock, StateStandby,
-			librefsm.WithAction(actions.OnForceLock),
-		).
-		Transition(StateHopOn, EvKeycardAuth, StateShuttingDown,
-			librefsm.WithGuards(actions.IsKickstandDown, actions.IsSeatboxClosed),
-		).
-		Transition(StateHopOn, EvKeycardAuth, StateWaitingSeatbox,
-			librefsm.WithGuard(actions.IsKickstandDown),
-		).
+
+		// From HopOnLearning — same exit shape as HopOn.
+		Transition(StateHopOnLearning, EvHopOnRelease, StateParked).
+		Transition(StateHopOnLearning, EvUnlock, StateParked).
 
 		// From ReadyToDrive
 		Transition(StateReadyToDrive, EvKickstandDown, StateParked).

@@ -421,45 +421,46 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 }
 
 // handleHopOnRequest engages or releases hop-on / hop-off mode by
-// dispatching the corresponding FSM event. The actual side-effects (LED
-// cues, steering lock, vehicle:hop-on-active publishing, auto-standby
-// timer resume) live in EnterHopOn / ExitHopOn — this handler just
-// captures the live auto-standby deadline before the transition fires
-// (because ExitParked will clear it before EnterHopOn runs) and then
-// dispatches the event.
+// dispatching the corresponding FSM event. The state machine handles
+// every side-effect (LED cues, steering lock, input gating, etc.) — see
+// fsm/definition.go and core/fsm_actions.go.
 //
-// "engage-silent" is the same transition as "engage" with a silent flag
-// passed via the event payload, used by the dashboard's combo learning
-// flow so input side-effects (horn, blinker, brake LED, seatbox open,
-// hibernation hold) are suppressed without the user-facing "powering
-// down" cue, opportunistic steering lock, or hop-on-active publish.
+//   - engage           -> locked hop-on (lock screen, LED cue, steering lock)
+//   - engage-learning  -> combo capture (no user-facing side-effects)
+//   - release          -> back to parked (works from either sub-state)
 func (v *VehicleSystem) handleHopOnRequest(action string) error {
 	if v.machine == nil {
 		return fmt.Errorf("hop-on: FSM not initialised")
 	}
 	switch action {
-	case "engage", "engage-silent":
+	case "engage":
 		current := v.machine.CurrentState()
 		if current == fsm.StateHopOn {
-			v.logger.Debugf("hop-on %s requested but already in StateHopOn — no-op", action)
+			v.logger.Debugf("hop-on engage requested but already in StateHopOn — no-op")
 			return nil
 		}
 		if current != fsm.StateParked {
-			v.logger.Warnf("hop-on %s refused: scooter is in %s, not parked", action, current)
+			v.logger.Warnf("hop-on engage refused: scooter is in %s, not parked", current)
 			return nil
 		}
-		// Capture the live auto-standby deadline so EnterHopOn (and later
-		// EnterParked from HopOn) can resume it. Without this the timer
-		// would restart from full duration on every hop-on cycle.
-		v.mu.Lock()
-		v.hopOnSavedAutoStandbyDl = v.autoStandbyDeadline
-		v.mu.Unlock()
-		silent := action == "engage-silent"
-		return v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnEngage, Payload: silent})
+		return v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnEngage})
+
+	case "engage-learning":
+		current := v.machine.CurrentState()
+		if current == fsm.StateHopOnLearning {
+			v.logger.Debugf("hop-on engage-learning requested but already in StateHopOnLearning — no-op")
+			return nil
+		}
+		if current != fsm.StateParked {
+			v.logger.Warnf("hop-on engage-learning refused: scooter is in %s, not parked", current)
+			return nil
+		}
+		return v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnLearningEngage})
 
 	case "release":
-		if v.machine.CurrentState() != fsm.StateHopOn {
-			v.logger.Debugf("hop-on release requested but not in StateHopOn — no-op")
+		current := v.machine.CurrentState()
+		if current != fsm.StateHopOn && current != fsm.StateHopOnLearning {
+			v.logger.Debugf("hop-on release requested but not in a hop-on sub-state — no-op")
 			return nil
 		}
 		return v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnRelease})

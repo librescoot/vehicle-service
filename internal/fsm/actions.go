@@ -13,8 +13,9 @@ type Actions interface {
 	EnterShuttingDown(c *librefsm.Context) error
 	EnterWaitingSeatbox(c *librefsm.Context) error
 
-	// State exit actions
-	ExitParked(c *librefsm.Context) error
+	// At-rest parent: owns the auto-standby timer for the parked family.
+	EnterAtRest(c *librefsm.Context) error
+	ExitAtRest(c *librefsm.Context) error
 
 	// Hibernation state actions
 	EnterHibernation(c *librefsm.Context) error
@@ -27,6 +28,8 @@ type Actions interface {
 	// Hop-on / hop-off state actions
 	EnterHopOn(c *librefsm.Context) error
 	ExitHopOn(c *librefsm.Context) error
+	EnterHopOnLearning(c *librefsm.Context) error
+	ExitHopOnLearning(c *librefsm.Context) error
 
 	// Guards for conditional transitions
 	CanEnterReadyToDrive(c *librefsm.Context) bool // True when both kickstand up AND dashboard ready

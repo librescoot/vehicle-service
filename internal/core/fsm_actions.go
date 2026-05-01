@@ -40,10 +40,12 @@ func stateIDToSystemState(id librefsm.StateID) types.SystemState {
 	case fsm.StateHibernationConfirm:
 		return types.StateWaitingHibernationConfirm
 	case fsm.StateHopOn:
-		// Externally hop-on looks like parked: the dashboard's `isParked()`
-		// check (used to allow opening the menu, learning, etc.) keeps
-		// working. Hop-on engagement is signalled separately via the
-		// `vehicle:hop-on-active` field.
+		return types.StateHopOn
+	case fsm.StateHopOnLearning:
+		return types.StateHopOnLearning
+	case fsm.StateAtRest:
+		// Parent grouping; never current as a leaf, but the converter
+		// is defensive against transient lookups.
 		return types.StateParked
 	default:
 		return types.SystemState(string(id))
@@ -75,6 +77,10 @@ func systemStateToStateID(s types.SystemState) librefsm.StateID {
 		return fsm.StateHibernationSeatbox
 	case types.StateWaitingHibernationConfirm:
 		return fsm.StateHibernationConfirm
+	case types.StateHopOn:
+		return fsm.StateHopOn
+	case types.StateHopOnLearning:
+		return fsm.StateHopOnLearning
 	default:
 		return librefsm.StateID(string(s))
 	}
@@ -299,52 +305,12 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 		}
 	}
 
-	// Start (or resume) the auto-standby timer.
-	//
-	// When transitioning back from hop-on we resume from the saved
-	// deadline so a forgotten hop-on still drops to standby on the
-	// original schedule. handleHopOnRequest captures the live deadline
-	// just before sending EvHopOnEngage; ExitParked then clears the
-	// live one but the saved copy persists across the StateHopOn detour.
-	v.mu.RLock()
-	seconds := v.autoStandbySeconds
-	saved := v.hopOnSavedAutoStandbyDl
-	v.mu.RUnlock()
-
-	cameFromHopOn := c.FromState == fsm.StateHopOn
-
-	if seconds > 0 && v.machine != nil {
-		var duration time.Duration
-		var deadline time.Time
-
-		if cameFromHopOn && !saved.IsZero() {
-			deadline = saved
-			duration = time.Until(deadline)
-			if duration < 1*time.Millisecond {
-				duration = 1 * time.Millisecond
-			}
-			v.logger.Infof("Resumed auto-standby timer with %v remaining (came from hop-on)", duration)
-		} else {
-			duration = time.Duration(seconds) * time.Second
-			deadline = time.Now().Add(duration)
-			v.logger.Infof("Started auto-standby timer: %d seconds", seconds)
-		}
-
-		v.mu.Lock()
-		v.autoStandbyDeadline = deadline
-		v.hopOnSavedAutoStandbyDl = time.Time{} // consumed (or stale — clear either way)
-		v.mu.Unlock()
-
-		v.machine.StartTimer(fsm.TimerAutoStandby, duration, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
-		if err := v.redis.PublishAutoStandbyDeadline(deadline); err != nil {
-			v.logger.Warnf("Failed to publish auto-standby deadline: %v", err)
-		}
-	} else {
-		// Even if no timer is armed, clear any stale saved deadline.
-		v.mu.Lock()
-		v.hopOnSavedAutoStandbyDl = time.Time{}
-		v.mu.Unlock()
-	}
+	// The auto-standby timer is owned by EnterAtRest / ExitAtRest now —
+	// see the StateAtRest parent in fsm.NewDefinition. EnterParked fires
+	// on every entry into the Parked leaf (including HopOn -> Parked),
+	// but the at-rest parent is unaffected by sibling transitions, so
+	// the timer keeps running through every hop-on detour without any
+	// manual deadline handoff.
 
 	return nil
 }
@@ -530,22 +496,48 @@ func (v *VehicleSystem) EnterWaitingSeatbox(c *librefsm.Context) error {
 	return nil
 }
 
-// === State Exit Actions ===
+// === StateAtRest parent (auto-standby owner) ===
 
-func (v *VehicleSystem) ExitParked(c *librefsm.Context) error {
-	v.logger.Debugf("FSM: ExitParked")
-	// Cancel auto-standby timer when leaving parked
+// EnterAtRest fires once on entry to the parked-family group from outside
+// (Standby/Init/ShuttingDown -> unlock). Sibling transitions inside the
+// group (Parked <-> HopOn <-> HopOnLearning) leave StateAtRest active and
+// do NOT re-fire this — see librefsm machine.go LCA semantics.
+func (v *VehicleSystem) EnterAtRest(c *librefsm.Context) error {
+	v.logger.Debugf("FSM: EnterAtRest (parent)")
+
+	v.mu.RLock()
+	seconds := v.autoStandbySeconds
+	v.mu.RUnlock()
+
+	if seconds <= 0 || v.machine == nil {
+		return nil
+	}
+
+	duration := time.Duration(seconds) * time.Second
+	deadline := time.Now().Add(duration)
+
+	v.mu.Lock()
+	v.autoStandbyDeadline = deadline
+	v.mu.Unlock()
+
+	v.machine.StartTimer(fsm.TimerAutoStandby, duration, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
+	v.logger.Infof("Started auto-standby timer: %d seconds", seconds)
+	if err := v.redis.PublishAutoStandbyDeadline(deadline); err != nil {
+		v.logger.Warnf("Failed to publish auto-standby deadline: %v", err)
+	}
+	return nil
+}
+
+// ExitAtRest fires once on exit to a non-parked-family state (Drive,
+// Shutdown, Hibernation, Standby). Cancels the auto-standby timer.
+func (v *VehicleSystem) ExitAtRest(c *librefsm.Context) error {
+	v.logger.Debugf("FSM: ExitAtRest (parent)")
 	if v.machine != nil {
 		v.machine.StopTimer(fsm.TimerAutoStandby)
-		v.logger.Debugf("Stopped auto-standby timer")
 	}
-	// Clear the deadline from Redis
 	if err := v.redis.ClearAutoStandbyDeadline(); err != nil {
 		v.logger.Warnf("Failed to clear auto-standby deadline: %v", err)
 	}
-	// Clear the live deadline. The saved-for-hop-on copy is intentionally
-	// NOT touched here — handleHopOnRequest captured it before triggering
-	// EvHopOnEngage so EnterHopOn / EnterParked-from-HopOn can resume.
 	v.mu.Lock()
 	v.autoStandbyDeadline = time.Time{}
 	v.mu.Unlock()
@@ -625,81 +617,18 @@ func (v *VehicleSystem) EnterHibernationConfirm(c *librefsm.Context) error {
 	return nil
 }
 
-// EnterHopOn enters hop-on / hop-off mode. The scooter stays powered up
-// but handleInputChange will publish-only every input. The auto-standby
-// timer is resumed from the deadline that handleHopOnRequest captured
-// just before sending EvHopOnEngage (since ExitParked already cleared
-// the live deadline by the time this runs).
-//
-// If the EvHopOnEngage payload carries silent=true (combo learning
-// mode), the user-facing side-effects (LED cue, opportunistic steering
-// lock, hop-on-active flag publish) are skipped — only the input
-// suppression behaviour of StateHopOn is borrowed. The auto-standby
-// resume still happens regardless.
+// EnterHopOn enters the locked hop-on mode. The scooter stays powered up;
+// the dashboard renders a lock screen. Physical inputs are dropped at the
+// FSM level via the BlockedEvents declared on StateHopOn. The auto-standby
+// timer is owned by the StateAtRest parent and continues running across
+// the engage/release detour without manual handoff.
 func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
-	silent := false
-	if c != nil && c.Event != nil {
-		if s, ok := c.Event.Payload.(bool); ok {
-			silent = s
-		}
-	}
-	if silent {
-		v.logger.Infof("FSM: EnterHopOn (silent)")
-	} else {
-		v.logger.Infof("FSM: EnterHopOn")
-	}
-
-	v.mu.Lock()
-	v.hopOnSilent = silent
-	v.mu.Unlock()
-
-	// Resume the auto-standby timer using the saved deadline. If it has
-	// already passed, fire the timeout immediately so the FSM moves to
-	// shutdown without delay.
-	v.mu.RLock()
-	saved := v.hopOnSavedAutoStandbyDl
-	v.mu.RUnlock()
-
-	if !saved.IsZero() && v.machine != nil {
-		remaining := time.Until(saved)
-		if remaining < 1*time.Millisecond {
-			remaining = 1 * time.Millisecond
-		}
-		v.machine.StartTimer(fsm.TimerAutoStandby, remaining, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
-		v.mu.Lock()
-		v.autoStandbyDeadline = saved
-		v.mu.Unlock()
-		if err := v.redis.PublishAutoStandbyDeadline(saved); err != nil {
-			v.logger.Warnf("Failed to publish auto-standby deadline in hop-on: %v", err)
-		}
-		v.logger.Infof("hop-on: resumed auto-standby timer with %v remaining", remaining)
-	}
-
-	if silent {
-		// Learning mode: suppress every user-facing signal. The dashboard
-		// shows its own learn overlay; vehicle-service stays "invisible"
-		// while the user records their combo.
-		return nil
-	}
-
-	// Visually the scooter "powers down" — kill the backlight immediately
-	// so the dashboard goes dark alongside the LED cue. EnterParked /
-	// EnterReadyToDrive will re-enable it on exit.
-	//
-	// Backlight goes off BEFORE we publish hop-on-active so the display
-	// has darkened by the time the dashboard reacts to the flag and paints
-	// the lock overlay — avoids a brief flash of the lock screen.
-	if err := v.redis.SetBacklightEnabled(false); err != nil {
-		v.logger.Warnf("Failed to disable backlight on hop-on: %v", err)
-	}
-
-	// Publish the hop-on flag so the dashboard renders the lock screen.
-	if err := v.redis.SetHopOnActive(true); err != nil {
-		v.logger.Warnf("Failed to publish hop-on-active=true: %v", err)
-	}
+	v.logger.Infof("FSM: EnterHopOn")
 
 	// Play the same LED cue we use for parked->standby (cue 7/8 picked
-	// by current brake state). Visually the scooter "powers down".
+	// by current brake state). Backlight handling lives entirely in the
+	// dashboard now (HopOnStore::activate keeps it on for 30s so the
+	// user sees the lock screen, then disables it via onBacklightDelayElapsed).
 	brakeLeft, brakeRight, _ := v.readBrakeStates()
 	if brakeLeft || brakeRight {
 		v.playLedCue(8, "hop-on engage (brakes on)")
@@ -746,51 +675,26 @@ func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
 	return nil
 }
 
-// ExitHopOn leaves hop-on / hop-off mode. Always cancels the auto-standby
-// timer (EnterParked or another state's onEnter will rearm it as needed)
-// and releases the steering lock if WE engaged it on entry. The
-// user-facing reverse LED cue and hop-on-active publish are skipped if
-// we entered silently (combo learning) — they were never set.
+// ExitHopOn leaves the locked hop-on mode. Releases the steering lock if
+// WE engaged it on entry. The auto-standby timer is parent-owned, so no
+// timer plumbing is needed here.
 func (v *VehicleSystem) ExitHopOn(c *librefsm.Context) error {
 	v.mu.Lock()
-	silent := v.hopOnSilent
-	v.hopOnSilent = false
 	releaseHandlebar := v.hopOnLockedHandlebar
 	v.hopOnLockedHandlebar = false
 	v.mu.Unlock()
 
-	if silent {
-		v.logger.Infof("FSM: ExitHopOn (silent)")
+	v.logger.Infof("FSM: ExitHopOn")
+
+	// Reverse LED cue: same one we play for standby->parked.
+	brakeLeft, brakeRight, _ := v.readBrakeStates()
+	if brakeLeft || brakeRight {
+		v.playLedCue(2, "hop-on release (brakes on)")
 	} else {
-		v.logger.Infof("FSM: ExitHopOn")
+		v.playLedCue(1, "hop-on release (brakes off)")
 	}
 
-	if v.machine != nil {
-		v.machine.StopTimer(fsm.TimerAutoStandby)
-	}
-	if err := v.redis.ClearAutoStandbyDeadline(); err != nil {
-		v.logger.Warnf("Failed to clear auto-standby deadline on hop-on exit: %v", err)
-	}
-	v.mu.Lock()
-	v.autoStandbyDeadline = time.Time{}
-	v.mu.Unlock()
-
-	if !silent {
-		if err := v.redis.SetHopOnActive(false); err != nil {
-			v.logger.Warnf("Failed to publish hop-on-active=false: %v", err)
-		}
-
-		// Reverse LED cue: same one we play for standby->parked.
-		brakeLeft, brakeRight, _ := v.readBrakeStates()
-		if brakeLeft || brakeRight {
-			v.playLedCue(2, "hop-on release (brakes on)")
-		} else {
-			v.playLedCue(1, "hop-on release (brakes off)")
-		}
-	}
-
-	// Release the steering lock only if we engaged it on entry. Silent
-	// mode never engages it, so this is naturally a no-op for learning.
+	// Release the steering lock only if we engaged it on entry.
 	if releaseHandlebar {
 		v.logger.Infof("hop-on: releasing steering lock that we engaged")
 		go func() {
@@ -816,6 +720,24 @@ func (v *VehicleSystem) ExitHopOn(c *librefsm.Context) error {
 		}()
 	}
 
+	return nil
+}
+
+// EnterHopOnLearning enters combo-learning mode. Borrows hop-on's input
+// gating so the user can press buttons to record a combo without the
+// scooter honking, blinking, opening the seatbox, or transitioning out.
+// No user-facing side-effects: no LED cue, no steering-lock attempt, no
+// backlight kill — the dashboard renders its own learn overlay. The
+// auto-standby timer continues to run on the StateAtRest parent.
+func (v *VehicleSystem) EnterHopOnLearning(c *librefsm.Context) error {
+	v.logger.Infof("FSM: EnterHopOnLearning")
+	return nil
+}
+
+// ExitHopOnLearning leaves combo-learning mode. Mirror of EnterHopOnLearning
+// — nothing to undo, since nothing was set up.
+func (v *VehicleSystem) ExitHopOnLearning(c *librefsm.Context) error {
+	v.logger.Infof("FSM: ExitHopOnLearning")
 	return nil
 }
 

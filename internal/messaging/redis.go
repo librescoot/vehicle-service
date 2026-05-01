@@ -319,23 +319,18 @@ func (r *RedisClient) handleHardwareCommand(value string) error {
 // handleHopOnCommand processes hop-on / hop-off mode commands.
 // Accepts:
 //
-//	"engage"        — enter hop-on mode with the user-facing side-effects
-//	                  (LED cue, opportunistic steering lock, hop-on-active
-//	                  flag published). Sent by the dashboard's "Activate
-//	                  now" menu action.
-//	"engage-silent" — enter hop-on mode quietly: no LED cue, no steering
-//	                  lock, no hop-on-active flag. Used by the combo
-//	                  learning UI so vehicle-service still suppresses
-//	                  input side-effects (horn, blinker, brake LED, seatbox
-//	                  open, hibernation hold) but the user doesn't see the
-//	                  scooter "power down" while configuring a combo.
-//	"release"       — leave hop-on mode regardless of how it was entered.
+//	"engage"          — enter the locked StateHopOn (lock screen, LED
+//	                    cue, opportunistic steering lock).
+//	"engage-learning" — enter StateHopOnLearning quietly (no LED cue,
+//	                    no steering lock) so the dashboard can record a
+//	                    combo without the scooter visibly reacting.
+//	"release"         — leave whichever hop-on sub-state is active.
 func (r *RedisClient) handleHopOnCommand(value string) error {
 	if r.callbacks.HopOnCallback == nil {
 		return nil
 	}
 	switch value {
-	case "engage", "engage-silent", "release":
+	case "engage", "engage-learning", "release":
 		r.logger.Infof("Processing hop-on command: %s", value)
 		return r.callbacks.HopOnCallback(value)
 	default:
@@ -654,22 +649,6 @@ func (r *RedisClient) GetDashboardPower() (bool, error) {
 		return false, err
 	}
 	return value == "on", nil
-}
-
-// SetHopOnActive publishes the hop-on / hop-off mode flag to the vehicle hash.
-// While true, the FSM blocks Parked->ReadyToDrive transitions so the scooter
-// stays powered up but cannot be ridden away.
-func (r *RedisClient) SetHopOnActive(active bool) error {
-	value := "false"
-	if active {
-		value = "true"
-	}
-	if err := r.vehiclePub.Set("hop-on-active", value); err != nil {
-		r.logger.Warnf("Failed to set hop-on-active: %v", err)
-		return err
-	}
-	r.logger.Infof("Set hop-on-active=%s", value)
-	return nil
 }
 
 // PublishUpdateStatus publishes the update status to Redis
