@@ -410,6 +410,25 @@ func (v *VehicleSystem) Start() error {
 		v.logger.Infof("Initial state: handlebar is unlocked")
 	}
 
+	// Recover hop-on across crashes: external state in Redis is the source
+	// of truth here. If vehicle:hop-on-active=true while we just restored to
+	// Parked (StateHopOn is published as Parked, so savedState can never be
+	// HopOn), drag the FSM into StateHopOn so the dashboard's lock screen
+	// remains authoritative and a future "release" actually does something.
+	// We don't restore hopOnSavedAutoStandbyDl (in-memory only, lost on
+	// crash) — EnterHopOn's `if !saved.IsZero()` guard then skips the
+	// auto-standby timer. Net effect: the lock survives the restart and
+	// holds indefinitely until the user releases it.
+	hopOnActiveStr, err := v.redis.GetHashField("vehicle", "hop-on-active")
+	if err != nil {
+		v.logger.Warnf("Failed to read hop-on-active for restore: %v", err)
+	} else if hopOnActiveStr == "true" && v.machine != nil && v.machine.CurrentState() == fsm.StateParked {
+		v.logger.Infof("Restoring StateHopOn from persisted vehicle:hop-on-active=true")
+		if err := v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnEngage, Payload: false}); err != nil {
+			v.logger.Warnf("Failed to restore StateHopOn: %v", err)
+		}
+	}
+
 	// Note: We do NOT read/sync dashboard power to Redis here
 	// Dashboard power is preserved from Redis during power restoration later
 	// Only state transitions should change dashboard power in Redis
