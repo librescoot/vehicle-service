@@ -310,9 +310,15 @@ func (v *VehicleSystem) Start() error {
 		dashboardPower, err := v.redis.GetDashboardPower()
 		if err != nil {
 			v.logger.Warnf("Failed to read dashboard power from Redis: %v", err)
-			// Fallback to state-based logic
+			// Fallback to state-based logic. Hop-on family runs the
+			// dashboard alive (lock screen / learn overlay) so it
+			// belongs in the powered set alongside parked/RTD.
 			v.mu.RLock()
-			dashboardPower = savedState == types.StateReadyToDrive || savedState == types.StateParked || v.dbcUpdating
+			dashboardPower = savedState == types.StateReadyToDrive ||
+				savedState == types.StateParked ||
+				savedState == types.StateHopOn ||
+				savedState == types.StateHopOnLearning ||
+				v.dbcUpdating
 			v.mu.RUnlock()
 		} else {
 			// Override if DBC is updating (keep dashboard powered during updates)
@@ -325,8 +331,14 @@ func (v *VehicleSystem) Start() error {
 		v.logger.Infof("Setting initial dashboard power: %v", dashboardPower)
 		v.io.SetInitialValue("dashboard_power", dashboardPower)
 
-		// Also set engine power initial value
-		enginePower := (savedState == types.StateReadyToDrive || savedState == types.StateParked)
+		// Also set engine power initial value. Hop-on family runs with
+		// parked-equivalent rails (the firmware HOP_ON state explicitly
+		// returns POWER_MODE_ACTIVE), so engine_power must come up ON
+		// when restoring into hop-on or hop-on-learning.
+		enginePower := savedState == types.StateReadyToDrive ||
+			savedState == types.StateParked ||
+			savedState == types.StateHopOn ||
+			savedState == types.StateHopOnLearning
 		v.io.SetInitialValue("engine_power", enginePower)
 		if err := v.redis.SetEnginePower(enginePower); err != nil {
 			v.logger.Warnf("Failed to publish initial engine power state to Redis: %v", err)
