@@ -615,10 +615,16 @@ func (io *LinuxHardwareIO) ReadDigitalOutput(channel string) (bool, error) {
 }
 
 func (io *LinuxHardwareIO) PlayPwmCue(idx int) error {
+	if io.pwmLed == nil {
+		return fmt.Errorf("PWM LED not initialized")
+	}
 	return io.pwmLed.PlayCue(idx)
 }
 
 func (io *LinuxHardwareIO) PlayPwmFade(ch int, idx int) error {
+	if io.pwmLed == nil {
+		return fmt.Errorf("PWM LED not initialized")
+	}
 	return io.pwmLed.PlayFade(ch, idx)
 }
 

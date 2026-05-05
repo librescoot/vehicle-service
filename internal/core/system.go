@@ -174,11 +174,6 @@ func (v *VehicleSystem) Start() error {
 		savedState = "" // No saved state available; FSM stays in default Standby
 	}
 
-	// Initialize and start librefsm state machine (starts from Standby)
-	if err := v.initFSM(context.Background()); err != nil {
-		return fmt.Errorf("failed to initialize FSM: %w", err)
-	}
-
 	// Read initial brake hibernation setting from Redis
 	brakeHibernationSetting, err := v.redis.GetHashField("settings", "scooter.brake-hibernation")
 	if err != nil {
@@ -400,6 +395,13 @@ func (v *VehicleSystem) Start() error {
 		if err := v.io.SetUsb0Enabled(true); err != nil {
 			v.logger.Warnf("Failed to bring usb0 up at startup: %v", err)
 		}
+	}
+
+	// Initialize and start librefsm state machine now that hardware is up.
+	// EnterStandby (the default initial state) drives PWM/GPIO immediately,
+	// so the FSM cannot run before v.io.Initialize() has wired things up.
+	if err := v.initFSM(context.Background()); err != nil {
+		return fmt.Errorf("failed to initialize FSM: %w", err)
 	}
 
 	// Restore saved FSM state now that hardware is initialized
