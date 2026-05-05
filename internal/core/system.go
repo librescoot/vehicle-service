@@ -1209,7 +1209,7 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}
 		cyclePos := time.Duration((now - startNanos) % int64(blinkerInterval))
 		var brightness uint8
 		if fade != nil {
-			// Square the normalised duty: the LP5662 is a lot brighter than
+			// Square the normalised duty: the LP5562 is a lot brighter than
 			// the front lamp, so a linear ramp looks pinned-on while the
 			// lamp is still mid-fade. Gamma 2 keeps the indicator visibly
 			// dark through the early rise / late fall.

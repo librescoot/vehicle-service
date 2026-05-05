@@ -13,7 +13,7 @@ const (
 	i2cSlaveForce   = 0x0706 // I2C_SLAVE_FORCE ioctl (bypasses kernel driver claim)
 )
 
-// LP5662 register frame layout starting at register 0x00.
+// LP5562 register frame layout starting at register 0x00.
 // Format: [reg_addr, ctrl, cfg, ch0, ch1, ch2, t0, t1, t2, mode]
 //
 // dbcLedColors maps a colour name to the three channel PWM bytes at full
