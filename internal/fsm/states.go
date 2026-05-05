@@ -4,7 +4,6 @@ import "github.com/librescoot/librefsm"
 
 // Vehicle states
 const (
-	StateInit           librefsm.StateID = "init"
 	StateStandby        librefsm.StateID = "stand-by"
 	StateParked         librefsm.StateID = "parked"
 	StateReadyToDrive   librefsm.StateID = "ready-to-drive"
@@ -60,7 +59,6 @@ const (
 	EvSeatboxButton  librefsm.EventID = "seatbox-button"
 
 	// Timer events
-	EvInitTimeout               librefsm.EventID = "init-timeout"
 	EvShutdownTimeout           librefsm.EventID = "shutdown-timeout"
 	EvAutoStandbyTimeout        librefsm.EventID = "auto-standby-timeout"
 	EvWaitingSeatboxTimeout     librefsm.EventID = "waiting-seatbox-timeout"

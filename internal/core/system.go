@@ -109,7 +109,7 @@ type VehicleSystem struct {
 
 func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *VehicleSystem {
 	vs := &VehicleSystem{
-		state:                   types.StateInit,
+		state:                   types.StateStandby,
 		logger:                  l.WithTag("Vehicle"),
 		io:                      io,
 		redis:                   redis,
@@ -171,10 +171,10 @@ func (v *VehicleSystem) Start() error {
 	savedState, err := v.redis.GetVehicleState()
 	if err != nil {
 		v.logger.Infof("Failed to get saved state from Redis: %v", err)
-		savedState = types.StateInit // Default to init if not found
+		savedState = "" // No saved state available; FSM stays in default Standby
 	}
 
-	// Initialize and start librefsm state machine (starts from init state)
+	// Initialize and start librefsm state machine (starts from Standby)
 	if err := v.initFSM(context.Background()); err != nil {
 		return fmt.Errorf("failed to initialize FSM: %w", err)
 	}
@@ -306,7 +306,7 @@ func (v *VehicleSystem) Start() error {
 
 	// Read dashboard power from Redis BEFORE hardware initialization
 	// This ensures GPIO starts with correct value (no power interruption)
-	if savedState != types.StateInit && savedState != types.StateShuttingDown {
+	if savedState != "" && savedState != types.StateShuttingDown {
 		dashboardPower, err := v.redis.GetDashboardPower()
 		if err != nil {
 			v.logger.Warnf("Failed to read dashboard power from Redis: %v", err)
@@ -486,7 +486,7 @@ func (v *VehicleSystem) Start() error {
 	v.resyncHandlebarLatchFromSensor()
 
 	// Now that hardware is initialized, set engine brake based on state
-	if savedState != types.StateInit && savedState != types.StateShuttingDown {
+	if savedState != "" && savedState != types.StateShuttingDown {
 		// Apply engine brake based on state
 		var engineBrake bool
 		if savedState == types.StateReadyToDrive {
@@ -562,9 +562,6 @@ func (v *VehicleSystem) Start() error {
 	if err := v.publishState(); err != nil {
 		return fmt.Errorf("failed to publish initial state: %w", err)
 	}
-
-	// FSM's Init state has a 2-second timeout that transitions to Standby
-	// if no other event (like EvDashboardReady) triggers first
 
 	// Start Redis listeners now that everything is initialized
 	if err := v.redis.StartListening(); err != nil {

@@ -15,8 +15,6 @@ var _ fsm.Actions = (*VehicleSystem)(nil)
 // stateIDToSystemState converts librefsm StateID to types.SystemState
 func stateIDToSystemState(id librefsm.StateID) types.SystemState {
 	switch id {
-	case fsm.StateInit:
-		return types.StateInit
 	case fsm.StateStandby:
 		return types.StateStandby
 	case fsm.StateParked:
@@ -55,8 +53,6 @@ func stateIDToSystemState(id librefsm.StateID) types.SystemState {
 // systemStateToStateID converts types.SystemState to librefsm StateID
 func systemStateToStateID(s types.SystemState) librefsm.StateID {
 	switch s {
-	case types.StateInit:
-		return fsm.StateInit
 	case types.StateStandby:
 		return fsm.StateStandby
 	case types.StateParked:
@@ -130,9 +126,13 @@ func (v *VehicleSystem) initFSM(ctx context.Context) error {
 	return nil
 }
 
-// restoreFSMState restores the FSM to a saved state (must be called after hardware init)
+// restoreFSMState restores the FSM to a saved state (must be called after hardware init).
+// Empty savedState means no state was persisted (fresh boot or post-hibernation cold
+// start) — leave the FSM in its initial Standby state. ShuttingDown is also skipped
+// so that a crash mid-shutdown doesn't strand us there; we'd rather fall through to
+// Standby and let the user re-engage the lock cleanly.
 func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) error {
-	if savedState != types.StateInit && savedState != types.StateShuttingDown {
+	if savedState != "" && savedState != types.StateShuttingDown {
 		v.logger.Infof("Restoring FSM to saved state: %s", savedState)
 		if err := v.machine.SetState(systemStateToStateID(savedState)); err != nil {
 			v.logger.Errorf("Failed to restore FSM state: %v", err)

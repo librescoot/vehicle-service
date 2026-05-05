@@ -8,7 +8,6 @@ import (
 
 // Timing constants
 const (
-	InitTimeout               = 2 * time.Second
 	ShutdownTimeout           = 5 * time.Second
 	WaitingSeatboxTimeout     = 30 * time.Second
 	HibernationInitialTimeout = 15 * time.Second
@@ -23,9 +22,6 @@ const (
 func NewDefinition(actions Actions) *librefsm.Definition {
 	return librefsm.NewDefinition().
 		// Basic states
-		State(StateInit,
-			librefsm.WithTimeout(InitTimeout, EvInitTimeout),
-		).
 		State(StateStandby,
 			librefsm.WithOnEnter(actions.EnterStandby),
 		).
@@ -118,9 +114,6 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		).
 
 		// === Transitions ===
-
-		// From Init
-		Transition(StateInit, EvInitTimeout, StateStandby).
 
 		// From Standby - unlock events transition to Parked
 		Transition(StateStandby, EvUnlock, StateParked).
@@ -261,5 +254,5 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateHibernation, EvKickstandUp, StateParked).
 
 		// Initial state
-		Initial(StateInit)
+		Initial(StateStandby)
 }

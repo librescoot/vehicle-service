@@ -418,16 +418,20 @@ func (r *RedisClient) SetBlinkerState(state string, startNanos int64) error {
 	return nil
 }
 
+// GetVehicleState reads the persisted vehicle state from Redis. Returns ""
+// (and a nil error) when no state has been persisted yet — fresh boot or
+// post-hibernation cold start where Redis came up empty. Callers treat the
+// empty result as "leave the FSM in its initial Standby state".
 func (r *RedisClient) GetVehicleState() (types.SystemState, error) {
 	r.logger.Infof("Getting vehicle state from Redis")
 	stateStr, err := r.client.HGet("vehicle", "state")
 	if errors.Is(err, redis.Nil) || (err == nil && stateStr == "") {
 		r.logger.Infof("No vehicle state found in Redis")
-		return types.StateInit, nil
+		return "", nil
 	}
 	if err != nil {
 		r.logger.Infof("Failed to get vehicle state: %v", err)
-		return types.StateInit, err
+		return "", err
 	}
 	r.logger.Infof("Successfully retrieved vehicle state: %s", stateStr)
 	return types.SystemState(stateStr), nil

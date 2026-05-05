@@ -3,7 +3,6 @@ package types
 type SystemState string
 
 const (
-	StateInit                       SystemState = "init"
 	StateStandby                    SystemState = "stand-by"
 	StateParked                     SystemState = "parked"
 	StateHopOn                      SystemState = "hop-on"

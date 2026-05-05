@@ -241,8 +241,8 @@ func TestNewVehicleSystem(t *testing.T) {
 	if system.redis != mockRedis {
 		t.Error("redis not set correctly")
 	}
-	if system.state != types.StateInit {
-		t.Errorf("Expected initial state StateInit, got %v", system.state)
+	if system.state != types.StateStandby {
+		t.Errorf("Expected initial state StateStandby, got %v", system.state)
 	}
 }
 
@@ -530,6 +530,9 @@ func TestHandleUpdateRequestCompleteDbc(t *testing.T) {
 	system, _, mockRedis := newTestVehicleSystem()
 	system.dbcUpdating = true
 	mockRedis.dbcUpdating = true
+	// Force a non-Standby state so the handler doesn't try to drive an
+	// FSM transition (the test fixture has no machine initialized).
+	system.state = types.StateParked
 
 	err := system.handleUpdateRequest("complete-dbc")
 	if err != nil {
