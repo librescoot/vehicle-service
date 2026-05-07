@@ -126,8 +126,8 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 		return v.machine.SendSync(librefsm.Event{ID: fsm.EvUnlock})
 
 	case "lock":
-		if currentState != types.StateParked && currentState != types.StateReadyToDrive {
-			return fmt.Errorf("vehicle must be parked or ready-to-drive to lock")
+		if currentState != types.StateParked {
+			return fmt.Errorf("vehicle must be parked to lock (use force-lock from drive)")
 		}
 		v.logger.Infof("Sending EvLock")
 		return v.machine.SendSync(librefsm.Event{ID: fsm.EvLock})

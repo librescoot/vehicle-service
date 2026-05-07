@@ -184,18 +184,16 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateHopOnLearning, EvHopOnRelease, StateParked).
 		Transition(StateHopOnLearning, EvUnlock, StateParked).
 
-		// From ReadyToDrive
+		// From ReadyToDrive: only force-lock can shut down from drive.
+		// EvLock and a single EvKeycardAuth are intentionally unhandled here:
+		// drive mode requires the rider to either bring the scooter to rest
+		// (kickstand down -> Parked) or trigger an explicit force-lock (Redis
+		// force-lock command, or the triple-tap-with-brake gesture in
+		// keycardAuthPassed which routes to EvForceLock).
 		Transition(StateReadyToDrive, EvKickstandDown, StateParked).
 		Transition(StateReadyToDrive, EvDashboardNotReady, StateParked). // Safety: dashboard disconnect
-		Transition(StateReadyToDrive, EvLock, StateShuttingDown,
-			librefsm.WithGuard(actions.IsSeatboxClosed),
-		).
-		Transition(StateReadyToDrive, EvLock, StateWaitingSeatbox). // Fallback if seatbox open
 		Transition(StateReadyToDrive, EvForceLock, StateStandby,
 			librefsm.WithAction(actions.OnForceLock),
-		).
-		Transition(StateReadyToDrive, EvKeycardAuth, StateShuttingDown, // Requires kickstand down (never true in RTD)
-			librefsm.WithGuard(actions.IsKickstandDown),
 		).
 
 		// From ShuttingDown
