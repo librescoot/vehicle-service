@@ -1690,3 +1690,104 @@ func TestHopOn_RestoreFromSavedState(t *testing.T) {
 		t.Errorf("auto-standby timer should be armed after restoring into the at-rest group")
 	}
 }
+
+// rtdLockTestSetup brings a fresh VehicleSystem up in ready-to-drive with the
+// hardware inputs that match: kickstand up, no brakes, dashboard ready,
+// seatbox closed.
+func rtdLockTestSetup(t *testing.T) (*VehicleSystem, *mockHardwareIO) {
+	t.Helper()
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = false // up
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["handlebar_lock_sensor"] = false // unlocked
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateReadyToDrive); err != nil {
+		t.Fatalf("SetState ReadyToDrive: %v", err)
+	}
+	system.initialized = true
+	system.dashboardReady = true
+	system.handlebarUnlocked = true
+
+	return system, mockIO
+}
+
+// Lock command from ready-to-drive must not shut the vehicle down: drive
+// requires an explicit force-lock (Redis force-lock command, or the keycard
+// triple-tap-with-brake gesture).
+func TestHandleStateRequest_LockFromReadyToDrive_Rejected(t *testing.T) {
+	system, _ := rtdLockTestSetup(t)
+
+	err := system.handleStateRequest("lock")
+	if err == nil {
+		t.Fatalf("handleStateRequest(lock) from ReadyToDrive must return error, got nil")
+	}
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Errorf("State must remain ReadyToDrive after rejected lock, got %v", system.getCurrentState())
+	}
+}
+
+// EvLock dispatched directly to the FSM in ready-to-drive must be a no-op
+// (the transition has been removed from the definition).
+func TestFSM_EvLockFromReadyToDrive_NoTransition(t *testing.T) {
+	system, _ := rtdLockTestSetup(t)
+
+	system.machine.Send(librefsm.Event{ID: fsm.EvLock})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Errorf("EvLock must not transition from ReadyToDrive, got %v", system.getCurrentState())
+	}
+}
+
+// A single keycard tap in ready-to-drive must not shut the vehicle down.
+func TestKeycardAuth_SingleTapFromReadyToDrive_NoShutdown(t *testing.T) {
+	system, _ := rtdLockTestSetup(t)
+
+	if err := system.keycardAuthPassed(); err != nil {
+		t.Fatalf("keycardAuthPassed: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Errorf("Single keycard tap must not transition from ReadyToDrive, got %v", system.getCurrentState())
+	}
+}
+
+// EvForceLock from ready-to-drive must transition straight to standby.
+func TestFSM_EvForceLockFromReadyToDrive_GoesToStandby(t *testing.T) {
+	system, _ := rtdLockTestSetup(t)
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvForceLock}); err != nil {
+		t.Fatalf("send force-lock: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateStandby {
+		t.Errorf("EvForceLock from ReadyToDrive must reach Standby, got %v", system.getCurrentState())
+	}
+}
+
+// Keycard triple-tap with at least one brake pressed must force-lock from
+// ready-to-drive (the only keycard-driven path that can shut down from drive).
+func TestKeycardAuth_TripleTapWithBrakeFromReadyToDrive_ForceLocks(t *testing.T) {
+	system, mockIO := rtdLockTestSetup(t)
+
+	mockIO.digitalInputs["brake_left"] = true
+
+	for i := 0; i < 3; i++ {
+		if err := system.keycardAuthPassed(); err != nil {
+			t.Fatalf("tap %d: %v", i+1, err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateStandby {
+		t.Errorf("Three keycard taps with brake from RTD must reach Standby, got %v", system.getCurrentState())
+	}
+}

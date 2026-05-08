@@ -1237,6 +1237,10 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	v.logger.Infof("Processing keycard authentication tap")
 
 	// --- Force Standby Check (3 taps + brake) ---
+	// Works from any state, including ready-to-drive. A single tap or a
+	// regular `lock` Redis command cannot shut down from drive; only this
+	// triple-tap-with-brake gesture (or the explicit force-lock Redis
+	// command) routes through EvForceLock.
 	brakeLeft, errL := v.io.ReadDigitalInput("brake_left")
 	if errL != nil {
 		v.logger.Debugf("Warning: Failed to read brake_left for keycard auth, assuming not pressed: %v", errL)
