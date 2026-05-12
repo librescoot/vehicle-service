@@ -89,10 +89,12 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 		v.blinkerCueIndex.Store(int32(cue))
 		v.blinkerStartNanos.Store(time.Now().UnixNano())
 		stopChan := make(chan struct{})
+		exited := make(chan struct{})
 		v.mu.Lock()
 		v.blinkerStopChan = stopChan
+		v.blinkerExited = exited
 		v.mu.Unlock()
-		go v.runBlinker(cue, state, stopChan)
+		go v.runBlinker(cue, state, stopChan, exited)
 	} else {
 		if err := v.io.PlayPwmCue(cue); err != nil {
 			return err

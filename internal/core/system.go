@@ -68,6 +68,7 @@ type VehicleSystem struct {
 	mu                      sync.RWMutex
 	blinkerState            BlinkerState
 	blinkerStopChan         chan struct{}
+	blinkerExited           chan struct{} // closed by runBlinker when it returns; stopBlinker waits on it
 	blinkerStartNanos       atomic.Int64      // UnixNano when blinker goroutine started (0 if inactive)
 	blinkerCueIndex         atomic.Int32      // Currently playing blinker cue index (-1 if none)
 	menuOpen                atomic.Bool       // True while scootui-qt reports its menu is open; suppresses brake-light LED cues
@@ -1041,14 +1042,27 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 	return nil
 }
 
-// stopBlinker safely stops any running blinker goroutine under mutex protection
+// stopBlinker cancels any running blinker goroutine and waits for it to
+// exit before returning. Waiting matters: runBlinker writes blinker:state
+// and runs PlayPwmCue at startup, so any subsequent SetBlinkerState from
+// the caller must happen after the old goroutine has flushed its writes —
+// otherwise a late-scheduled goroutine can clobber the new state. Without
+// the wait, rapid switch flicks (left→off→right) can leave Redis with a
+// stale direction while the hardware blinks correctly.
 func (v *VehicleSystem) stopBlinker() {
 	v.mu.Lock()
-	if v.blinkerStopChan != nil {
-		close(v.blinkerStopChan)
-		v.blinkerStopChan = nil
-	}
+	stopChan := v.blinkerStopChan
+	exited := v.blinkerExited
+	v.blinkerStopChan = nil
+	v.blinkerExited = nil
 	v.mu.Unlock()
+
+	if stopChan != nil {
+		close(stopChan)
+	}
+	if exited != nil {
+		<-exited
+	}
 }
 
 func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
@@ -1121,14 +1135,28 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	// goroutine for the same reason.
 	v.blinkerCueIndex.Store(int32(cue))
 	stopChan := make(chan struct{})
+	exited := make(chan struct{})
 	v.mu.Lock()
 	v.blinkerStopChan = stopChan
+	v.blinkerExited = exited
 	v.mu.Unlock()
-	go v.runBlinker(cue, switchState, stopChan)
+	go v.runBlinker(cue, switchState, stopChan, exited)
 	return nil
 }
 
-func (v *VehicleSystem) runBlinker(cue int, state string, stopChan chan struct{}) {
+func (v *VehicleSystem) runBlinker(cue int, state string, stopChan, exited chan struct{}) {
+	defer close(exited)
+
+	// Bail before any side effects if cancellation already arrived. With
+	// rapid switch flicks the cancel can fire before this goroutine first
+	// gets CPU; without this gate we'd still write blinker:state and run
+	// the initial PlayPwmCue, racing the next handler's writes.
+	select {
+	case <-stopChan:
+		return
+	default:
+	}
+
 	v.mu.RLock()
 	dbcLed := v.dbcBlinkerLed
 	v.mu.RUnlock()
