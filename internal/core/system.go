@@ -97,7 +97,7 @@ type VehicleSystem struct {
 	autoStandbySeconds      int               // Auto-standby timeout in seconds (0 = disabled)
 	hornEnableMode          string            // Horn enable mode: "true", "false", or "in-drive" (default: "true")
 	dbcBlinkerLed           bool              // Blink DBC boot LED in sync with blinkers (default: false)
-	usb0Policy              string            // "always-on" (default) or "auto" (tracks dashboard_power)
+	usb0Policy              string            // "auto" (default, tracks dashboard_power) or "always-on"
 	hibernationForceTimer   *time.Timer       // Timer for forcing hibernation after 15s of brake hold
 	machine                 *librefsm.Machine // librefsm state machine
 	gestures                *gestureDetector
@@ -120,7 +120,7 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		forceStandbyNoLock:      false,
 		brakeHibernationEnabled: true,        // Default to enabled for backward compatibility
 		hornEnableMode:          "true",      // Default to always enabled for backward compatibility
-		usb0Policy:              "always-on", // Default: keep MDB<->DBC link up for installer/diag reachability
+		usb0Policy:              "auto",      // Default: bring usb0 down in standby; setPower tracks dashboard_power
 	}
 	vs.blinkerCueIndex.Store(-1)
 	vs.gestures = newGestureDetector(func(event string) {
@@ -374,18 +374,19 @@ func (v *VehicleSystem) Start() error {
 	v.io.SetDebounce("seatbox_lock_sensor", resumeSettleDebounce)
 
 	// Apply usb0 policy up front so an installer reboot has a reachable
-	// interface before the FSM restore runs setPower. Default (always-on)
-	// keeps usb0 up regardless of dashboard_power; "auto" hands the wheel
-	// to setPower. The policy is a user setting in the `settings` hash.
+	// interface before the FSM restore runs setPower. Default ("auto")
+	// hands the wheel to setPower so usb0 follows dashboard_power;
+	// "always-on" keeps usb0 up regardless. The policy is a user setting
+	// in the `settings` hash.
 	usb0PolicySetting, err := v.redis.GetHashField("settings", "scooter.usb0-policy")
 	if err != nil {
-		v.logger.Warnf("Failed to read usb0 policy setting on startup: %v (using default always-on)", err)
-	} else if usb0PolicySetting == "auto" {
+		v.logger.Warnf("Failed to read usb0 policy setting on startup: %v (using default auto)", err)
+	} else if usb0PolicySetting == "always-on" {
 		v.mu.Lock()
-		v.usb0Policy = "auto"
+		v.usb0Policy = "always-on"
 		v.mu.Unlock()
-	} else if usb0PolicySetting != "" && usb0PolicySetting != "always-on" {
-		v.logger.Warnf("Unknown usb0 policy value on startup: %q, using default always-on", usb0PolicySetting)
+	} else if usb0PolicySetting != "" && usb0PolicySetting != "auto" {
+		v.logger.Warnf("Unknown usb0 policy value on startup: %q, using default auto", usb0PolicySetting)
 	}
 	v.mu.RLock()
 	policy := v.usb0Policy

@@ -572,11 +572,11 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
 			return err
 		}
-		policy := "always-on"
-		if value == "auto" {
-			policy = "auto"
-		} else if value != "" && value != "always-on" {
-			v.logger.Warnf("Unknown usb0 policy %q, falling back to always-on", value)
+		policy := "auto"
+		if value == "always-on" {
+			policy = "always-on"
+		} else if value != "" && value != "auto" {
+			v.logger.Warnf("Unknown usb0 policy %q, falling back to auto", value)
 		}
 		v.mu.Lock()
 		v.usb0Policy = policy
