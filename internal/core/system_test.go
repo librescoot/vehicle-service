@@ -1634,6 +1634,54 @@ func TestHopOn_LockTransitionsToShuttingDown(t *testing.T) {
 	}
 }
 
+// Keycard tap in StateHopOn unlocks to Parked (child-state override) rather
+// than inheriting StateAtRest's "tap to lock" behavior. A rider returning to
+// a hop-on'd scooter expects the keycard to release it, mirroring the
+// mobile-app unlock path.
+func TestHopOn_KeycardAuthUnlocksToParked(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateHopOn); err != nil {
+		t.Fatalf("SetState HopOn: %v", err)
+	}
+	system.initialized = true
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvKeycardAuth}); err != nil {
+		t.Fatalf("send keycard-auth: %v", err)
+	}
+	if system.machine.CurrentState() != fsm.StateParked {
+		t.Errorf("keycard tap in HopOn should unlock to Parked; got %v", system.machine.CurrentState())
+	}
+}
+
+// Keycard tap in StateHopOnLearning is intentionally NOT overridden — it
+// still inherits the parent StateAtRest transition and locks to
+// ShuttingDown. Learning mode is a brief setup flow; only HopOn proper gets
+// the rider-friendly unlock-on-tap behavior.
+func TestHopOnLearning_KeycardAuthLocksToShuttingDown(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateHopOnLearning); err != nil {
+		t.Fatalf("SetState HopOnLearning: %v", err)
+	}
+	system.initialized = true
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvKeycardAuth}); err != nil {
+		t.Fatalf("send keycard-auth: %v", err)
+	}
+	if system.machine.CurrentState() != fsm.StateShuttingDown {
+		t.Errorf("keycard tap in HopOnLearning should lock to ShuttingDown; got %v", system.machine.CurrentState())
+	}
+}
+
 // HopOnLearning enters without user-facing side-effects: no LED cue, no
 // backlight toggle. The dashboard renders its own learn overlay.
 func TestHopOnLearning_NoSideEffects(t *testing.T) {

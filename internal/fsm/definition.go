@@ -173,12 +173,16 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 
 		// From HopOn — release (combo matched) or mobile-app unlock both
 		// drop back to the default child of StateAtRest. The standard
-		// escape paths (lock/force-lock/keycard/auto-standby) live on
+		// escape paths (lock/force-lock/auto-standby) live on
 		// StateAtRest above and are inherited via the parent walk.
 		// Physical inputs like kickstand-up are pre-empted by
 		// BlockedEvents on the state itself.
 		Transition(StateHopOn, EvHopOnRelease, StateParked).
 		Transition(StateHopOn, EvUnlock, StateParked).
+		// Keycard tap in HopOn unlocks (same as mobile-app unlock) rather
+		// than inheriting StateAtRest's "tap to lock" behavior — a rider
+		// returning to a hop-on'd scooter expects the keycard to release it.
+		Transition(StateHopOn, EvKeycardAuth, StateParked).
 
 		// From HopOnLearning — same exit shape as HopOn.
 		Transition(StateHopOnLearning, EvHopOnRelease, StateParked).
