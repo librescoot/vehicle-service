@@ -208,7 +208,7 @@ func (m *mockHardwareIO) PlayPwmFade(ch int, idx int) error {
 }
 
 func (m *mockHardwareIO) SetDbcLed(color string, brightness uint8) error { return nil }
-func (m *mockHardwareIO) SetUsb0Enabled(enabled bool) error { return nil }
+func (m *mockHardwareIO) SetUsb0Enabled(enabled bool) error              { return nil }
 
 // SimulateInput triggers an input callback
 func (m *mockHardwareIO) SimulateInput(channel string, value bool) error {
@@ -622,9 +622,9 @@ func TestEnterReadyToDrive_EngineBrakeDisabled(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
 	// Set up initial conditions: kickstand up, no brakes pressed
-	mockIO.digitalInputs["kickstand"] = false       // up
-	mockIO.digitalInputs["brake_left"] = false      // not pressed
-	mockIO.digitalInputs["brake_right"] = false     // not pressed
+	mockIO.digitalInputs["kickstand"] = false   // up
+	mockIO.digitalInputs["brake_left"] = false  // not pressed
+	mockIO.digitalInputs["brake_right"] = false // not pressed
 	mockIO.digitalInputs["handlebar_position"] = false
 	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked (pressed)
 	mockIO.digitalInputs["seatbox_lock_sensor"] = true   // closed

@@ -47,7 +47,7 @@ func main() {
 	// Create hardware IO
 	io := hardware.NewLinuxHardwareIO(l.WithTag("Hardware"))
 
-	// Create Redis client (callbacks will be set by VehicleSystem.Start())
+	// Create Redis client (callbacks will be set by NewVehicleSystem())
 	redisClient, err := messaging.NewRedisClient("127.0.0.1", 6379, l.WithTag("Redis"), messaging.Callbacks{})
 	if err != nil {
 		l.Fatalf("Failed to create Redis client: %v", err)

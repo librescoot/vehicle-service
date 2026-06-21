@@ -33,7 +33,7 @@ type Callbacks struct {
 	HopOnCallback          func(string) error // "engage", "release"
 	PowerStateCallback     func(string) error // power-manager state: "running", "suspend-pending", ...
 	MenuOpenCallback       func(bool) error   // scootui-qt menu open/closed
-	BleCallback           func(string) error // ble hash 'status' field: "connected" / "disconnected"
+	BleCallback            func(string) error // ble hash 'status' field: "connected" / "disconnected"
 }
 
 type RedisClient struct {

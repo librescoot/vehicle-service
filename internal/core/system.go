@@ -45,7 +45,7 @@ const (
 	// release-then-press pair within milliseconds when the pad reads
 	// differently across the sleep boundary. The debounce collapses the
 	// pair; hardware IO then dedupes against the last-delivered value.
-	resumeSettleDebounce = 50 * time.Millisecond
+	resumeSettleDebounce      = 50 * time.Millisecond
 	handlebarLockDuration     = 1100 * time.Millisecond
 	handlebarLockWindow       = 60 * time.Second
 	handlebarLockRetries      = 3
@@ -65,50 +65,50 @@ const (
 const minLockOnDisconnectSeconds = 5
 
 type VehicleSystem struct {
-	state                   types.SystemState
-	dashboardReady          bool
-	logger                  *logger.Logger
-	io                      HardwareIO
-	redis                   MessagingClient
-	mu                      sync.RWMutex
-	blinkerState            BlinkerState
-	blinkerStopChan         chan struct{}
-	blinkerExited           chan struct{} // closed by runBlinker when it returns; stopBlinker waits on it
-	blinkerStartNanos       atomic.Int64      // UnixNano when blinker goroutine started (0 if inactive)
-	blinkerCueIndex         atomic.Int32      // Currently playing blinker cue index (-1 if none)
-	menuOpen                atomic.Bool       // True while scootui-qt reports its menu is open; suppresses brake-light LED cues
-	dbcPoweroffSent         atomic.Bool       // True once EnterShuttingDown published dbc:command poweroff; cleared on EnterShuttingDown entry and EnterStandby
-	pendingUnlock           atomic.Bool       // True when an unlock arrived during a committed shutdown; replayed from EnterStandby
-	ledCurves               *led.CurveLibrary // LED fade/cue metadata for timing
-	initialized             bool
-	handlebarUnlocked       bool          // Track if handlebar has been unlocked in this power cycle
-	handlebarLatchedLocked  bool          // Last commanded/confirmed lock state, immune to spurious sensor edges
-	handlebarLatchInit      bool          // True once latch has been seeded from sensor or actuation
-	handlebarTimer          *time.Timer   // Timer for handlebar position window
-	handlebarDone           chan struct{} // Done channel for handlebar lock goroutine
-	handlebarUnlockDone     chan struct{} // Done channel for handlebar unlock goroutine
-	readyToDriveEntryTime   time.Time     // Track when we entered ready-to-drive state for park debounce
-	kickstandDebounceTimer  *time.Timer   // Deferred kickstand-down check after debounce window
-	keycardTapCount         int
-	lastKeycardTapTime      time.Time
-	forceStandbyNoLock      bool
-	hibernationRequest      bool              // Track if hibernation was requested during shutdown
-	shutdownFromParked      bool              // Track if shutdown was initiated from parked state
-	dbcUpdating             bool              // Track if DBC update is in progress
-	dbcWatchdogTimer        *time.Timer       // Watchdog timer for DBC updates, reset on OTA activity
-	dbcWatchdogGeneration   uint64            // Generation counter to invalidate stale callbacks
-	deferredDashboardPower  *bool             // Deferred dashboard power state (nil = no change needed)
-	brakeHibernationEnabled bool              // Track if brake lever hibernation is enabled (default: true)
+	state                      types.SystemState
+	dashboardReady             bool
+	logger                     *logger.Logger
+	io                         HardwareIO
+	redis                      MessagingClient
+	mu                         sync.RWMutex
+	blinkerState               BlinkerState
+	blinkerStopChan            chan struct{}
+	blinkerExited              chan struct{}     // closed by runBlinker when it returns; stopBlinker waits on it
+	blinkerStartNanos          atomic.Int64      // UnixNano when blinker goroutine started (0 if inactive)
+	blinkerCueIndex            atomic.Int32      // Currently playing blinker cue index (-1 if none)
+	menuOpen                   atomic.Bool       // True while scootui-qt reports its menu is open; suppresses brake-light LED cues
+	dbcPoweroffSent            atomic.Bool       // True once EnterShuttingDown published dbc:command poweroff; cleared on EnterShuttingDown entry and EnterStandby
+	pendingUnlock              atomic.Bool       // True when an unlock arrived during a committed shutdown; replayed from EnterStandby
+	ledCurves                  *led.CurveLibrary // LED fade/cue metadata for timing
+	initialized                bool
+	handlebarUnlocked          bool          // Track if handlebar has been unlocked in this power cycle
+	handlebarLatchedLocked     bool          // Last commanded/confirmed lock state, immune to spurious sensor edges
+	handlebarLatchInit         bool          // True once latch has been seeded from sensor or actuation
+	handlebarTimer             *time.Timer   // Timer for handlebar position window
+	handlebarDone              chan struct{} // Done channel for handlebar lock goroutine
+	handlebarUnlockDone        chan struct{} // Done channel for handlebar unlock goroutine
+	readyToDriveEntryTime      time.Time     // Track when we entered ready-to-drive state for park debounce
+	kickstandDebounceTimer     *time.Timer   // Deferred kickstand-down check after debounce window
+	keycardTapCount            int
+	lastKeycardTapTime         time.Time
+	forceStandbyNoLock         bool
+	hibernationRequest         bool              // Track if hibernation was requested during shutdown
+	shutdownFromParked         bool              // Track if shutdown was initiated from parked state
+	dbcUpdating                bool              // Track if DBC update is in progress
+	dbcWatchdogTimer           *time.Timer       // Watchdog timer for DBC updates, reset on OTA activity
+	dbcWatchdogGeneration      uint64            // Generation counter to invalidate stale callbacks
+	deferredDashboardPower     *bool             // Deferred dashboard power state (nil = no change needed)
+	brakeHibernationEnabled    bool              // Track if brake lever hibernation is enabled (default: true)
 	autoStandbySeconds         int               // Auto-standby timeout in seconds (0 = disabled)
 	lockOnBleDisconnectSeconds int               // Grace seconds before locking after BLE disconnect while parked (0 = disabled)
-	keylessCountdownActive bool   // A lock-on-disconnect countdown is currently armed
-	lastBleStatus          string // Last observed ble/status ("connected"/"disconnected")
-	hornEnableMode          string            // Horn enable mode: "true", "false", or "in-drive" (default: "true")
-	dbcBlinkerLed           bool              // Blink DBC boot LED in sync with blinkers (default: false)
-	usb0Policy              string            // "auto" (default, tracks dashboard_power) or "always-on"
-	hibernationForceTimer   *time.Timer       // Timer for forcing hibernation after 15s of brake hold
-	machine                 *librefsm.Machine // librefsm state machine
-	gestures                *gestureDetector
+	keylessCountdownActive     bool              // A lock-on-disconnect countdown is currently armed
+	lastBleStatus              string            // Last observed ble/status ("connected"/"disconnected")
+	hornEnableMode             string            // Horn enable mode: "true", "false", or "in-drive" (default: "true")
+	dbcBlinkerLed              bool              // Blink DBC boot LED in sync with blinkers (default: false)
+	usb0Policy                 string            // "auto" (default, tracks dashboard_power) or "always-on"
+	hibernationForceTimer      *time.Timer       // Timer for forcing hibernation after 15s of brake hold
+	machine                    *librefsm.Machine // librefsm state machine
+	gestures                   *gestureDetector
 
 	// Hop-on bookkeeping: only the steering-lock latch survives across
 	// the EnterHopOn / ExitHopOn pair so we know whether to release on exit.
@@ -126,9 +126,9 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		initialized:             false,
 		keycardTapCount:         0,
 		forceStandbyNoLock:      false,
-		brakeHibernationEnabled: true,        // Default to enabled for backward compatibility
-		hornEnableMode:          "true",      // Default to always enabled for backward compatibility
-		usb0Policy:              "auto",      // Default: bring usb0 down in standby; setPower tracks dashboard_power
+		brakeHibernationEnabled: true,   // Default to enabled for backward compatibility
+		hornEnableMode:          "true", // Default to always enabled for backward compatibility
+		usb0Policy:              "auto", // Default: bring usb0 down in standby; setPower tracks dashboard_power
 	}
 	vs.blinkerCueIndex.Store(-1)
 	vs.gestures = newGestureDetector(func(event string) {
