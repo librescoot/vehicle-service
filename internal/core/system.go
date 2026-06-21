@@ -59,6 +59,11 @@ const (
 	dbcUpdateWatchdogTimeout = 15 * time.Minute
 )
 
+// minLockOnDisconnectSeconds is the floor for a non-zero
+// scooter.lock-on-bluetooth-disconnect-seconds value. Values between 1 and
+// this floor are clamped up so the countdown overlay stays meaningful.
+const minLockOnDisconnectSeconds = 5
+
 type VehicleSystem struct {
 	state                   types.SystemState
 	dashboardReady          bool
@@ -94,7 +99,8 @@ type VehicleSystem struct {
 	dbcWatchdogGeneration   uint64            // Generation counter to invalidate stale callbacks
 	deferredDashboardPower  *bool             // Deferred dashboard power state (nil = no change needed)
 	brakeHibernationEnabled bool              // Track if brake lever hibernation is enabled (default: true)
-	autoStandbySeconds      int               // Auto-standby timeout in seconds (0 = disabled)
+	autoStandbySeconds         int               // Auto-standby timeout in seconds (0 = disabled)
+	lockOnBleDisconnectSeconds int               // Grace seconds before locking after BLE disconnect while parked (0 = disabled)
 	hornEnableMode          string            // Horn enable mode: "true", "false", or "in-drive" (default: "true")
 	dbcBlinkerLed           bool              // Blink DBC boot LED in sync with blinkers (default: false)
 	usb0Policy              string            // "auto" (default, tracks dashboard_power) or "always-on"
@@ -224,6 +230,17 @@ func (v *VehicleSystem) Start() error {
 		}
 	} else {
 		v.logger.Infof("No auto-standby setting found on startup, using default (%d seconds)", defaultAutoStandbySeconds)
+	}
+
+	v.lockOnBleDisconnectSeconds = 0
+	if lockSetting, err := v.redis.GetHashField("settings", "scooter.lock-on-bluetooth-disconnect-seconds"); err != nil {
+		v.logger.Infof("No lock-on-bluetooth-disconnect setting on startup (using disabled)")
+	} else if lockSetting != "" {
+		if secs, perr := strconv.Atoi(lockSetting); perr != nil {
+			v.logger.Warnf("Invalid lock-on-bluetooth-disconnect setting on startup: '%s' (using disabled)", lockSetting)
+		} else {
+			v.lockOnBleDisconnectSeconds = v.clampLockOnDisconnect(secs)
+		}
 	}
 
 	// Read initial horn enable mode setting from Redis
@@ -680,6 +697,19 @@ func (v *VehicleSystem) resetAutoStandbyTimer() {
 	v.logger.Debugf("Resetting auto-standby timer")
 	v.cancelAutoStandbyTimer()
 	v.startAutoStandbyTimer()
+}
+
+// clampLockOnDisconnect normalises a lock-on-disconnect setting value:
+// negatives become 0 (off); 1..min become the floor; 0 and >=min pass through.
+func (v *VehicleSystem) clampLockOnDisconnect(seconds int) int {
+	if seconds < 0 {
+		return 0
+	}
+	if seconds > 0 && seconds < minLockOnDisconnectSeconds {
+		v.logger.Warnf("lock-on-bluetooth-disconnect-seconds %d below minimum, clamping to %d", seconds, minLockOnDisconnectSeconds)
+		return minLockOnDisconnectSeconds
+	}
+	return seconds
 }
 
 // isInHopOnFamily reports whether the FSM is currently in the locked

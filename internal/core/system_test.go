@@ -1839,3 +1839,56 @@ func TestKeycardAuth_TripleTapWithBrakeFromReadyToDrive_ForceLocks(t *testing.T)
 		t.Errorf("Three keycard taps with brake from RTD must reach Standby, got %v", system.getCurrentState())
 	}
 }
+
+func TestHandleSettingsUpdateLockOnDisconnect(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.hashFieldValue = "30"
+
+	if err := system.handleSettingsUpdate("scooter.lock-on-bluetooth-disconnect-seconds"); err != nil {
+		t.Fatalf("handleSettingsUpdate failed: %v", err)
+	}
+	system.mu.RLock()
+	got := system.lockOnBleDisconnectSeconds
+	system.mu.RUnlock()
+	if got != 30 {
+		t.Errorf("expected 30 seconds, got %d", got)
+	}
+}
+
+func TestHandleSettingsUpdateLockOnDisconnectFloor(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.hashFieldValue = "3" // below the 5s floor
+
+	if err := system.handleSettingsUpdate("scooter.lock-on-bluetooth-disconnect-seconds"); err != nil {
+		t.Fatalf("handleSettingsUpdate failed: %v", err)
+	}
+	system.mu.RLock()
+	got := system.lockOnBleDisconnectSeconds
+	system.mu.RUnlock()
+	if got != 5 {
+		t.Errorf("expected clamp to 5, got %d", got)
+	}
+}
+
+func TestHandleSettingsUpdateLockOnDisconnectDisabled(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.hashFieldValue = "0"
+
+	if err := system.handleSettingsUpdate("scooter.lock-on-bluetooth-disconnect-seconds"); err != nil {
+		t.Fatalf("handleSettingsUpdate failed: %v", err)
+	}
+	system.mu.RLock()
+	got := system.lockOnBleDisconnectSeconds
+	system.mu.RUnlock()
+	if got != 0 {
+		t.Errorf("expected 0 (disabled), got %d", got)
+	}
+}
+
+func TestHandleSettingsUpdateLockOnDisconnectInvalid(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.hashFieldValue = "not-a-number"
+	if err := system.handleSettingsUpdate("scooter.lock-on-bluetooth-disconnect-seconds"); err == nil {
+		t.Error("expected error for invalid value")
+	}
+}

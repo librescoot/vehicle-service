@@ -536,6 +536,27 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 			}
 		}
 
+	case "scooter.lock-on-bluetooth-disconnect-seconds":
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+		seconds, parseErr := strconv.Atoi(value)
+		if parseErr != nil {
+			v.logger.Warnf("Invalid lock-on-bluetooth-disconnect value: '%s'", value)
+			return fmt.Errorf("invalid lock-on-bluetooth-disconnect value: %s", value)
+		}
+		clamped := v.clampLockOnDisconnect(seconds)
+		v.mu.Lock()
+		v.lockOnBleDisconnectSeconds = clamped
+		v.mu.Unlock()
+		if clamped > 0 {
+			v.logger.Infof("Lock-on-Bluetooth-disconnect enabled: %d seconds", clamped)
+		} else {
+			v.logger.Infof("Lock-on-Bluetooth-disconnect disabled")
+		}
+
 	case "scooter.enable-horn":
 		// Read the new value from Redis
 		value, err := v.redis.GetHashField("settings", settingKey)
