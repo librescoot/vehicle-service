@@ -33,6 +33,7 @@ type Callbacks struct {
 	HopOnCallback          func(string) error // "engage", "release"
 	PowerStateCallback     func(string) error // power-manager state: "running", "suspend-pending", ...
 	MenuOpenCallback       func(bool) error   // scootui-qt menu open/closed
+	BleCallback           func(string) error // ble hash 'status' field: "connected" / "disconnected"
 }
 
 type RedisClient struct {
@@ -57,6 +58,7 @@ type RedisClient struct {
 	settingsWatcher     *ipc.HashWatcher
 	otaWatcher          *ipc.HashWatcher
 	powerManagerWatcher *ipc.HashWatcher
+	bleWatcher          *ipc.HashWatcher
 
 	// Fault handling
 	faultSet    *ipc.FaultSet
@@ -132,6 +134,16 @@ func (r *RedisClient) Connect() error {
 		}
 	}
 
+	// Seed the current BLE status so the edge detector has a baseline and does
+	// not treat a startup "disconnected" as a fresh disconnect.
+	if bleStatus, err := r.client.HGet("ble", "status"); err == nil && bleStatus != "" {
+		if r.callbacks.BleCallback != nil {
+			if err := r.callbacks.BleCallback(bleStatus); err != nil {
+				r.logger.Infof("Failed to handle initial BLE status: %v", err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -190,6 +202,16 @@ func (r *RedisClient) StartListening() error {
 		return nil
 	})
 	r.powerManagerWatcher.Start()
+
+	// Watch BLE link status so vehicle-service can lock on phone disconnect.
+	r.bleWatcher = r.client.NewHashWatcher("ble")
+	r.bleWatcher.OnField("status", func(value string) error {
+		if r.callbacks.BleCallback != nil {
+			return r.callbacks.BleCallback(value)
+		}
+		return nil
+	})
+	r.bleWatcher.Start()
 
 	// Start queue command listeners
 	ipc.HandleRequests(r.client, "scooter:seatbox", r.handleSeatboxCommand)

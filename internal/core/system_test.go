@@ -2061,3 +2061,14 @@ func TestKeyless_InteractionCancels_IdleEnabled(t *testing.T) {
 		t.Fatal("interaction must cancel the countdown when idle auto-standby is enabled")
 	}
 }
+
+func TestBleCallbackWired(t *testing.T) {
+	_, _, mockRedis := newTestVehicleSystem()
+	if mockRedis.callbacks.BleCallback == nil {
+		t.Fatal("BleCallback was not wired in SetCallbacks")
+	}
+	// The wired callback must route into the BLE edge handler without error.
+	if err := mockRedis.callbacks.BleCallback("connected"); err != nil {
+		t.Fatalf("BleCallback returned error: %v", err)
+	}
+}

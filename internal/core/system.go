@@ -136,6 +136,31 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 			vs.logger.Debugf("Failed to publish input event: %v", err)
 		}
 	}, gestureLongTapThreshold, gestureHoldThreshold, gestureDoubleTapThreshold)
+
+	// Set up Redis callbacks so they are available as soon as the system object
+	// exists, even before Start() is called (enables unit tests to verify wiring).
+	vs.redis.SetCallbacks(messaging.Callbacks{
+		DashboardCallback:      vs.handleDashboardReady,
+		KeycardCallback:        vs.keycardAuthPassed,
+		SeatboxCallback:        vs.handleSeatboxRequest,
+		HornCallback:           vs.handleHornRequest,
+		BlinkerCallback:        vs.handleBlinkerRequest,
+		StateCallback:          vs.handleStateRequest,
+		ForceLockCallback:      vs.handleForceLockRequest,
+		LedCueCallback:         vs.handleLedCueRequest,
+		LedFadeCallback:        vs.handleLedFadeRequest,
+		UpdateCallback:         vs.handleUpdateRequest,
+		HardwareCallback:       vs.handleHardwareRequest,
+		SettingsCallback:       vs.handleSettingsUpdate,
+		OtaDbcActivityCallback: vs.resetDbcWatchdog,
+		HopOnCallback:          vs.handleHopOnRequest,
+		PowerStateCallback:     vs.handlePowerStateChange,
+		MenuOpenCallback: func(open bool) error {
+			vs.menuOpen.Store(open)
+			return nil
+		},
+		BleCallback: vs.handleBleStatusChange,
+	})
 	return vs
 }
 
@@ -147,29 +172,6 @@ func (v *VehicleSystem) Start() error {
 	if err := v.ledCurves.Load(); err != nil {
 		v.logger.Warnf("Failed to load LED curves (blinker timing may be imprecise): %v", err)
 	}
-
-	// Set up Redis callbacks
-	v.redis.SetCallbacks(messaging.Callbacks{
-		DashboardCallback:      v.handleDashboardReady,
-		KeycardCallback:        v.keycardAuthPassed,
-		SeatboxCallback:        v.handleSeatboxRequest,
-		HornCallback:           v.handleHornRequest,
-		BlinkerCallback:        v.handleBlinkerRequest,
-		StateCallback:          v.handleStateRequest,
-		ForceLockCallback:      v.handleForceLockRequest,
-		LedCueCallback:         v.handleLedCueRequest,
-		LedFadeCallback:        v.handleLedFadeRequest,
-		UpdateCallback:         v.handleUpdateRequest,
-		HardwareCallback:       v.handleHardwareRequest,
-		SettingsCallback:       v.handleSettingsUpdate,
-		OtaDbcActivityCallback: v.resetDbcWatchdog,
-		HopOnCallback:          v.handleHopOnRequest,
-		PowerStateCallback:     v.handlePowerStateChange,
-		MenuOpenCallback: func(open bool) error {
-			v.menuOpen.Store(open)
-			return nil
-		},
-	})
 
 	// Connect to Redis first so we can retrieve saved state
 	if err := v.redis.Connect(); err != nil {
