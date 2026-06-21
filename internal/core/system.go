@@ -101,6 +101,8 @@ type VehicleSystem struct {
 	brakeHibernationEnabled bool              // Track if brake lever hibernation is enabled (default: true)
 	autoStandbySeconds         int               // Auto-standby timeout in seconds (0 = disabled)
 	lockOnBleDisconnectSeconds int               // Grace seconds before locking after BLE disconnect while parked (0 = disabled)
+	keylessCountdownActive bool   // A lock-on-disconnect countdown is currently armed
+	lastBleStatus          string // Last observed ble/status ("connected"/"disconnected")
 	hornEnableMode          string            // Horn enable mode: "true", "false", or "in-drive" (default: "true")
 	dbcBlinkerLed           bool              // Blink DBC boot LED in sync with blinkers (default: false)
 	usb0Policy              string            // "auto" (default, tracks dashboard_power) or "always-on"
@@ -651,7 +653,7 @@ func (v *VehicleSystem) startAutoStandbyTimer() {
 	seconds := v.autoStandbySeconds
 	v.mu.RUnlock()
 
-	if seconds <= 0 || v.machine == nil {
+	if seconds <= 0 {
 		return
 	}
 
@@ -659,11 +661,18 @@ func (v *VehicleSystem) startAutoStandbyTimer() {
 	// kickstand, seatbox). The meaningful "timer armed" log is emitted once
 	// from EnterParked. See fsm_actions.go `Started auto-standby timer`.
 	v.logger.Debugf("Starting auto-standby timer: %d seconds", seconds)
+	v.startStandbyCountdown(time.Duration(seconds) * time.Second)
+}
 
-	duration := time.Duration(seconds) * time.Second
+// startStandbyCountdown arms TimerAutoStandby for the given duration (firing
+// EvAutoStandbyTimeout) and publishes the deadline so the dashboard countdown
+// overlay can render it. Callers own all precondition checks; this is reused by
+// both the idle auto-standby path and the lock-on-disconnect path.
+func (v *VehicleSystem) startStandbyCountdown(duration time.Duration) {
+	if v.machine == nil || duration <= 0 {
+		return
+	}
 	v.machine.StartTimer(fsm.TimerAutoStandby, duration, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
-
-	// Publish the deadline time so UI can display countdown
 	deadline := time.Now().Add(duration)
 	if err := v.redis.PublishAutoStandbyDeadline(deadline); err != nil {
 		v.logger.Warnf("Failed to publish auto-standby deadline: %v", err)
@@ -702,6 +711,54 @@ func (v *VehicleSystem) resetAutoStandbyTimer() {
 	v.logger.Debugf("Resetting auto-standby timer")
 	v.cancelAutoStandbyTimer()
 	v.startAutoStandbyTimer()
+}
+
+// handleBleStatusChange reacts to the bluetooth-service ble/status field. A
+// connected->disconnected edge while parked, with the feature enabled, arms a
+// short standby countdown; a reconnect during that window cancels it.
+func (v *VehicleSystem) handleBleStatusChange(status string) error {
+	v.mu.Lock()
+	prev := v.lastBleStatus
+	v.lastBleStatus = status
+	graceSeconds := v.lockOnBleDisconnectSeconds
+	countingDown := v.keylessCountdownActive
+	v.mu.Unlock()
+
+	switch status {
+	case "disconnected":
+		if prev != "connected" || graceSeconds <= 0 || countingDown {
+			return nil
+		}
+		if v.getCurrentState() != types.StateParked {
+			return nil
+		}
+		v.mu.Lock()
+		v.keylessCountdownActive = true
+		v.mu.Unlock()
+		v.logger.Infof("BLE disconnected while parked; locking in %d seconds", graceSeconds)
+		v.cancelAutoStandbyTimer()
+		v.startStandbyCountdown(time.Duration(graceSeconds) * time.Second)
+	case "connected":
+		if countingDown {
+			v.logger.Infof("BLE reconnected during lock countdown; canceling")
+			v.clearKeylessCountdown()
+		}
+	}
+	return nil
+}
+
+// clearKeylessCountdown cancels an active lock-on-disconnect countdown and, when
+// still parked with idle auto-standby enabled, restores the normal idle timer.
+func (v *VehicleSystem) clearKeylessCountdown() {
+	v.mu.Lock()
+	v.keylessCountdownActive = false
+	idleSeconds := v.autoStandbySeconds
+	v.mu.Unlock()
+
+	v.cancelAutoStandbyTimer()
+	if v.getCurrentState() == types.StateParked && idleSeconds > 0 {
+		v.startAutoStandbyTimer()
+	}
 }
 
 // clampLockOnDisconnect normalises a lock-on-disconnect setting value:

@@ -518,6 +518,7 @@ func (v *VehicleSystem) EnterAtRest(c *librefsm.Context) error {
 
 	v.mu.Lock()
 	v.autoStandbyDeadline = deadline
+	v.keylessCountdownActive = false
 	v.mu.Unlock()
 
 	v.machine.StartTimer(fsm.TimerAutoStandby, duration, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
@@ -540,6 +541,7 @@ func (v *VehicleSystem) ExitAtRest(c *librefsm.Context) error {
 	}
 	v.mu.Lock()
 	v.autoStandbyDeadline = time.Time{}
+	v.keylessCountdownActive = false
 	v.mu.Unlock()
 	return nil
 }

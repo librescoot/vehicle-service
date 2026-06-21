@@ -1899,3 +1899,128 @@ func TestClampLockOnDisconnectNegative(t *testing.T) {
 		t.Errorf("expected negative input to clamp to 0, got %d", got)
 	}
 }
+
+// parkedTestSystem brings a fresh VehicleSystem up in StateParked with inputs
+// matching a parked scooter (kickstand down, no brakes, seatbox/handlebar locked).
+func parkedTestSystem(t *testing.T) (*VehicleSystem, *mockHardwareIO, *mockMessagingClient) {
+	t.Helper()
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["handlebar_lock_sensor"] = true
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState Parked: %v", err)
+	}
+	system.initialized = true
+	return system, mockIO, mockRedis
+}
+
+func TestKeyless_ArmsOnDisconnectEdgeWhenParked(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	if err := system.handleBleStatusChange("disconnected"); err != nil {
+		t.Fatalf("handleBleStatusChange: %v", err)
+	}
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if !active {
+		t.Fatal("expected countdown active after connected->disconnected edge while parked")
+	}
+}
+
+func TestKeyless_NoArmWithoutConnectedEdge(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "" // never observed "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("must not arm without a connected->disconnected edge")
+	}
+}
+
+func TestKeyless_NoArmWhenDisabled(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 0 // feature off
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("must not arm when the setting is 0 (disabled)")
+	}
+}
+
+func TestKeyless_NoArmOutsideParked(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateStandby); err != nil {
+		t.Fatalf("SetState Standby: %v", err)
+	}
+	system.initialized = true
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("must not arm outside parked")
+	}
+}
+
+func TestKeyless_ReconnectCancelsCountdown(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	_ = system.handleBleStatusChange("connected")
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("reconnect must cancel the countdown")
+	}
+}
+
+func TestKeyless_ExpiryReachesShuttingDown(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	// The timer fires EvAutoStandbyTimeout; send it directly to avoid a 10s wait.
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvAutoStandbyTimeout}); err != nil {
+		t.Fatalf("send timeout: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if system.getCurrentState() != types.StateShuttingDown {
+		t.Errorf("expected shutting-down after countdown expiry, got %v", system.getCurrentState())
+	}
+}
