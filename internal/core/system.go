@@ -232,14 +232,19 @@ func (v *VehicleSystem) Start() error {
 		v.logger.Infof("No auto-standby setting found on startup, using default (%d seconds)", defaultAutoStandbySeconds)
 	}
 
+	v.mu.Lock()
 	v.lockOnBleDisconnectSeconds = 0
+	v.mu.Unlock()
 	if lockSetting, err := v.redis.GetHashField("settings", "scooter.lock-on-bluetooth-disconnect-seconds"); err != nil {
 		v.logger.Infof("No lock-on-bluetooth-disconnect setting on startup (using disabled)")
 	} else if lockSetting != "" {
 		if secs, perr := strconv.Atoi(lockSetting); perr != nil {
 			v.logger.Warnf("Invalid lock-on-bluetooth-disconnect setting on startup: '%s' (using disabled)", lockSetting)
 		} else {
-			v.lockOnBleDisconnectSeconds = v.clampLockOnDisconnect(secs)
+			clamped := v.clampLockOnDisconnect(secs)
+			v.mu.Lock()
+			v.lockOnBleDisconnectSeconds = clamped
+			v.mu.Unlock()
 		}
 	}
 

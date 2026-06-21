@@ -1892,3 +1892,10 @@ func TestHandleSettingsUpdateLockOnDisconnectInvalid(t *testing.T) {
 		t.Error("expected error for invalid value")
 	}
 }
+
+func TestClampLockOnDisconnectNegative(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+	if got := system.clampLockOnDisconnect(-3); got != 0 {
+		t.Errorf("expected negative input to clamp to 0, got %d", got)
+	}
+}
