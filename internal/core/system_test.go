@@ -2024,3 +2024,40 @@ func TestKeyless_ExpiryReachesShuttingDown(t *testing.T) {
 		t.Errorf("expected shutting-down after countdown expiry, got %v", system.getCurrentState())
 	}
 }
+
+func TestKeyless_InteractionCancels_IdleDisabled(t *testing.T) {
+	system, _, _ := parkedTestSystem(t) // autoStandbySeconds defaults to 0
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	system.resetAutoStandbyTimer() // simulates brake/kickstand/seatbox interaction
+
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("interaction must cancel the countdown even when idle auto-standby is disabled")
+	}
+}
+
+func TestKeyless_InteractionCancels_IdleEnabled(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.autoStandbySeconds = 900
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	system.resetAutoStandbyTimer()
+
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("interaction must cancel the countdown when idle auto-standby is enabled")
+	}
+}

@@ -695,15 +695,22 @@ func (v *VehicleSystem) cancelAutoStandbyTimer() {
 	v.logger.Debugf("Auto-standby timer canceled")
 }
 
-// resetAutoStandbyTimer resets the auto-standby timer
+// resetAutoStandbyTimer resets the auto-standby timer on rider interaction. If a
+// lock-on-disconnect countdown is active it is cancelled first (regardless of the
+// idle auto-standby setting), then the idle timer is re-armed when applicable.
 func (v *VehicleSystem) resetAutoStandbyTimer() {
-	currentState := v.getCurrentState()
-
 	v.mu.RLock()
+	countingDown := v.keylessCountdownActive
 	autoStandbySeconds := v.autoStandbySeconds
 	v.mu.RUnlock()
 
-	// Only reset if in parked state and auto-standby is enabled
+	if countingDown {
+		v.logger.Debugf("Interaction during lock-on-disconnect countdown; canceling")
+		v.clearKeylessCountdown()
+		return
+	}
+
+	currentState := v.getCurrentState()
 	if currentState != types.StateParked || autoStandbySeconds <= 0 {
 		return
 	}
