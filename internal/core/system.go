@@ -104,6 +104,8 @@ type VehicleSystem struct {
 	keylessCountdownActive     bool              // A lock-on-disconnect countdown is currently armed
 	lastBleStatus              string            // Last observed ble/status ("connected"/"disconnected")
 	hornEnableMode             string            // Horn enable mode: "true", "false", or "in-drive" (default: "true")
+	hornWhenSeatboxOpen        bool              // Allow manual horn button while seatbox open + unlocked (default: false = muted, guards against the seat lid honking)
+	seatboxClosed              bool              // Cached seatbox lock sensor state (true = closed)
 	dbcBlinkerLed              bool              // Blink DBC boot LED in sync with blinkers (default: false)
 	usb0Policy                 string            // "auto" (default, tracks dashboard_power) or "always-on"
 	hibernationForceTimer      *time.Timer       // Timer for forcing hibernation after 15s of brake hold
@@ -128,6 +130,8 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		forceStandbyNoLock:      false,
 		brakeHibernationEnabled: true,   // Default to enabled for backward compatibility
 		hornEnableMode:          "true", // Default to always enabled for backward compatibility
+		hornWhenSeatboxOpen:     false,  // Default: mute manual horn while seatbox open in unlocked states
+		seatboxClosed:           true,   // Safe default until first sensor read (closed = no suppression)
 		usb0Policy:              "auto", // Default: bring usb0 down in standby; setPower tracks dashboard_power
 	}
 	vs.blinkerCueIndex.Store(-1)
@@ -269,6 +273,20 @@ func (v *VehicleSystem) Start() error {
 		v.mu.Unlock()
 	} else {
 		v.logger.Infof("No horn enable mode setting found on startup, using default (true)")
+	}
+
+	// Read initial "horn while seatbox open" setting from Redis
+	hornWhenSeatboxOpenSetting, err := v.redis.GetHashField("settings", "scooter.horn-when-seatbox-open")
+	if err != nil {
+		v.logger.Warnf("Failed to read horn-when-seatbox-open setting on startup: %v", err)
+		// Continue with default (false = mute manual horn while seatbox open)
+	} else if hornWhenSeatboxOpenSetting != "" {
+		v.mu.Lock()
+		v.hornWhenSeatboxOpen = hornWhenSeatboxOpenSetting == "true"
+		v.mu.Unlock()
+		v.logger.Infof("Horn-when-seatbox-open setting on startup: %s", hornWhenSeatboxOpenSetting)
+	} else {
+		v.logger.Infof("No horn-when-seatbox-open setting found on startup, using default (false)")
 	}
 
 	// Read initial DBC blinker LED setting from Redis
@@ -467,6 +485,10 @@ func (v *VehicleSystem) Start() error {
 			v.io.RegisterInputCallback(ch, v.handleHandlebarPosition)
 		case "seatbox_lock_sensor":
 			v.io.RegisterInputCallback(ch, func(channel string, value bool) error {
+				// Cache sensor state (value true = closed) for the horn gate
+				v.mu.Lock()
+				v.seatboxClosed = value
+				v.mu.Unlock()
 				// Update Redis
 				if err := v.redis.SetSeatboxLockState(value); err != nil {
 					return err
@@ -508,6 +530,13 @@ func (v *VehicleSystem) Start() error {
 
 		if err := publisher(value); err != nil {
 			v.logger.Infof("Warning: Failed to publish initial state for %s to Redis: %v", sensor, err)
+		}
+
+		// Seed the cached seatbox state for the horn gate (value true = closed)
+		if sensor == "seatbox_lock_sensor" {
+			v.mu.Lock()
+			v.seatboxClosed = value
+			v.mu.Unlock()
 		}
 	}
 
@@ -811,6 +840,23 @@ func (v *VehicleSystem) isHornAllowed() bool {
 	}
 }
 
+// seatboxBlocksHorn reports whether the manual horn button should be muted
+// because the open seat lid can rest on it. Only applies while the seatbox is
+// open and the scooter is unlocked (any non-standby state). The alarm and
+// remote/CLI horn paths (scooter:horn) are unaffected.
+func (v *VehicleSystem) seatboxBlocksHorn() bool {
+	v.mu.RLock()
+	allowHorn := v.hornWhenSeatboxOpen
+	seatboxClosed := v.seatboxClosed
+	v.mu.RUnlock()
+
+	if allowHorn || seatboxClosed {
+		return false
+	}
+	// getCurrentState takes its own lock; call it after releasing v.mu.
+	return v.getCurrentState() != types.StateStandby
+}
+
 func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 	v.logger.Infof("Handling dashboard ready state: %v", ready)
 
@@ -964,8 +1010,9 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 	switch channel {
 	case "horn_button":
-		// Check if horn is allowed before activating
-		allowed := v.isHornAllowed()
+		// Check if horn is allowed before activating. Also mute it when the
+		// open seat lid can rest on the button (seatbox open + unlocked).
+		allowed := v.isHornAllowed() && !v.seatboxBlocksHorn()
 		hornValue := value && allowed // Only activate if both button pressed AND allowed
 
 		if err := v.io.WriteDigitalOutput("horn", hornValue); err != nil {

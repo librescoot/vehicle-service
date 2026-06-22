@@ -576,6 +576,17 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 		v.mu.Unlock()
 		v.logger.Infof("Horn enable mode updated to: %s", value)
 
+	case "scooter.horn-when-seatbox-open":
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+		v.mu.Lock()
+		v.hornWhenSeatboxOpen = value == "true"
+		v.mu.Unlock()
+		v.logger.Infof("Horn-when-seatbox-open updated to: %v", value == "true")
+
 	case "scooter.dbc-blinker-led":
 		value, err := v.redis.GetHashField("settings", settingKey)
 		if err != nil {
