@@ -630,6 +630,33 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 			}
 		}
 
+	case "scooter.handlebar-unlocked":
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+		unlock := value == "true"
+		v.mu.Lock()
+		v.handlebarUnlockedOverride = unlock
+		v.mu.Unlock()
+		if unlock {
+			v.logger.Infof("Service mode: releasing handlebar latch and suppressing auto re-lock")
+			v.cancelHandlebarLock()
+			if perr := v.pulseHandlebarLock(false); perr != nil {
+				v.logger.Warnf("Failed to release handlebar latch: %v", perr)
+			} else {
+				v.setHandlebarLatch(false)
+			}
+		} else {
+			v.logger.Infof("Service mode off: restoring normal handlebar locking")
+			if perr := v.pulseHandlebarLock(true); perr != nil {
+				v.logger.Warnf("Failed to re-lock handlebar on service-mode exit: %v", perr)
+			} else {
+				v.setHandlebarLatch(true)
+			}
+		}
+
 	default:
 		// Only log unknown settings if they're in the scooter namespace
 		// Silently ignore settings for other services (e.g., updates.*, battery.*, etc.)

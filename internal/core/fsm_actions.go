@@ -343,20 +343,25 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 	if forcedStandby {
 		v.logger.Debugf("Forced standby: skipping handlebar lock.")
 	} else if isFromParked {
-		v.logger.Infof("Locking handlebar (direct transition from parked)")
-		v.lockHandlebar()
-
-		// Play shutdown LED cue
-		brakeLeft, brakeRight, err := v.readBrakeStates()
-		if err != nil {
-			v.logger.Infof("%v for standby cue", err)
-		}
-		brakesPressed := brakeLeft || brakeRight
-
-		if brakesPressed {
-			v.playLedCue(8, "parked brake on to standby")
+		v.mu.RLock()
+		override := v.handlebarUnlockedOverride
+		v.mu.RUnlock()
+		if override {
+			v.logger.Debugf("Service mode: skipping handlebar re-lock on standby")
 		} else {
-			v.playLedCue(7, "parked brake off to standby")
+			v.logger.Infof("Locking handlebar (direct transition from parked)")
+			v.lockHandlebar()
+
+			brakeLeft, brakeRight, err := v.readBrakeStates()
+			if err != nil {
+				v.logger.Infof("%v for standby cue", err)
+			}
+			brakesPressed := brakeLeft || brakeRight
+			if brakesPressed {
+				v.playLedCue(8, "parked brake on to standby")
+			} else {
+				v.playLedCue(7, "parked brake off to standby")
+			}
 		}
 	}
 
@@ -440,9 +445,16 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 		v.playLedCue(7, "parked brake off to standby")
 	}
 
-	// Start handlebar locking immediately
-	v.logger.Debugf("Starting handlebar locking during shutdown")
-	v.lockHandlebar()
+	// Start handlebar locking immediately, unless service mode holds it released.
+	v.mu.RLock()
+	override := v.handlebarUnlockedOverride
+	v.mu.RUnlock()
+	if override {
+		v.logger.Debugf("Service mode: skipping handlebar lock during shutdown")
+	} else {
+		v.logger.Debugf("Starting handlebar locking during shutdown")
+		v.lockHandlebar()
+	}
 
 	// Note: The shutdown timer is handled by librefsm WithTimeout
 	v.logger.Infof("Shutdown timer started via librefsm (4.0s)")
