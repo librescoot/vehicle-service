@@ -649,11 +649,18 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 				v.setHandlebarLatch(false)
 			}
 		} else {
-			v.logger.Infof("Service mode off: restoring normal handlebar locking")
-			if perr := v.pulseHandlebarLock(true); perr != nil {
-				v.logger.Warnf("Failed to re-lock handlebar on service-mode exit: %v", perr)
+			// Override already cleared above. Re-lock only when the handlebar
+			// is meant to be locked, i.e. in stand-by; in parked/ready-to-drive
+			// it stays free and a later stand-by transition locks it via the
+			// now-cleared override. Use the verified, retrying lock path
+			// (positioning window + sensor confirmation) so the latch is
+			// reported locked only once the sensor confirms, rather than
+			// optimistically after a single unverified pulse.
+			if state := v.getCurrentState(); state == types.StateStandby {
+				v.logger.Infof("Service mode off: re-locking handlebar (sensor-verified, with retries)")
+				v.lockHandlebar()
 			} else {
-				v.setHandlebarLatch(true)
+				v.logger.Infof("Service mode off: vehicle in %s state, leaving handlebar unlocked", state)
 			}
 		}
 
