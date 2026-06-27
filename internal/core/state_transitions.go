@@ -63,10 +63,14 @@ func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
 	return nil
 }
 
-// lockHandlebar initiates handlebar locking with a 10-second window for positioning.
-// The done channel is set up before the goroutine starts so cancelHandlebarLock()
-// can cancel both the immediate-lock path and the timer-wait path.
-func (v *VehicleSystem) lockHandlebar() {
+// lockHandlebar initiates handlebar locking with a handlebarLockWindow
+// positioning window. If the handlebar is already in lock-position it locks
+// immediately; otherwise it waits for the user to move it into position within
+// the window. The done channel is set up before the goroutine starts so
+// cancelHandlebarLock() can cancel both the immediate-lock path and the
+// timer-wait path. onLocked, if non-nil, runs once the lock is sensor-confirmed
+// engaged (hop-on uses it to record that it owns the lock for release on exit).
+func (v *VehicleSystem) lockHandlebar(onLocked func()) {
 	done := make(chan struct{})
 	v.mu.Lock()
 	if v.handlebarDone != nil {
@@ -91,7 +95,7 @@ func (v *VehicleSystem) lockHandlebar() {
 
 		if handlebarPos {
 			// Handlebar is in position, lock it with retry + sensor verification
-			v.lockHandlebarWithRetry(done)
+			v.lockHandlebarWithRetry(done, onLocked)
 			// Clear done reference
 			v.mu.Lock()
 			if v.handlebarDone == done {
@@ -145,7 +149,7 @@ func (v *VehicleSystem) lockHandlebar() {
 
 			timer.Stop()
 
-			v.lockHandlebarWithRetry(done)
+			v.lockHandlebarWithRetry(done, onLocked)
 			cleanup()
 			return nil
 		})
@@ -167,7 +171,8 @@ func (v *VehicleSystem) lockHandlebar() {
 
 // lockHandlebarWithRetry pulses the lock closed and verifies via the lock sensor.
 // Retries up to handlebarLockRetries times if the sensor doesn't confirm engagement.
-func (v *VehicleSystem) lockHandlebarWithRetry(done chan struct{}) {
+// onLocked, if non-nil, runs once the lock is sensor-confirmed engaged.
+func (v *VehicleSystem) lockHandlebarWithRetry(done chan struct{}, onLocked func()) {
 	for attempt := 1; attempt <= handlebarLockRetries; attempt++ {
 		// Check for cancellation
 		select {
@@ -210,6 +215,9 @@ func (v *VehicleSystem) lockHandlebarWithRetry(done chan struct{}) {
 		if locked {
 			v.setHandlebarLatch(true)
 			v.logger.Infof("Handlebar locked successfully (attempt %d/%d)", attempt, handlebarLockRetries)
+			if onLocked != nil {
+				onLocked()
+			}
 			return
 		}
 

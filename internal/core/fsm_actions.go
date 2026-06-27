@@ -350,7 +350,7 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 			v.logger.Debugf("Service mode: skipping handlebar re-lock on standby")
 		} else {
 			v.logger.Infof("Locking handlebar (direct transition from parked)")
-			v.lockHandlebar()
+			v.lockHandlebar(nil)
 
 			brakeLeft, brakeRight, err := v.readBrakeStates()
 			if err != nil {
@@ -453,7 +453,7 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 		v.logger.Debugf("Service mode: skipping handlebar lock during shutdown")
 	} else {
 		v.logger.Debugf("Starting handlebar locking during shutdown")
-		v.lockHandlebar()
+		v.lockHandlebar(nil)
 	}
 
 	// Note: The shutdown timer is handled by librefsm WithTimeout
@@ -650,41 +650,18 @@ func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
 		v.playLedCue(7, "hop-on engage (brakes off)")
 	}
 
-	// Opportunistic steering-lock engagement: only if the handlebar
-	// happens to be in lock-position right now. Synchronous pulse
-	// (~1.1s) so run on a goroutine to avoid blocking the FSM.
-	positioned, err := v.io.ReadDigitalInputDirect("handlebar_position")
-	if err != nil {
-		v.logger.Warnf("hop-on: failed to read handlebar position: %v", err)
-	} else if positioned {
-		v.logger.Infof("hop-on: handlebar in position, engaging steering lock")
-		go func() {
-			if err := v.pulseHandlebarLock(true); err != nil {
-				v.logger.Warnf("hop-on: failed to pulse handlebar lock: %v", err)
-				return
-			}
-			time.Sleep(handlebarLockRetryDelay)
-			sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
-			if err != nil {
-				v.logger.Warnf("hop-on: failed to read handlebar lock sensor after pulse: %v", err)
-				return
-			}
-			v.mu.Lock()
-			v.handlebarUnlocked = sensorVal
-			if !sensorVal {
-				v.hopOnLockedHandlebar = true
-			}
-			v.mu.Unlock()
-			if sensorVal {
-				v.logger.Warnf("hop-on: lock pulse fired but sensor still reads unlocked")
-			} else {
-				v.setHandlebarLatch(true)
-				v.logger.Infof("hop-on: steering lock engaged")
-			}
-		}()
-	} else {
-		v.logger.Debugf("hop-on: handlebar not in position, skipping steering lock")
-	}
+	// Steering-lock engagement with the same positioning grace window we use
+	// for parked->standby: if the handlebar is already in lock-position it
+	// locks immediately, otherwise the rider has handlebarLockWindow to move it
+	// all the way left to trigger the lock. The onLocked callback records that
+	// hop-on owns the lock so ExitHopOn releases the one it engaged.
+	v.logger.Infof("hop-on: arming steering lock (positioning window)")
+	v.lockHandlebar(func() {
+		v.mu.Lock()
+		v.hopOnLockedHandlebar = true
+		v.mu.Unlock()
+		v.logger.Infof("hop-on: steering lock engaged")
+	})
 
 	return nil
 }
@@ -693,6 +670,12 @@ func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
 // WE engaged it on entry. The auto-standby timer is parent-owned, so no
 // timer plumbing is needed here.
 func (v *VehicleSystem) ExitHopOn(c *librefsm.Context) error {
+	// Tear down any still-open positioning window so it can't lock the
+	// handlebar after we've left hop-on. The Parked exit path also cancels via
+	// EnterParked->unlockHandlebarIfNeeded, but force-lock->Standby and
+	// WaitingSeatbox do not, so cancel here unconditionally.
+	v.cancelHandlebarLock()
+
 	v.mu.Lock()
 	releaseHandlebar := v.hopOnLockedHandlebar
 	v.hopOnLockedHandlebar = false

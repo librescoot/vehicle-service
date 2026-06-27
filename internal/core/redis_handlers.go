@@ -658,7 +658,7 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 			// optimistically after a single unverified pulse.
 			if state := v.getCurrentState(); state == types.StateStandby {
 				v.logger.Infof("Service mode off: re-locking handlebar (sensor-verified, with retries)")
-				v.lockHandlebar()
+				v.lockHandlebar(nil)
 			} else {
 				v.logger.Infof("Service mode off: vehicle in %s state, leaving handlebar unlocked", state)
 			}
