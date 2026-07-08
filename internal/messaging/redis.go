@@ -180,7 +180,12 @@ func (r *RedisClient) StartListening() error {
 		}
 		return nil
 	})
-	r.settingsWatcher.Start()
+	// Redis is not persisted; settings-service reseeds the hash at every boot
+	// and publishes one notification per field. StartWithSync (subscribe →
+	// HGETALL → handlers → buffered messages) picks the seed up regardless of
+	// whether it lands before or after this point — plain Start() would
+	// silently miss any field seeded between the startup reads and here.
+	r.settingsWatcher.StartWithSync()
 
 	// Watch OTA hash for DBC update activity (feeds the watchdog timer)
 	r.otaWatcher = r.client.NewHashWatcher("ota")
