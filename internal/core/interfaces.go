@@ -88,4 +88,8 @@ type HardwareIO interface {
 
 	// Network link (usb0 to DBC)
 	SetUsb0Enabled(enabled bool) error
+
+	// PPP link over UART to DBC (ppp-link.service); slaved to dashboard
+	// power so pppd never holds the UART open against an unpowered DBC
+	SetPppLinkEnabled(enabled bool) error
 }

@@ -375,6 +375,13 @@ func (v *VehicleSystem) Start() error {
 		v.logger.Infof("Setting initial dashboard power: %v", dashboardPower)
 		v.io.SetInitialValue("dashboard_power", dashboardPower)
 
+		// Sync the UART PPP link to the restored dashboard power state. The
+		// unit is not enabled at boot (see the ppp-link recipe), so without
+		// this a vehicle-service restart would leave it in a stale state.
+		if err := v.io.SetPppLinkEnabled(dashboardPower); err != nil {
+			v.logger.Warnf("Failed to sync ppp-link to dashboard power: %v", err)
+		}
+
 		// Also set engine power initial value. Hop-on family runs with
 		// parked-equivalent rails (the firmware HOP_ON state explicitly
 		// returns POWER_MODE_ACTIVE), so engine_power must come up ON
@@ -1516,6 +1523,16 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 		}
 	}
 
+	// Stop the UART PPP link BEFORE cutting DBC power, so pppd never holds
+	// ttymxc2 open against a dead line (the unpowered DBC pulls RX into a
+	// permanent break, triggering imx-uart RX flood soft resets).
+	if component == "dashboard_power" && !enabled {
+		if err := v.io.SetPppLinkEnabled(false); err != nil {
+			v.logger.Warnf("Failed to stop ppp-link: %v", err)
+			// Continue anyway - power change must not be blocked
+		}
+	}
+
 	if err := v.io.WriteDigitalOutput(component, enabled); err != nil {
 		action := "enable"
 		if !enabled {
@@ -1530,6 +1547,13 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 		if err := v.redis.SetDashboardPower(enabled); err != nil {
 			v.logger.Warnf("Failed to persist dashboard power state to Redis: %v", err)
 			// Don't return error - hardware state was set successfully
+		}
+		// Start the UART PPP link once the DBC is powered; pppd sits in
+		// 'passive' until the DBC side answers with LCP.
+		if enabled {
+			if err := v.io.SetPppLinkEnabled(true); err != nil {
+				v.logger.Warnf("Failed to start ppp-link: %v", err)
+			}
 		}
 		if v.usb0AutoEffective() {
 			if err := v.io.SetUsb0Enabled(enabled); err != nil {

@@ -642,6 +642,21 @@ func (io *LinuxHardwareIO) SetUsb0Enabled(enabled bool) error {
 	return nil
 }
 
+func (io *LinuxHardwareIO) SetPppLinkEnabled(enabled bool) error {
+	action := "stop"
+	if enabled {
+		action = "start"
+	}
+	// --no-block: don't hold the FSM transition hostage to unit startup
+	cmd := exec.Command("systemctl", "--no-block", action, "ppp-link.service")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemctl %s ppp-link: %w (%s)", action, err, string(out))
+	}
+	io.logger.Debugf("ppp-link %s requested", action)
+	return nil
+}
+
 func (io *LinuxHardwareIO) SetDbcLed(color string, brightness uint8) error {
 	if io.dbcLed == nil {
 		return nil

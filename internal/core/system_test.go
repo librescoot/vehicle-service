@@ -209,6 +209,7 @@ func (m *mockHardwareIO) PlayPwmFade(ch int, idx int) error {
 
 func (m *mockHardwareIO) SetDbcLed(color string, brightness uint8) error { return nil }
 func (m *mockHardwareIO) SetUsb0Enabled(enabled bool) error              { return nil }
+func (m *mockHardwareIO) SetPppLinkEnabled(enabled bool) error           { return nil }
 
 // SimulateInput triggers an input callback
 func (m *mockHardwareIO) SimulateInput(channel string, value bool) error {
