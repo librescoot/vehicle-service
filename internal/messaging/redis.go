@@ -61,8 +61,7 @@ type RedisClient struct {
 	bleWatcher          *ipc.HashWatcher
 
 	// Fault handling
-	faultSet    *ipc.FaultSet
-	faultStream *ipc.StreamPublisher
+	faults *ipc.FaultReporter
 }
 
 func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks) (*RedisClient, error) {
@@ -97,8 +96,7 @@ func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks
 	r.buttonsPub = client.NewHashPublisher("buttons")
 
 	// Initialize fault handling
-	r.faultSet = client.NewFaultSet("vehicle:fault", "vehicle", "fault")
-	r.faultStream = client.NewStreamPublisher("events:faults", ipc.WithMaxLen(1000))
+	r.faults = client.NewFaultReporter("vehicle")
 
 	return r, nil
 }
@@ -813,56 +811,23 @@ func (r *RedisClient) PublishMessage(channel, message string) error {
 	return nil
 }
 
-// ReportFaultPresent reports a fault as present to Redis
-func (r *RedisClient) ReportFaultPresent(code int, description string, timestamp int64, info string) error {
+// ReportFaultPresent raises a fault. Idempotent.
+func (r *RedisClient) ReportFaultPresent(code int, description string) error {
 	r.logger.Infof("Reporting fault present: code=%d, description=%s", code, description)
-
-	// Add fault code to active faults set
-	if err := r.faultSet.Add(code); err != nil {
-		r.logger.Infof("Failed to add fault to set: %v", err)
+	if err := r.faults.Raise(code, description); err != nil {
+		r.logger.Infof("Failed to raise fault %d: %v", code, err)
 		return err
 	}
-
-	// Add fault event to global event stream with metadata
-	eventData := map[string]any{
-		"group":       "vehicle",
-		"code":        fmt.Sprint(code),
-		"description": description,
-		"ts":          fmt.Sprint(timestamp),
-	}
-	if info != "" {
-		eventData["info"] = info
-	}
-	if _, err := r.faultStream.Add(eventData); err != nil {
-		r.logger.Infof("Failed to add fault to stream: %v", err)
-		return err
-	}
-
-	r.logger.Infof("Successfully reported fault %d as present", code)
 	return nil
 }
 
-// ReportFaultAbsent reports a fault as absent (cleared) to Redis
+// ReportFaultAbsent clears a fault. Idempotent.
 func (r *RedisClient) ReportFaultAbsent(code int) error {
 	r.logger.Infof("Reporting fault absent: code=%d", code)
-
-	// Remove fault code from active faults set
-	if err := r.faultSet.Remove(code); err != nil {
-		r.logger.Infof("Failed to remove fault from set: %v", err)
+	if err := r.faults.Clear(code); err != nil {
+		r.logger.Infof("Failed to clear fault %d: %v", code, err)
 		return err
 	}
-
-	// Add clear event to global event stream (negative code indicates cleared)
-	eventData := map[string]any{
-		"group": "vehicle",
-		"code":  fmt.Sprint(-code), // Negative code indicates fault cleared
-	}
-	if _, err := r.faultStream.Add(eventData); err != nil {
-		r.logger.Infof("Failed to add fault clear to stream: %v", err)
-		return err
-	}
-
-	r.logger.Infof("Successfully reported fault %d as absent", code)
 	return nil
 }
 
