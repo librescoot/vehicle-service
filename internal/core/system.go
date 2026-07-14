@@ -1237,20 +1237,23 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	// kernel's second GPIO interrupt handler.
 	blinkerRight := false
 	blinkerLeft := false
-	if channel == "blinker_right" {
+	switch channel {
+	case "blinker_right":
 		blinkerRight = value
 		if leftVal, err := v.io.ReadDigitalInput("blinker_left"); err != nil {
 			v.logger.Warnf("Failed to read blinker_left for hazard detection: %v", err)
 		} else {
 			blinkerLeft = leftVal
 		}
-	} else {
+	case "blinker_left":
 		blinkerLeft = value
 		if rightVal, err := v.io.ReadDigitalInput("blinker_right"); err != nil {
 			v.logger.Warnf("Failed to read blinker_right for hazard detection: %v", err)
 		} else {
 			blinkerRight = rightVal
 		}
+	default:
+		return fmt.Errorf("unexpected blinker channel: %s", channel)
 	}
 
 	var switchState string
@@ -1291,37 +1294,29 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		return v.redis.SetBlinkerState(switchState, 0)
 	}
 
-	// Blinker active: set state and publish appropriate button event.
-	// For hazard (both switches active simultaneously) we publish the event
-	// for the triggering channel so that consumers see both blinker:left:on
-	// and blinker:right:on arriving in quick succession, which is the correct
-	// representation of hazard without introducing a new event type.
+	// Blinker active: update LED state based on combined switch state, then
+	// publish the PUBSUB event for the triggering channel based on value.
+	// Publishing channel+value (not switchState) ensures consumers always
+	// receive the correct edge — e.g. blinker:right:off when one side of a
+	// hazard pair is released, even though the combined state transitions to
+	// "left" rather than "off".
 	switch switchState {
 	case "both":
 		v.blinkerState = BlinkerBoth
-		if channel == "blinker_right" {
-			if err := v.redis.PublishButtonEvent("blinker:right:on"); err != nil {
-				v.logger.Infof("Failed to publish blinker right button event: %v", err)
-				// Continue with normal processing even if PUBSUB fails
-			}
-		} else {
-			if err := v.redis.PublishButtonEvent("blinker:left:on"); err != nil {
-				v.logger.Infof("Failed to publish blinker left button event: %v", err)
-				// Continue with normal processing even if PUBSUB fails
-			}
-		}
 	case "right":
 		v.blinkerState = BlinkerRight
-		if err := v.redis.PublishButtonEvent("blinker:right:on"); err != nil {
-			v.logger.Infof("Failed to publish blinker right button event: %v", err)
-			// Continue with normal processing even if PUBSUB fails
-		}
 	case "left":
 		v.blinkerState = BlinkerLeft
-		if err := v.redis.PublishButtonEvent("blinker:left:on"); err != nil {
-			v.logger.Infof("Failed to publish blinker left button event: %v", err)
-			// Continue with normal processing even if PUBSUB fails
-		}
+	}
+
+	position := strings.TrimPrefix(channel, "blinker_")
+	onOff := "on"
+	if !value {
+		onOff = "off"
+	}
+	if err := v.redis.PublishButtonEvent(fmt.Sprintf("blinker:%s:%s", position, onOff)); err != nil {
+		v.logger.Infof("Failed to publish blinker button event: %v", err)
+		// Continue with normal processing even if PUBSUB fails
 	}
 
 	if err := v.redis.SetBlinkerSwitch(switchState); err != nil {
