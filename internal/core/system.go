@@ -1233,15 +1233,6 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	// Stop any existing blinker routine
 	v.stopBlinker()
 
-	// Build the PUBSUB event string once from the triggering channel and value
-	// so both the off path and the active path use the same format.
-	position := strings.TrimPrefix(channel, "blinker_")
-	onOff := "on"
-	if !value {
-		onOff = "off"
-	}
-	evt := fmt.Sprintf("blinker:%s:%s", position, onOff)
-
 	// Determine the combined state of both blinker switches. io.go updates
 	// activeKeys for each event before firing the callback, so by the time
 	// event 2's callback runs, event 1's key is already reflected in the
@@ -1271,6 +1262,16 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		return fmt.Errorf("unexpected blinker channel: %s", channel)
 	}
 
+	// Build PUBSUB event string after channel validation so position is
+	// guaranteed to be "left" or "right", never a TrimPrefix residue from an
+	// unexpected channel value.
+	position := strings.TrimPrefix(channel, "blinker_")
+	onOff := "on"
+	if !value {
+		onOff = "off"
+	}
+	evt := fmt.Sprintf("blinker:%s:%s", position, onOff)
+
 	var switchState string
 	var cue int
 	switch {
@@ -1289,7 +1290,6 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	}
 
 	if switchState == "off" {
-		v.blinkerState = BlinkerOff
 		if err := v.io.PlayPwmCue(cue); err != nil {
 			return err
 		}
@@ -1301,26 +1301,21 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 			v.logger.Infof("Failed to publish blinker button event %s: %v", evt, err)
 			// Continue with normal processing even if PUBSUB fails
 		}
-		return v.redis.SetBlinkerState(switchState, 0)
+		if err := v.redis.SetBlinkerState(switchState, 0); err != nil {
+			return err
+		}
+		// Only update in-memory state after all hardware and Redis writes
+		// succeed so the fallback read in future events reflects reality.
+		v.blinkerState = BlinkerOff
+		return nil
 	}
 
-	// Blinker active: update LED state based on combined switch state, write
-	// Redis switch state, then publish the PUBSUB event. Writing Redis state
-	// before publishing matches the off-path ordering so consumers that read
-	// Redis in response to the event always see the updated switch state.
-	// Publishing channel+value (not switchState) ensures consumers always
-	// receive the correct edge — e.g. blinker:right:off when one side of a
-	// hazard pair is released, even though the combined state transitions to
-	// "left" rather than "off".
-	switch switchState {
-	case "both":
-		v.blinkerState = BlinkerBoth
-	case "right":
-		v.blinkerState = BlinkerRight
-	case "left":
-		v.blinkerState = BlinkerLeft
-	}
-
+	// Blinker active: write Redis switch state before publishing the PUBSUB
+	// event so consumers that read Redis in response to the event always see
+	// the updated switch state. Publishing channel+value (not switchState)
+	// ensures consumers always receive the correct edge — e.g. blinker:right:off
+	// when one side of a hazard pair is released, even though the combined
+	// state transitions to "left" rather than "off".
 	if err := v.redis.SetBlinkerSwitch(switchState); err != nil {
 		return err
 	}
@@ -1328,6 +1323,17 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	if err := v.redis.PublishButtonEvent(evt); err != nil {
 		v.logger.Infof("Failed to publish blinker button event %s: %v", evt, err)
 		// Continue with normal processing even if PUBSUB fails
+	}
+
+	// Only update in-memory blinker state after all Redis writes succeed so
+	// the fallback read in future events reflects actual committed state.
+	switch switchState {
+	case "both":
+		v.blinkerState = BlinkerBoth
+	case "right":
+		v.blinkerState = BlinkerRight
+	case "left":
+		v.blinkerState = BlinkerLeft
 	}
 
 	// Start blinker routine. runBlinker captures blinker:start_nanos itself
