@@ -1241,14 +1241,16 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	case "blinker_right":
 		blinkerRight = value
 		if leftVal, err := v.io.ReadDigitalInput("blinker_left"); err != nil {
-			v.logger.Warnf("Failed to read blinker_left for hazard detection: %v", err)
+			v.logger.Warnf("Failed to read blinker_left for hazard detection, falling back to last known state: %v", err)
+			blinkerLeft = v.blinkerState == BlinkerLeft || v.blinkerState == BlinkerBoth
 		} else {
 			blinkerLeft = leftVal
 		}
 	case "blinker_left":
 		blinkerLeft = value
 		if rightVal, err := v.io.ReadDigitalInput("blinker_right"); err != nil {
-			v.logger.Warnf("Failed to read blinker_right for hazard detection: %v", err)
+			v.logger.Warnf("Failed to read blinker_right for hazard detection, falling back to last known state: %v", err)
+			blinkerRight = v.blinkerState == BlinkerRight || v.blinkerState == BlinkerBoth
 		} else {
 			blinkerRight = rightVal
 		}
@@ -1288,7 +1290,7 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 			evtOff = "blinker:left:off"
 		}
 		if err := v.redis.PublishButtonEvent(evtOff); err != nil {
-			v.logger.Infof("Failed to publish blinker button event: %v", err)
+			v.logger.Infof("Failed to publish blinker button event %s: %v", evtOff, err)
 			// Continue with normal processing even if PUBSUB fails
 		}
 		return v.redis.SetBlinkerState(switchState, 0)
@@ -1314,8 +1316,9 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	if !value {
 		onOff = "off"
 	}
-	if err := v.redis.PublishButtonEvent(fmt.Sprintf("blinker:%s:%s", position, onOff)); err != nil {
-		v.logger.Infof("Failed to publish blinker button event: %v", err)
+	evt := fmt.Sprintf("blinker:%s:%s", position, onOff)
+	if err := v.redis.PublishButtonEvent(evt); err != nil {
+		v.logger.Infof("Failed to publish blinker button event %s: %v", evt, err)
 		// Continue with normal processing even if PUBSUB fails
 	}
 
