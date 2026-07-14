@@ -1226,8 +1226,21 @@ func (v *VehicleSystem) stopBlinker() {
 }
 
 func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
+	// Capture blinker state before stopping so the peer-read fallback below
+	// uses the pre-stop value regardless of what stopBlinker does internally.
+	prevBlinkerState := v.blinkerState
+
 	// Stop any existing blinker routine
 	v.stopBlinker()
+
+	// Build the PUBSUB event string once from the triggering channel and value
+	// so both the off path and the active path use the same format.
+	position := strings.TrimPrefix(channel, "blinker_")
+	onOff := "on"
+	if !value {
+		onOff = "off"
+	}
+	evt := fmt.Sprintf("blinker:%s:%s", position, onOff)
 
 	// Determine the combined state of both blinker switches. io.go updates
 	// activeKeys for each event before firing the callback, so by the time
@@ -1242,7 +1255,7 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		blinkerRight = value
 		if leftVal, err := v.io.ReadDigitalInput("blinker_left"); err != nil {
 			v.logger.Warnf("Failed to read blinker_left for hazard detection, falling back to last known state: %v", err)
-			blinkerLeft = v.blinkerState == BlinkerLeft || v.blinkerState == BlinkerBoth
+			blinkerLeft = prevBlinkerState == BlinkerLeft || prevBlinkerState == BlinkerBoth
 		} else {
 			blinkerLeft = leftVal
 		}
@@ -1250,7 +1263,7 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		blinkerLeft = value
 		if rightVal, err := v.io.ReadDigitalInput("blinker_right"); err != nil {
 			v.logger.Warnf("Failed to read blinker_right for hazard detection, falling back to last known state: %v", err)
-			blinkerRight = v.blinkerState == BlinkerRight || v.blinkerState == BlinkerBoth
+			blinkerRight = prevBlinkerState == BlinkerRight || prevBlinkerState == BlinkerBoth
 		} else {
 			blinkerRight = rightVal
 		}
@@ -1284,14 +1297,8 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 			return err
 		}
 		// Also publish the button event directly via PUBSUB for immediate handling
-		var evtOff string
-		if channel == "blinker_right" {
-			evtOff = "blinker:right:off"
-		} else {
-			evtOff = "blinker:left:off"
-		}
-		if err := v.redis.PublishButtonEvent(evtOff); err != nil {
-			v.logger.Infof("Failed to publish blinker button event %s: %v", evtOff, err)
+		if err := v.redis.PublishButtonEvent(evt); err != nil {
+			v.logger.Infof("Failed to publish blinker button event %s: %v", evt, err)
 			// Continue with normal processing even if PUBSUB fails
 		}
 		return v.redis.SetBlinkerState(switchState, 0)
@@ -1318,12 +1325,6 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		return err
 	}
 
-	position := strings.TrimPrefix(channel, "blinker_")
-	onOff := "on"
-	if !value {
-		onOff = "off"
-	}
-	evt := fmt.Sprintf("blinker:%s:%s", position, onOff)
 	if err := v.redis.PublishButtonEvent(evt); err != nil {
 		v.logger.Infof("Failed to publish blinker button event %s: %v", evt, err)
 		// Continue with normal processing even if PUBSUB fails
