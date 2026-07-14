@@ -1259,7 +1259,7 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 			blinkerRight = rightVal
 		}
 	default:
-		return fmt.Errorf("unexpected blinker channel: %s", channel)
+		return fmt.Errorf("unexpected blinker channel: %q", channel)
 	}
 
 	// Build PUBSUB event string after channel validation so position is
