@@ -71,16 +71,16 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 	switch state {
 	case "off":
 		cue = 9 // LED_BLINK_NONE
-		v.blinkerState = BlinkerOff
+		v.setBlinkerState(BlinkerOff)
 	case "left":
 		cue = 10 // LED_BLINK_LEFT
-		v.blinkerState = BlinkerLeft
+		v.setBlinkerState(BlinkerLeft)
 	case "right":
 		cue = 11 // LED_BLINK_RIGHT
-		v.blinkerState = BlinkerRight
+		v.setBlinkerState(BlinkerRight)
 	case "both":
 		cue = 12 // LED_BLINK_BOTH
-		v.blinkerState = BlinkerBoth
+		v.setBlinkerState(BlinkerBoth)
 	default:
 		return fmt.Errorf("invalid blinker state: %s", state)
 	}

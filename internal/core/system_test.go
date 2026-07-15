@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 // Mock MessagingClient
 type mockMessagingClient struct {
 	callbacks messaging.Callbacks
+	mu        sync.Mutex // guards the recorded-call slices; runBlinker records from its own goroutine
 
 	// Track method calls
 	publishedStates       []types.SystemState
@@ -83,28 +85,40 @@ func (m *mockMessagingClient) SetSeatboxLockState(locked bool) error            
 func (m *mockMessagingClient) SetHornButton(pressed bool) error                    { return nil }
 func (m *mockMessagingClient) SetSeatboxButton(pressed bool) error                 { return nil }
 func (m *mockMessagingClient) SetMainPower(on bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.mainPowerSets = append(m.mainPowerSets, on)
 	return nil
 }
 func (m *mockMessagingClient) SetEnginePower(on bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.enginePowerSets = append(m.enginePowerSets, on)
 	return nil
 }
 func (m *mockMessagingClient) SendCommand(channel, command string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.sendCommands = append(m.sendCommands, struct{ channel, command string }{channel, command})
 	return nil
 }
 func (m *mockMessagingClient) PublishMessage(channel, message string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.publishedMessages = append(m.publishedMessages, struct{ channel, message string }{channel, message})
 	return nil
 }
 
 func (m *mockMessagingClient) PublishVehicleState(state types.SystemState) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.publishedStates = append(m.publishedStates, state)
 	return nil
 }
 
 func (m *mockMessagingClient) SetBrakeState(side string, pressed bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.setBrakeStates = append(m.setBrakeStates, struct {
 		side    string
 		pressed bool
@@ -113,21 +127,29 @@ func (m *mockMessagingClient) SetBrakeState(side string, pressed bool) error {
 }
 
 func (m *mockMessagingClient) SetHandlebarPosition(isOnPlace bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.setHandlebarPositions = append(m.setHandlebarPositions, isOnPlace)
 	return nil
 }
 
 func (m *mockMessagingClient) SetBlinkerSwitch(state string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.setBlinkerSwitches = append(m.setBlinkerSwitches, state)
 	return nil
 }
 
 func (m *mockMessagingClient) SetBlinkerState(state string, _ int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.setBlinkerStates = append(m.setBlinkerStates, state)
 	return nil
 }
 
 func (m *mockMessagingClient) PublishButtonEvent(event string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.publishedButtonEvents = append(m.publishedButtonEvents, event)
 	return nil
 }
@@ -143,6 +165,7 @@ func (m *mockMessagingClient) PublishSeatboxOpened() error {
 
 // Mock HardwareIO
 type mockHardwareIO struct {
+	mu             sync.Mutex // guards recorded calls; runBlinker plays cues from its own goroutine
 	digitalOutputs map[string]bool
 	digitalInputs  map[string]bool
 	initialValues  map[string]bool
@@ -198,11 +221,15 @@ func (m *mockHardwareIO) ResyncInputs() error {
 }
 
 func (m *mockHardwareIO) PlayPwmCue(idx int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.pwmCues = append(m.pwmCues, idx)
 	return nil
 }
 
 func (m *mockHardwareIO) PlayPwmFade(ch int, idx int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.pwmFades = append(m.pwmFades, struct{ ch, idx int }{ch, idx})
 	return nil
 }
@@ -283,8 +310,8 @@ func TestHandleBlinkerRequestOff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleBlinkerRequest failed: %v", err)
 	}
-	if system.blinkerState != BlinkerOff {
-		t.Errorf("Expected BlinkerOff, got %v", system.blinkerState)
+	if system.getBlinkerState() != BlinkerOff {
+		t.Errorf("Expected BlinkerOff, got %v", system.getBlinkerState())
 	}
 	if len(mockIO.pwmCues) != 1 || mockIO.pwmCues[0] != 9 {
 		t.Errorf("Expected PWM cue 9 (LED_BLINK_NONE), got %v", mockIO.pwmCues)
@@ -301,8 +328,8 @@ func TestHandleBlinkerRequestLeft(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleBlinkerRequest failed: %v", err)
 	}
-	if system.blinkerState != BlinkerLeft {
-		t.Errorf("Expected BlinkerLeft, got %v", system.blinkerState)
+	if system.getBlinkerState() != BlinkerLeft {
+		t.Errorf("Expected BlinkerLeft, got %v", system.getBlinkerState())
 	}
 	if system.blinkerStopChan == nil {
 		t.Error("Expected blinker goroutine to be started")
@@ -316,8 +343,8 @@ func TestHandleBlinkerRequestRight(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleBlinkerRequest failed: %v", err)
 	}
-	if system.blinkerState != BlinkerRight {
-		t.Errorf("Expected BlinkerRight, got %v", system.blinkerState)
+	if system.getBlinkerState() != BlinkerRight {
+		t.Errorf("Expected BlinkerRight, got %v", system.getBlinkerState())
 	}
 }
 
@@ -328,8 +355,8 @@ func TestHandleBlinkerRequestBoth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleBlinkerRequest failed: %v", err)
 	}
-	if system.blinkerState != BlinkerBoth {
-		t.Errorf("Expected BlinkerBoth, got %v", system.blinkerState)
+	if system.getBlinkerState() != BlinkerBoth {
+		t.Errorf("Expected BlinkerBoth, got %v", system.getBlinkerState())
 	}
 }
 

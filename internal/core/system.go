@@ -71,7 +71,7 @@ type VehicleSystem struct {
 	io                         HardwareIO
 	redis                      MessagingClient
 	mu                         sync.RWMutex
-	blinkerState               BlinkerState
+	blinkerState               atomic.Int32      // BlinkerState; written from IO callbacks and the Redis blinker handler
 	blinkerStopChan            chan struct{}
 	blinkerExited              chan struct{}     // closed by runBlinker when it returns; stopBlinker waits on it
 	blinkerStartNanos          atomic.Int64      // UnixNano when blinker goroutine started (0 if inactive)
@@ -128,7 +128,6 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		logger:                  l.WithTag("Vehicle"),
 		io:                      io,
 		redis:                   redis,
-		blinkerState:            BlinkerOff,
 		initialized:             false,
 		keycardTapCount:         0,
 		forceStandbyNoLock:      false,
@@ -1225,10 +1224,21 @@ func (v *VehicleSystem) stopBlinker() {
 	}
 }
 
+// getBlinkerState / setBlinkerState wrap the atomic field: blinker state is
+// written from both the IO callback goroutine (handleBlinkerChange) and the
+// Redis handler goroutine (handleBlinkerRequest).
+func (v *VehicleSystem) getBlinkerState() BlinkerState {
+	return BlinkerState(v.blinkerState.Load())
+}
+
+func (v *VehicleSystem) setBlinkerState(s BlinkerState) {
+	v.blinkerState.Store(int32(s))
+}
+
 func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	// Capture blinker state before stopping so the peer-read fallback below
 	// uses the pre-stop value regardless of what stopBlinker does internally.
-	prevBlinkerState := v.blinkerState
+	prevBlinkerState := v.getBlinkerState()
 
 	// Stop any existing blinker routine
 	v.stopBlinker()
@@ -1306,7 +1316,7 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		}
 		// Only update in-memory state after all hardware and Redis writes
 		// succeed so the fallback read in future events reflects reality.
-		v.blinkerState = BlinkerOff
+		v.setBlinkerState(BlinkerOff)
 		return nil
 	}
 
@@ -1329,11 +1339,11 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	// the fallback read in future events reflects actual committed state.
 	switch switchState {
 	case "both":
-		v.blinkerState = BlinkerBoth
+		v.setBlinkerState(BlinkerBoth)
 	case "right":
-		v.blinkerState = BlinkerRight
+		v.setBlinkerState(BlinkerRight)
 	case "left":
-		v.blinkerState = BlinkerLeft
+		v.setBlinkerState(BlinkerLeft)
 	}
 
 	// Start blinker routine. runBlinker captures blinker:start_nanos itself
