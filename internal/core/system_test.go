@@ -196,8 +196,22 @@ func (m *mockHardwareIO) ReadDigitalInputDirect(channel string) (bool, error) {
 }
 
 func (m *mockHardwareIO) WriteDigitalOutput(channel string, value bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.digitalOutputs[channel] = value
 	return nil
+}
+
+func (m *mockHardwareIO) getDigitalOutput(channel string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.digitalOutputs[channel]
+}
+
+func (m *mockHardwareIO) setDigitalOutput(channel string, value bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.digitalOutputs[channel] = value
 }
 
 func (m *mockHardwareIO) SetInitialValue(name string, value bool) {
@@ -283,20 +297,20 @@ func TestHandleHornRequestOn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleHornRequest failed: %v", err)
 	}
-	if !mockIO.digitalOutputs["horn"] {
+	if !mockIO.getDigitalOutput("horn") {
 		t.Error("Expected horn to be on")
 	}
 }
 
 func TestHandleHornRequestOff(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
-	mockIO.digitalOutputs["horn"] = true
+	mockIO.setDigitalOutput("horn", true)
 
 	err := system.handleHornRequest(false)
 	if err != nil {
 		t.Fatalf("handleHornRequest failed: %v", err)
 	}
-	if mockIO.digitalOutputs["horn"] {
+	if mockIO.getDigitalOutput("horn") {
 		t.Error("Expected horn to be off")
 	}
 }
@@ -603,7 +617,7 @@ func TestHardwareIODigitalOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteDigitalOutput failed: %v", err)
 	}
-	if !mockIO.digitalOutputs["test_pin"] {
+	if !mockIO.getDigitalOutput("test_pin") {
 		t.Error("Digital output not set")
 	}
 }
@@ -681,9 +695,9 @@ func TestEnterReadyToDrive_EngineBrakeDisabled(t *testing.T) {
 	}
 
 	// CRITICAL: engine_brake should be FALSE in ready-to-drive (throttle enabled)
-	if mockIO.digitalOutputs["engine_brake"] != false {
+	if mockIO.getDigitalOutput("engine_brake") != false {
 		t.Errorf("Engine brake should be FALSE (disabled) in ReadyToDrive with no brakes pressed, got %v",
-			mockIO.digitalOutputs["engine_brake"])
+			mockIO.getDigitalOutput("engine_brake"))
 	}
 }
 
@@ -715,9 +729,9 @@ func TestEnterReadyToDrive_EngineBrakeFollowsBrakes(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// engine_brake should be TRUE when brake lever is pressed
-	if mockIO.digitalOutputs["engine_brake"] != true {
+	if mockIO.getDigitalOutput("engine_brake") != true {
 		t.Errorf("Engine brake should be TRUE when brake lever is pressed in ReadyToDrive, got %v",
-			mockIO.digitalOutputs["engine_brake"])
+			mockIO.getDigitalOutput("engine_brake"))
 	}
 }
 
@@ -757,9 +771,9 @@ func TestEnterParked_EngineBrakeEnabled(t *testing.T) {
 	}
 
 	// CRITICAL: engine_brake should be TRUE in parked (throttle disabled)
-	if mockIO.digitalOutputs["engine_brake"] != true {
+	if mockIO.getDigitalOutput("engine_brake") != true {
 		t.Errorf("Engine brake should be TRUE (enabled) in Parked state, got %v",
-			mockIO.digitalOutputs["engine_brake"])
+			mockIO.getDigitalOutput("engine_brake"))
 	}
 }
 
@@ -792,8 +806,8 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	system.machine.SetState(fsm.StateParked)
 	time.Sleep(50 * time.Millisecond)
 
-	if mockIO.digitalOutputs["engine_brake"] != true {
-		t.Errorf("Step 1: Engine brake should be TRUE in Parked, got %v", mockIO.digitalOutputs["engine_brake"])
+	if mockIO.getDigitalOutput("engine_brake") != true {
+		t.Errorf("Step 1: Engine brake should be TRUE in Parked, got %v", mockIO.getDigitalOutput("engine_brake"))
 	}
 
 	// Now transition to ReadyToDrive
@@ -809,9 +823,9 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	}
 
 	// CRITICAL CHECK: This was the bug - engine_brake ended up TRUE instead of FALSE
-	if mockIO.digitalOutputs["engine_brake"] != false {
+	if mockIO.getDigitalOutput("engine_brake") != false {
 		t.Errorf("Step 2: Engine brake should be FALSE in ReadyToDrive (no brakes pressed), got %v",
-			mockIO.digitalOutputs["engine_brake"])
+			mockIO.getDigitalOutput("engine_brake"))
 	}
 
 	// Now go back to Parked
@@ -827,9 +841,9 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	}
 
 	// CRITICAL CHECK: This was the bug - engine_brake ended up FALSE instead of TRUE
-	if mockIO.digitalOutputs["engine_brake"] != true {
+	if mockIO.getDigitalOutput("engine_brake") != true {
 		t.Errorf("Step 3: Engine brake should be TRUE in Parked, got %v",
-			mockIO.digitalOutputs["engine_brake"])
+			mockIO.getDigitalOutput("engine_brake"))
 	}
 }
 
@@ -981,7 +995,7 @@ func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
 	system.initialized = true
 
 	// Set engine power on initially
-	mockIO.digitalOutputs["engine_power"] = true
+	mockIO.setDigitalOutput("engine_power", true)
 
 	// Trigger shutdown via lock event
 	system.machine.Send(librefsm.Event{ID: fsm.EvLock})
@@ -992,9 +1006,9 @@ func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
 	}
 
 	// Engine power should be turned off during shutdown
-	if mockIO.digitalOutputs["engine_power"] != false {
+	if mockIO.getDigitalOutput("engine_power") != false {
 		t.Errorf("Engine power should be FALSE during shutdown, got %v",
-			mockIO.digitalOutputs["engine_power"])
+			mockIO.getDigitalOutput("engine_power"))
 	}
 }
 
