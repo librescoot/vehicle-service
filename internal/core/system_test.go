@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -168,6 +169,7 @@ type mockHardwareIO struct {
 	mu             sync.Mutex // guards recorded calls; runBlinker plays cues from its own goroutine
 	digitalOutputs map[string]bool
 	digitalInputs  map[string]bool
+	inputErrs      map[string]error // per-channel ReadDigitalInput failures
 	initialValues  map[string]bool
 	inputCallbacks map[string]hardware.InputCallback
 	pwmCues        []int
@@ -188,6 +190,9 @@ func (m *mockHardwareIO) Initialize() error { return nil }
 func (m *mockHardwareIO) Cleanup()          {}
 
 func (m *mockHardwareIO) ReadDigitalInput(channel string) (bool, error) {
+	if err := m.inputErrs[channel]; err != nil {
+		return false, err
+	}
 	return m.digitalInputs[channel], nil
 }
 
@@ -2112,5 +2117,142 @@ func TestBleCallbackWired(t *testing.T) {
 	// The wired callback must route into the BLE edge handler without error.
 	if err := mockRedis.callbacks.BleCallback("connected"); err != nil {
 		t.Fatalf("BleCallback returned error: %v", err)
+	}
+}
+
+// ===== Blinker Switch (GPIO) Tests =====
+
+func TestHandleBlinkerChangeLeftOn(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.digitalInputs["blinker_left"] = true
+	if err := system.handleBlinkerChange("blinker_left", true); err != nil {
+		t.Fatalf("handleBlinkerChange failed: %v", err)
+	}
+	defer system.stopBlinker()
+
+	if system.getBlinkerState() != BlinkerLeft {
+		t.Errorf("Expected BlinkerLeft, got %v", system.getBlinkerState())
+	}
+	if len(mockRedis.setBlinkerSwitches) != 1 || mockRedis.setBlinkerSwitches[0] != "left" {
+		t.Errorf("Expected switch 'left' published, got %v", mockRedis.setBlinkerSwitches)
+	}
+	if len(mockRedis.publishedButtonEvents) != 1 || mockRedis.publishedButtonEvents[0] != "blinker:left:on" {
+		t.Errorf("Expected blinker:left:on event, got %v", mockRedis.publishedButtonEvents)
+	}
+}
+
+func TestHandleBlinkerChangeHazardBothOn(t *testing.T) {
+	// Hazard button: both switch inputs go active. The second event's handler
+	// sees the first switch already active in the input cache.
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.digitalInputs["blinker_left"] = true
+	mockIO.digitalInputs["blinker_right"] = true
+	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
+		t.Fatalf("handleBlinkerChange failed: %v", err)
+	}
+	defer system.stopBlinker()
+
+	if system.getBlinkerState() != BlinkerBoth {
+		t.Errorf("Expected BlinkerBoth, got %v", system.getBlinkerState())
+	}
+	if len(mockRedis.setBlinkerSwitches) != 1 || mockRedis.setBlinkerSwitches[0] != "both" {
+		t.Errorf("Expected switch 'both' published, got %v", mockRedis.setBlinkerSwitches)
+	}
+	if len(mockRedis.publishedButtonEvents) != 1 || mockRedis.publishedButtonEvents[0] != "blinker:right:on" {
+		t.Errorf("Expected blinker:right:on event, got %v", mockRedis.publishedButtonEvents)
+	}
+}
+
+func TestHandleBlinkerChangeHazardReleaseOneSide(t *testing.T) {
+	// Releasing one side of a hazard pair transitions both -> right, and the
+	// PUBSUB event must carry the released edge, not the combined state.
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.digitalInputs["blinker_left"] = true
+	mockIO.digitalInputs["blinker_right"] = true
+	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
+		t.Fatalf("hazard setup failed: %v", err)
+	}
+
+	mockIO.digitalInputs["blinker_left"] = false
+	if err := system.handleBlinkerChange("blinker_left", false); err != nil {
+		t.Fatalf("handleBlinkerChange failed: %v", err)
+	}
+	defer system.stopBlinker()
+
+	if system.getBlinkerState() != BlinkerRight {
+		t.Errorf("Expected BlinkerRight after releasing left, got %v", system.getBlinkerState())
+	}
+	if n := len(mockRedis.setBlinkerSwitches); n != 2 || mockRedis.setBlinkerSwitches[1] != "right" {
+		t.Errorf("Expected switch 'right' published, got %v", mockRedis.setBlinkerSwitches)
+	}
+	if n := len(mockRedis.publishedButtonEvents); n != 2 || mockRedis.publishedButtonEvents[1] != "blinker:left:off" {
+		t.Errorf("Expected blinker:left:off event, got %v", mockRedis.publishedButtonEvents)
+	}
+}
+
+func TestHandleBlinkerChangeAllOff(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.digitalInputs["blinker_right"] = true
+	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+
+	mockIO.digitalInputs["blinker_right"] = false
+	if err := system.handleBlinkerChange("blinker_right", false); err != nil {
+		t.Fatalf("handleBlinkerChange failed: %v", err)
+	}
+
+	if system.getBlinkerState() != BlinkerOff {
+		t.Errorf("Expected BlinkerOff, got %v", system.getBlinkerState())
+	}
+	last := len(mockRedis.setBlinkerSwitches) - 1
+	if mockRedis.setBlinkerSwitches[last] != "off" {
+		t.Errorf("Expected switch 'off' published, got %v", mockRedis.setBlinkerSwitches)
+	}
+	if got := mockRedis.publishedButtonEvents[len(mockRedis.publishedButtonEvents)-1]; got != "blinker:right:off" {
+		t.Errorf("Expected blinker:right:off event, got %v", got)
+	}
+	foundOffCue := false
+	for _, cue := range mockIO.pwmCues {
+		if cue == 9 { // LED_BLINK_NONE
+			foundOffCue = true
+		}
+	}
+	if !foundOffCue {
+		t.Errorf("Expected PWM cue 9 (LED_BLINK_NONE) played, got %v", mockIO.pwmCues)
+	}
+}
+
+func TestHandleBlinkerChangePeerReadErrorFallsBackToLastState(t *testing.T) {
+	// If the peer switch can't be read, the handler must fall back to the
+	// last known blinker state instead of assuming the peer is inactive.
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.digitalInputs["blinker_left"] = true
+	if err := system.handleBlinkerChange("blinker_left", true); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+
+	mockIO.inputErrs = map[string]error{"blinker_left": fmt.Errorf("ioctl failed")}
+	mockIO.digitalInputs["blinker_right"] = true
+	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
+		t.Fatalf("handleBlinkerChange failed: %v", err)
+	}
+	defer system.stopBlinker()
+
+	if system.getBlinkerState() != BlinkerBoth {
+		t.Errorf("Expected BlinkerBoth via fallback (left was last known active), got %v", system.getBlinkerState())
+	}
+}
+
+func TestHandleBlinkerChangeUnexpectedChannel(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+
+	if err := system.handleBlinkerChange("horn", true); err == nil {
+		t.Error("Expected error for unexpected channel")
 	}
 }

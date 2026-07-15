@@ -65,33 +65,33 @@ const (
 const minLockOnDisconnectSeconds = 5
 
 type VehicleSystem struct {
-	state                      types.SystemState
-	dashboardReady             bool
-	logger                     *logger.Logger
-	io                         HardwareIO
-	redis                      MessagingClient
-	mu                         sync.RWMutex
-	blinkerState               atomic.Int32      // BlinkerState; written from IO callbacks and the Redis blinker handler
-	blinkerStopChan            chan struct{}
-	blinkerExited              chan struct{}     // closed by runBlinker when it returns; stopBlinker waits on it
-	blinkerStartNanos          atomic.Int64      // UnixNano when blinker goroutine started (0 if inactive)
-	blinkerCueIndex            atomic.Int32      // Currently playing blinker cue index (-1 if none)
-	menuOpen                   atomic.Bool       // True while scootui-qt reports its menu is open; suppresses brake-light LED cues
-	dbcPoweroffSent            atomic.Bool       // True once EnterShuttingDown published dbc:command poweroff; cleared on EnterShuttingDown entry and EnterStandby
-	pendingUnlock              atomic.Bool       // True when an unlock arrived during a committed shutdown; replayed from EnterStandby
-	ledCurves                  *led.CurveLibrary // LED fade/cue metadata for timing
-	initialized                bool
-	handlebarUnlocked          bool          // Track if handlebar has been unlocked in this power cycle
-	handlebarLatchedLocked     bool          // Last commanded/confirmed lock state, immune to spurious sensor edges
-	handlebarLatchInit         bool          // True once latch has been seeded from sensor or actuation
-	handlebarTimer             *time.Timer   // Timer for handlebar position window
-	handlebarDone              chan struct{} // Done channel for handlebar lock goroutine
-	handlebarUnlockDone        chan struct{} // Done channel for handlebar unlock goroutine
-	readyToDriveEntryTime      time.Time     // Track when we entered ready-to-drive state for park debounce
-	kickstandDebounceTimer     *time.Timer   // Deferred kickstand-down check after debounce window
-	keycardTapCount            int
-	lastKeycardTapTime         time.Time
-	forceStandbyNoLock         bool
+	state                  types.SystemState
+	dashboardReady         bool
+	logger                 *logger.Logger
+	io                     HardwareIO
+	redis                  MessagingClient
+	mu                     sync.RWMutex
+	blinkerState           atomic.Int32 // BlinkerState; written from IO callbacks and the Redis blinker handler
+	blinkerStopChan        chan struct{}
+	blinkerExited          chan struct{}     // closed by runBlinker when it returns; stopBlinker waits on it
+	blinkerStartNanos      atomic.Int64      // UnixNano when blinker goroutine started (0 if inactive)
+	blinkerCueIndex        atomic.Int32      // Currently playing blinker cue index (-1 if none)
+	menuOpen               atomic.Bool       // True while scootui-qt reports its menu is open; suppresses brake-light LED cues
+	dbcPoweroffSent        atomic.Bool       // True once EnterShuttingDown published dbc:command poweroff; cleared on EnterShuttingDown entry and EnterStandby
+	pendingUnlock          atomic.Bool       // True when an unlock arrived during a committed shutdown; replayed from EnterStandby
+	ledCurves              *led.CurveLibrary // LED fade/cue metadata for timing
+	initialized            bool
+	handlebarUnlocked      bool          // Track if handlebar has been unlocked in this power cycle
+	handlebarLatchedLocked bool          // Last commanded/confirmed lock state, immune to spurious sensor edges
+	handlebarLatchInit     bool          // True once latch has been seeded from sensor or actuation
+	handlebarTimer         *time.Timer   // Timer for handlebar position window
+	handlebarDone          chan struct{} // Done channel for handlebar lock goroutine
+	handlebarUnlockDone    chan struct{} // Done channel for handlebar unlock goroutine
+	readyToDriveEntryTime  time.Time     // Track when we entered ready-to-drive state for park debounce
+	kickstandDebounceTimer *time.Timer   // Deferred kickstand-down check after debounce window
+	keycardTapCount        int
+	lastKeycardTapTime     time.Time
+	forceStandbyNoLock     bool
 	// handlebarUnlockedOverride is set by the scooter.handlebar-unlocked
 	// setting (service mode). While true, auto re-lock on standby/shutdown is
 	// suppressed and the latch is held released. Guarded by mu.
