@@ -49,7 +49,6 @@ type RedisClient struct {
 	systemPub    *ipc.HashPublisher
 	otaPub       *ipc.HashPublisher
 	dashboardPub *ipc.HashPublisher
-	buttonsPub   *ipc.HashPublisher
 
 	// Watchers
 	vehicleWatcher      *ipc.HashWatcher
@@ -94,7 +93,6 @@ func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks
 	r.systemPub = client.NewHashPublisher("system")
 	r.otaPub = client.NewHashPublisher("ota")
 	r.dashboardPub = client.NewHashPublisher("dashboard")
-	r.buttonsPub = client.NewHashPublisher("buttons")
 
 	// Initialize fault handling
 	r.faultSet = client.NewFaultSet("vehicle:fault", "vehicle", "fault")
@@ -514,9 +512,9 @@ func (r *RedisClient) SetHornButton(isPressed bool) error {
 		state = "on"
 	}
 
-	// Note: Using vehiclePub here but it publishes to "buttons" channel for these button events
-	// We need a separate publisher for the buttons hash
-	if err := r.buttonsPub.Set(fmt.Sprintf("horn:%s", state), "1"); err != nil {
+	// The edge event on the "buttons" channel is published by
+	// PublishButtonEvent; this only owns the level field in the vehicle hash.
+	if err := r.vehiclePub.Set("horn:button", state); err != nil {
 		r.logger.Warnf("Failed to set horn button state: %v", err)
 		return err
 	}
@@ -531,8 +529,9 @@ func (r *RedisClient) SetSeatboxButton(isPressed bool) error {
 		state = "on"
 	}
 
-	// Note: Using buttonsPub here for button event publishing
-	if err := r.buttonsPub.Set(fmt.Sprintf("seatbox:%s", state), "1"); err != nil {
+	// The edge event on the "buttons" channel is published by
+	// PublishButtonEvent; this only owns the level field in the vehicle hash.
+	if err := r.vehiclePub.Set("seatbox:button", state); err != nil {
 		r.logger.Warnf("Failed to set seatbox button state: %v", err)
 		return err
 	}
