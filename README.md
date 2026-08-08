@@ -16,6 +16,7 @@ Part of the [Librescoot](https://librescoot.org/) open-source platform.
 - Redis-based messaging system for component communication
 - Safety state transitions
 - Dashboard communication interface
+- Fault reporting to `vehicle:fault` and `events:faults`
 
 ## Dependencies
 
@@ -39,6 +40,62 @@ The service is built around a core `VehicleSystem` that manages:
 - **Messaging**: Handles Redis-based communication between vehicle components
 - **LED Control**: Manages vehicle lighting systems
 - **State Management**: Ensures safe state transitions and vehicle operation
+
+## Fault Reporting
+
+Faults are reported under the `vehicle` group: the code goes into the
+`vehicle:fault` set, an entry with the description lands in `events:faults`, and
+a notification is published on the `vehicle` channel. Raising and clearing are
+idempotent and run as one server-side script, so the set and the stream cannot
+drift. A cleared fault appears in the stream with a negative code.
+
+The codes are a contract once released. Numbers are never reused, and the list
+is append only. Codes with no raise site yet are reserved so a later change
+cannot claim them.
+
+| Code | Meaning | Raised |
+|---|---|---|
+| 1 | Steering lock retries exhausted, sensor still reads unlocked | reserved |
+| 2 | Steering unlock failed | reserved |
+| 3 | `engine_power` output write failed | yes |
+| 4 | `dashboard_power` output write failed | yes |
+| 5 | `engine_brake` output write failed | yes |
+| 6 | `seatbox_lock` output write failed | reserved |
+| 10 | Input event device unreadable | reserved |
+| 20 | Saved state could not be restored, vehicle forced to stand-by | yes |
+
+Codes 3, 4 and 5 clear on the next successful write to the same channel, which
+happens on every state transition, and for `engine_brake` on every brake lever
+edge. Code 20 stands for the rest of the power session and is cleared by the
+startup reconcile on the next boot, because the vehicle is not in the state it
+was left in until then.
+
+Every owned code is cleared once at startup, right after the GPIO lines have
+been re-requested: a process that just started has no evidence of a standing
+failure, and anything genuinely broken re-raises within one state transition.
+
+The description reaches the stream and is rendered verbatim by the dashboard at
+critical severity, with no per-code lookup table. It names the specific failure
+and carries the underlying error. The first raise of a code wins the
+description, since raising an already-active code writes nothing.
+
+## Boot State Restore
+
+`vehicle[state]` is read back at startup and the FSM is put into it. Only known,
+resumable states are accepted; an unrecognised string or `updating` (which has
+no transition in or out) is refused, the vehicle is left in stand-by with the
+engine brake engaged and the ECU dark, the steering lock is armed if the sensor
+reads unlocked, and fault 20 is raised.
+
+`vehicle:restore-attempt` records the state a restore is entering and is deleted
+once the restore has run to a conclusion. Finding it on the next boot means the
+previous attempt never finished, most likely because the process died inside an
+entry action, so that state is refused rather than tried again. The key carries
+a 60s TTL and is process bookkeeping, not a published surface.
+
+A failed entry action is never fatal. State machine entry actions are side
+effects: the state is already committed when they run, and only a guard can stop
+a transition.
 
 ## Building and Running
 
