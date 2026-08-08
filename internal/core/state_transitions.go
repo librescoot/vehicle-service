@@ -36,9 +36,13 @@ func (v *VehicleSystem) cancelHandlebarUnlock() {
 	v.mu.Unlock()
 }
 
-// unlockHandlebarIfNeeded checks if the handlebar needs unlocking and unlocks it
-// Also cancels any ongoing handlebar locking attempt
-func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
+// unlockHandlebarIfNeeded checks if the handlebar needs unlocking and unlocks it.
+// Also cancels any ongoing handlebar locking attempt.
+//
+// It reports nothing: the one thing that can fail here is the sensor read, which
+// it logs and works around. Having no error return is what keeps callers from
+// growing a check that can never fire.
+func (v *VehicleSystem) unlockHandlebarIfNeeded() {
 	v.cancelHandlebarLock()
 
 	// Read the actual lock sensor state from hardware to avoid acting on
@@ -59,7 +63,6 @@ func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
 	if !unlocked {
 		v.unlockHandlebar()
 	}
-	return nil
 }
 
 // lockHandlebar initiates handlebar locking with a handlebarLockWindow

@@ -2018,6 +2018,121 @@ func TestClearOwnedFaults(t *testing.T) {
 	}
 }
 
+// ===== Entry Action Semantics Tests =====
+
+// The interlock, and the single most important assertion in the suite: without
+// a confirmed engine brake, the ECU must not come up.
+func TestEnterParked_BrakeFailureLeavesEnginePowerLow(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.setDigitalOutput("engine_power", true)
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Error("a failed engine brake write must leave engine power low")
+	}
+	if !faultActive(mockRedis, FaultEngineBrakeOutput) {
+		t.Error("expected the engine brake output fault to be raised")
+	}
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked, got %v", got)
+	}
+}
+
+// A dark dashboard is not a reason to skip the interlock and the ECU power-up.
+func TestEnterParked_DashboardFailureStillRunsInterlock(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if !mockIO.getDigitalOutput("engine_brake") {
+		t.Error("the engine brake must still be engaged after a failed dashboard write")
+	}
+	if !mockIO.getDigitalOutput("engine_power") {
+		t.Error("the ECU must still be powered after a failed dashboard write")
+	}
+	if !faultActive(mockRedis, FaultDashboardPowerOutput) {
+		t.Error("expected the dashboard power output fault to be raised")
+	}
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked, got %v", got)
+	}
+}
+
+// The rollback that could not work is gone: entering Parked must never leave
+// the dashboard dark on a scooter that reports itself parked.
+func TestEnterParked_NoDashboardRollback(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if !mockIO.getDigitalOutput("dashboard_power") {
+		t.Error("a failed engine brake write must not tear the dashboard back down")
+	}
+}
+
+// A dashboard power failure entering ready-to-drive keeps the engine power cut
+// and leaves drive mode honestly, rather than sitting in it with a live motor
+// and no rider-visible state.
+func TestEnterReadyToDrive_DashboardFailureLeavesDriveMode(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.digitalInputs["kickstand"] = false
+	mockIO.digitalInputs["handlebar_lock_sensor"] = true
+	system.dashboardReady = true
+	system.initialized = true
+	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateReadyToDrive)
+
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Error("the engine power cut must survive: it compensates this action's own side effect")
+	}
+	if !faultActive(mockRedis, FaultDashboardPowerOutput) {
+		t.Error("expected the dashboard power output fault to be raised")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if system.machine.CurrentState() == fsm.StateParked {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected the machine to fall back to StateParked, got %v", got)
+	}
+	if !mockIO.getDigitalOutput("engine_brake") {
+		t.Error("the engine brake must be engaged once the machine reaches Parked")
+	}
+}
+
+// A GPIO failure entering drive mode must not stop the transition. Guards
+// decide whether a transition happens; entry actions are side effects.
+func TestEnterReadyToDrive_EnginePowerFailureStillEntersDriveMode(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.digitalInputs["kickstand"] = false
+	mockIO.digitalInputs["handlebar_lock_sensor"] = true
+	mockIO.digitalInputs["brake_left"] = true
+	system.dashboardReady = true
+	mockIO.failOutput("engine_power", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateReadyToDrive)
+
+	if got := system.machine.CurrentState(); got != fsm.StateReadyToDrive {
+		t.Errorf("expected StateReadyToDrive, got %v", got)
+	}
+	if !faultActive(mockRedis, FaultEnginePowerOutput) {
+		t.Error("expected the engine power output fault to be raised")
+	}
+	// The work below the failed write still ran.
+	if !mockIO.getDigitalOutput("engine_brake") {
+		t.Error("the engine brake write must still follow the levers after a failed power write")
+	}
+}
+
 // ===== Boot State Restore Tests =====
 
 // restoreTestSystem brings up a system with the FSM started and the inputs a

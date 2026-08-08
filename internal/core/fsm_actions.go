@@ -284,9 +284,7 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 	v.readyToDriveEntryTime = time.Now()
 	v.mu.Unlock()
 
-	if err := v.unlockHandlebarIfNeeded(); err != nil {
-		return err
-	}
+	v.unlockHandlebarIfNeeded()
 
 	// If handlebar is still locked after unlock attempt, the user forced RTD
 	// via the three-button override — cancel the unlock loop.
@@ -303,29 +301,53 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 		v.logger.Warnf("Failed to enable backlight: %v", err)
 	}
 
+	// The ECU got no power, which continuing does not make worse. The machine is
+	// in ready-to-drive either way, and the engine brake, the LED cue and the
+	// brake resync below all still need to run. writeOutput has raised the fault.
 	if err := v.setPower("engine_power", true); err != nil {
 		v.logger.Errorf("%v", err)
-		return err
 	}
 
 	if err := v.setPower("dashboard_power", true); err != nil {
 		v.logger.Errorf("%v", err)
-		// Roll back engine power to avoid inconsistent hardware state
-		if rbErr := v.setPower("engine_power", false); rbErr != nil {
-			v.logger.Errorf("Rollback failed: %v", rbErr)
+
+		// Cutting engine power here is not a rollback of the transition, it is
+		// compensation for the side effect this same function performed four
+		// lines up. It buys the interval between now and the engine brake being
+		// engaged in Parked. Do not delete it: continuing without it leaves a
+		// powered ECU, no dashboard, and the engine brake written from the
+		// levers below, meaning released whenever the rider is not squeezing.
+		if err := v.setPower("engine_power", false); err != nil {
+			v.logger.Errorf("%v", err)
 		}
-		return err
+
+		// Leave ready-to-drive honestly rather than sitting in it with no
+		// dashboard. The transition exists for exactly this and is unguarded.
+		// Delivered after the machine has already left ready-to-drive it finds
+		// no transition and is dropped, which is harmless.
+		c.Send(librefsm.Event{ID: fsm.EvDashboardNotReady})
+
+		// Returning skips the rest on purpose. Everything below describes a
+		// vehicle that is about to leave ready-to-drive, and the engine brake
+		// write in particular is the one that would release the brake. Not
+		// writing it leaves the brake where it was, which outside drive mode is
+		// engaged.
+		//
+		// dashboardReady stays as it is: this was a GPIO write failure on the
+		// power line, and the dashboard may well still be up. Clearing the flag
+		// would fabricate sensor state.
+		return nil
 	}
 
-	// Check current brake state and set engine brake pin accordingly
+	// Check current brake state and set engine brake pin accordingly. A failed
+	// read can only mean an unknown channel name, so carry on with the false,
+	// false it returns rather than skipping the write and the LED cue.
 	brakeLeft, brakeRight, err := v.readBrakeStates()
 	if err != nil {
 		v.logger.Errorf("%v during transition", err)
-		return err
 	}
 	if err := v.writeOutput("engine_brake", brakeLeft || brakeRight); err != nil {
 		v.logger.Errorf("Failed to set engine brake during transition: %v", err)
-		return err
 	}
 	v.logger.Debugf("Engine brake set to %v during transition (left: %v, right: %v)", brakeLeft || brakeRight, brakeLeft, brakeRight)
 
@@ -358,37 +380,34 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: EnterParked")
 
-	if err := v.unlockHandlebarIfNeeded(); err != nil {
-		return err
-	}
+	v.unlockHandlebarIfNeeded()
 
 	// Ensure backlight is enabled for user interaction
 	if err := v.redis.SetBacklightEnabled(true); err != nil {
 		v.logger.Warnf("Failed to enable backlight: %v", err)
 	}
 
-	// Always turn on dashboard power when entering parked state
+	// Always turn on dashboard power when entering parked state. A dark
+	// dashboard is not a reason to skip the engine brake and the ECU power-up
+	// below, which is the much larger hole the old early return left.
 	if err := v.setPower("dashboard_power", true); err != nil {
 		v.logger.Errorf("%v", err)
-		return err
 	}
 
-	// Engage engine brake BEFORE powering ECU to prevent movement
+	// Engage the engine brake before powering the ECU so the motor cannot turn
+	// while the controller comes up. Without a confirmed brake there is no such
+	// guarantee, so the ECU is driven dark instead: a powered controller with
+	// the brake in an unknown state is the movement this ordering exists to
+	// prevent. Parked is entered from ready-to-drive, where engine power is
+	// already on and the brake has been following the levers, so skipping the
+	// power-up would not be enough.
 	if err := v.writeOutput("engine_brake", true); err != nil {
 		v.logger.Errorf("Failed to engage engine brake: %v", err)
-		if rbErr := v.setPower("dashboard_power", false); rbErr != nil {
-			v.logger.Errorf("Rollback failed: %v", rbErr)
+		if err := v.setPower("engine_power", false); err != nil {
+			v.logger.Errorf("%v", err)
 		}
-		return err
-	}
-
-	// Keep ECU powered in parked state
-	if err := v.setPower("engine_power", true); err != nil {
+	} else if err := v.setPower("engine_power", true); err != nil {
 		v.logger.Errorf("%v", err)
-		if rbErr := v.setPower("dashboard_power", false); rbErr != nil {
-			v.logger.Errorf("Rollback failed: %v", rbErr)
-		}
-		return err
 	}
 
 	prevState := stateIDToSystemState(c.FromState)
@@ -397,10 +416,12 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 	}
 
 	if prevState == types.StateStandby {
+		// A failed read can only mean an unknown channel name. Carry on with the
+		// false, false it returns rather than skipping the blinker switch
+		// restore below for a condition that cannot occur.
 		brakeLeft, brakeRight, err := v.readBrakeStates()
 		if err != nil {
 			v.logger.Errorf("%v", err)
-			return err
 		}
 		brakesPressed := brakeLeft || brakeRight
 
@@ -674,6 +695,15 @@ func (v *VehicleSystem) EnterAtRest(c *librefsm.Context) error {
 
 // ExitAtRest fires once on exit to a non-parked-family state (Drive,
 // Shutdown, Hibernation, Standby). Cancels the auto-standby timer.
+//
+// Like every other exit action here it returns nil unconditionally, and that
+// has to stay true. executeTransition bails out on an exit error before
+// currentState is reassigned but after the state timers have been cancelled and
+// whatever OnExit bodies it already reached have run, and it never fires the
+// state change callback. Returning the ClearAutoStandbyDeadline error would
+// therefore leave the machine reporting the state it is leaving, with its timers
+// already torn down and no observer told. The error return exists for interface
+// conformance; treat it as required to be nil and log failures inline.
 func (v *VehicleSystem) ExitAtRest(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: ExitAtRest (parent)")
 	if v.machine != nil {
