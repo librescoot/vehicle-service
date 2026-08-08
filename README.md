@@ -61,14 +61,19 @@ cannot claim them.
 | 4 | `dashboard_power` output write failed | yes |
 | 5 | `engine_brake` output write failed | yes |
 | 6 | `seatbox_lock` output write failed | reserved |
+| 7 | Engine controller held unpowered, engine brake not confirmed | yes |
 | 10 | Input event device unreadable | reserved |
 | 20 | Saved state could not be restored, vehicle forced to stand-by | yes |
 
 Codes 3, 4 and 5 clear on the next successful write to the same channel, which
 happens on every state transition, and for `engine_brake` on every brake lever
-edge. Code 20 stands for the rest of the power session and is cleared by the
-startup reconcile on the next boot, because the vehicle is not in the state it
-was left in until then.
+edge. Code 7 clears only when engine power is actually commanded back on, which
+is what its condition depends on: the failed brake write that triggers the
+interlock is retried on every lever edge and code 5 goes with it, while the
+controller stays dark until the vehicle enters a state that powers it. Code 20
+stands for the rest of the power session and is cleared by the startup
+reconcile on the next boot, because the vehicle is not in the state it was left
+in until then.
 
 Every owned code is cleared once at startup, right after the GPIO lines have
 been re-requested: a process that just started has no evidence of a standing
@@ -85,7 +90,9 @@ description, since raising an already-active code writes nothing.
 resumable states are accepted; an unrecognised string or `updating` (which has
 no transition in or out) is refused, the vehicle is left in stand-by with the
 engine brake engaged and the ECU dark, the steering lock is armed if the sensor
-reads unlocked, and fault 20 is raised.
+reads unlocked, and fault 20 is raised. The lock is armed at the end of startup
+rather than at the moment of the refusal, because its positioning window needs
+the handlebar position callback that startup registers.
 
 `vehicle:restore-attempt` records the state a restore is entering and is deleted
 once the restore has run to a conclusion. Finding it on the next boot means the

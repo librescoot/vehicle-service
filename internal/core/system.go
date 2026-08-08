@@ -125,6 +125,12 @@ type VehicleSystem struct {
 	// the EnterHopOn / ExitHopOn pair so we know whether to release on exit.
 	hopOnLockedHandlebar bool
 	autoStandbyDeadline  time.Time // Live auto-standby deadline (set by EnterAtRest, cleared by ExitAtRest)
+
+	// steeringLockPending records that a declined boot restore left the
+	// steering unlocked. It is set during the restore and consumed once, later
+	// in Start(). Both happen on the Start() goroutine before anything else can
+	// observe it, so it needs no lock.
+	steeringLockPending bool
 }
 
 func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *VehicleSystem {
@@ -474,12 +480,6 @@ func (v *VehicleSystem) Start() error {
 	// cannot happen is not a startup failure, see restoreFSMState.
 	v.restoreFSMState(savedState)
 
-	// The state the machine actually ended up in. Everything below that used to
-	// branch on savedState (the value Redis asked for) has to branch on this
-	// instead, or a declined restore gets silently undone a few lines later by
-	// hardware asserted from stale intent.
-	restoredState := stateIDToSystemState(v.getCurrentStateID())
-
 	// Check initial handlebar lock sensor state
 	handlebarLockSensorRaw, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
 	if err != nil {
@@ -569,23 +569,35 @@ func (v *VehicleSystem) Start() error {
 	// only happen on confirmed actuations and on Standby entry.
 	v.resyncHandlebarLatchFromSensor()
 
-	// Now that hardware is initialized, set engine brake for the state the
-	// machine is in. Only drive mode lets the brake follow the physical levers;
-	// every other state keeps it engaged so the motor stays disabled.
-	engineBrake := true
-	if restoredState == types.StateReadyToDrive {
-		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-		if err != nil {
-			v.logger.Errorf("Failed to read brake_left: %v", err)
+	// A declined restore may have left the steering unlocked. Arm the lock here
+	// rather than at the point the restore was declined: the positioning window
+	// installs its own handlebar_position callback, so arming it before the
+	// registration loop above would have that callback overwritten and the
+	// window would expire without ever actuating anything.
+	v.lockSteeringAfterDeclinedRestore()
+
+	// Now that hardware is initialized, engage the engine brake so the motor
+	// stays disabled in every state that is not drive mode.
+	//
+	// The machine is read here, at the point of use, and never from a value
+	// captured earlier in Start(). The event loop runs on its own goroutine, so
+	// the machine can move while the hundreds of lines above register callbacks
+	// and publish sensors: an entry action that queued an event does it without
+	// any outside help, and once the callbacks are registered a physical input
+	// does it too.
+	//
+	// Drive mode is skipped rather than followed, which is what makes this
+	// write safe against that movement in either direction. EnterReadyToDrive
+	// already wrote the brake from the levers, so repeating it here buys
+	// nothing, and a machine that reads as drive mode can be in Parked by the
+	// time the write lands, with EnterParked having just engaged the brake and
+	// powered the ECU. Writing the levers over that releases the brake on a
+	// live controller. Engaging the brake is safe whichever way the machine
+	// moved; releasing it from outside drive mode is not.
+	if v.getCurrentStateID() != fsm.StateReadyToDrive {
+		if err := v.writeOutput("engine_brake", true); err != nil {
+			v.logger.Errorf("Failed to set engine brake: %v", err)
 		}
-		brakeRight, err := v.io.ReadDigitalInput("brake_right")
-		if err != nil {
-			v.logger.Errorf("Failed to read brake_right: %v", err)
-		}
-		engineBrake = brakeLeft || brakeRight
-	}
-	if err := v.writeOutput("engine_brake", engineBrake); err != nil {
-		v.logger.Errorf("Failed to set engine brake: %v", err)
 	}
 
 	// Play LED cues based on restored state
@@ -1692,6 +1704,16 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 		if err := v.redis.SetEnginePower(enabled); err != nil {
 			v.logger.Warnf("Failed to persist engine power state to Redis: %v", err)
 			// Don't return error - hardware state was set successfully
+		}
+
+		// The controller is powered again, so the brake-ordering interlock is
+		// no longer holding it dark. This is the only condition that resolves
+		// FaultEcuHeldUnpowered, which is why it clears here and not from the
+		// engine_brake write that raised the interlock in the first place.
+		if enabled {
+			if err := v.redis.ClearFault(FaultEcuHeldUnpowered); err != nil {
+				v.logger.Errorf("Failed to clear fault %d: %v", FaultEcuHeldUnpowered, err)
+			}
 		}
 	}
 

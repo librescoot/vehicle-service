@@ -36,6 +36,16 @@ const (
 	FaultEngineBrakeOutput = 5
 	// FaultSeatboxLockOutput: the seatbox_lock output write failed.
 	FaultSeatboxLockOutput = 6
+	// FaultEcuHeldUnpowered: the engine brake could not be confirmed, so the
+	// engine controller is being held unpowered by the ordering interlock.
+	//
+	// This is deliberately not the same code as the failed engine_brake write
+	// that caused it. That write is retried on every brake lever edge and its
+	// code clears as soon as one succeeds, while the controller stays dark
+	// until something enters a state that powers it. A code whose clear
+	// condition is not the condition the standing harm depends on reports
+	// "resolved" on a vehicle that is still degraded.
+	FaultEcuHeldUnpowered = 7
 
 	// FaultInputDeviceUnreadable: the gpio-keys event device cannot be read.
 	FaultInputDeviceUnreadable = 10
@@ -54,6 +64,7 @@ var ownedFaultCodes = []int{
 	FaultDashboardPowerOutput,
 	FaultEngineBrakeOutput,
 	FaultSeatboxLockOutput,
+	FaultEcuHeldUnpowered,
 	FaultInputDeviceUnreadable,
 	FaultStateRestoreRefused,
 }

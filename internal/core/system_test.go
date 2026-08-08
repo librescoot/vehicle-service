@@ -1987,6 +1987,63 @@ func TestWriteOutput_EngineBrakeFaultClearsOnBrakeEdge(t *testing.T) {
 	}
 }
 
+// The failed brake write and the dark ECU it causes are separate faults with
+// separate lifetimes. The write is retried on every lever edge; the controller
+// stays unpowered until something enters a state that powers it, so the lever
+// edge that clears code 5 must not take the standing fault with it.
+func TestEnterParked_BrakeFailureRaisesEcuHeldUnpowered(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	system.initialized = true
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if !faultActive(mockRedis, FaultEcuHeldUnpowered) {
+		t.Fatal("expected the held-unpowered fault to be raised")
+	}
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Fatal("expected the interlock to leave engine power cut")
+	}
+
+	mockIO.failOutput("engine_brake", nil)
+	if err := system.handleInputChange("brake_left", true); err != nil {
+		t.Fatalf("brake edge: %v", err)
+	}
+
+	if faultActive(mockRedis, FaultEngineBrakeOutput) {
+		t.Error("expected the brake output fault to clear on the lever edge")
+	}
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Error("nothing on the lever edge path repowers the ECU")
+	}
+	if !faultActive(mockRedis, FaultEcuHeldUnpowered) {
+		t.Error("the held-unpowered fault must stand while the ECU is still dark")
+	}
+}
+
+// The one condition that resolves it: engine power actually back on.
+func TestEnterParked_EcuHeldUnpoweredClearsOnRepower(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	system.initialized = true
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+	if !faultActive(mockRedis, FaultEcuHeldUnpowered) {
+		t.Fatal("expected the held-unpowered fault to be raised")
+	}
+
+	mockIO.failOutput("engine_brake", nil)
+	_ = system.machine.SetState(fsm.StateStandby)
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if !mockIO.getDigitalOutput("engine_power") {
+		t.Fatal("expected the ECU to be powered once the brake write succeeds")
+	}
+	if faultActive(mockRedis, FaultEcuHeldUnpowered) {
+		t.Error("the held-unpowered fault must clear once the ECU is powered")
+	}
+}
+
 // Channels outside the map are not fault reported: a stuck horn is not
 // something a rider or a mechanic acts on through the fault view.
 func TestWriteOutput_UntrackedChannelReportsNothing(t *testing.T) {
@@ -2325,7 +2382,9 @@ func TestRestoreFSMState_UpdatingDeclined(t *testing.T) {
 
 // A declined restore that finds the steering unlocked arms the lock, because
 // Standby was entered from machine.Start() and EnterStandby's from-parked arm
-// never ran.
+// never ran. The restore only records the intent; Start() does the arming once
+// its own handlebar_position callback is registered, otherwise the positioning
+// window's temporary callback would be overwritten and expire against nothing.
 func TestRestoreFSMState_DeclineArmsSteeringLock(t *testing.T) {
 	system, mockIO, _ := restoreTestSystem(t)
 	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
@@ -2334,12 +2393,65 @@ func TestRestoreFSMState_DeclineArmsSteeringLock(t *testing.T) {
 	system.restoreFSMState(types.SystemState("wat"))
 
 	system.mu.RLock()
+	armedTooEarly := system.handlebarDone != nil
+	system.mu.RUnlock()
+	if armedTooEarly {
+		t.Error("the lock must not be armed from inside the restore")
+	}
+	if !system.steeringLockPending {
+		t.Fatal("declined restore with the steering unlocked should mark the lock pending")
+	}
+
+	system.lockSteeringAfterDeclinedRestore()
+
+	system.mu.RLock()
 	armed := system.handlebarDone != nil
 	system.mu.RUnlock()
 	if !armed {
 		t.Error("declined restore with the steering unlocked should arm the lock")
 	}
+	if system.steeringLockPending {
+		t.Error("the pending mark should be consumed by the arming")
+	}
 	system.cancelHandlebarLock()
+}
+
+// A locked steering after a declined restore needs no actuation, and the
+// pending mark must still be consumed so a later call cannot re-arm it.
+func TestRestoreFSMState_DeclineLeavesLockedSteeringAlone(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.digitalInputs["handlebar_lock_sensor"] = false // locked
+	system.cancelHandlebarLock()
+
+	system.restoreFSMState(types.SystemState("wat"))
+	system.lockSteeringAfterDeclinedRestore()
+
+	system.mu.RLock()
+	armed := system.handlebarDone != nil
+	system.mu.RUnlock()
+	if armed {
+		t.Error("a locked steering should not be actuated")
+	}
+	if system.steeringLockPending {
+		t.Error("the pending mark should be consumed even when nothing is actuated")
+	}
+}
+
+// A clean restore never marks the lock pending, so Start()'s call is a no-op.
+func TestRestoreFSMState_CleanRestoreDoesNotArmSteeringLock(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
+	system.cancelHandlebarLock()
+
+	system.restoreFSMState(types.StateParked)
+	system.lockSteeringAfterDeclinedRestore()
+
+	system.mu.RLock()
+	armed := system.handlebarDone != nil
+	system.mu.RUnlock()
+	if armed {
+		t.Error("a clean restore should not arm the steering lock")
+	}
 }
 
 // A shutting-down save is handed to the second restore path in Start(), not

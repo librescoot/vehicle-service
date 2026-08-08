@@ -221,7 +221,7 @@ func (v *VehicleSystem) clearRestoreAttempt() {
 func (v *VehicleSystem) declineRestore(description string) {
 	v.logger.Errorf("Declining state restore: %s", description)
 	v.assertMotorSafeOutputs()
-	v.lockSteeringAfterDeclinedRestore()
+	v.markSteeringLockPending()
 
 	// Raised last, once the machine has settled in Standby and the outputs have
 	// been asserted, so nothing on the way clears it.
@@ -254,11 +254,34 @@ func (v *VehicleSystem) assertMotorSafeOutputs() {
 	}
 }
 
+// markSteeringLockPending notes that a declined restore may have left the
+// steering unlocked. The actuation itself is deferred to
+// lockSteeringAfterDeclinedRestore, which Start() calls once the rest of the
+// boot is out of the way.
+func (v *VehicleSystem) markSteeringLockPending() {
+	v.steeringLockPending = true
+}
+
 // lockSteeringAfterDeclinedRestore engages the steering lock when a declined
 // restore left the machine in Standby with the lock sensor reading unlocked.
 // Standby was entered from machine.Start() with an empty FromState, so
 // EnterStandby's from-parked arm never ran and nothing else will lock it.
+//
+// Start() calls this after it has registered the input callbacks and re-seeded
+// the lock latch, never from inside the restore. lockHandlebar's positioning
+// window works by installing its own temporary handlebar_position callback and
+// waiting a minute for the bars to reach the detent; arming it during the
+// restore means Start()'s own callback registration overwrites that callback a
+// few lines later, the window expires against nothing, and the steering is
+// never actuated on the one path that exists to lock it. Deferring also keeps
+// the lock goroutine, which writes handlebarUnlocked under mu, from running
+// against the unguarded writes to that field earlier in Start().
 func (v *VehicleSystem) lockSteeringAfterDeclinedRestore() {
+	if !v.steeringLockPending {
+		return
+	}
+	v.steeringLockPending = false
+
 	if v.machine.CurrentState() != fsm.StateStandby {
 		return
 	}
@@ -405,6 +428,17 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 		v.logger.Errorf("Failed to engage engine brake: %v", err)
 		if err := v.setPower("engine_power", false); err != nil {
 			v.logger.Errorf("%v", err)
+		}
+
+		// The controller stays dark from here until something enters a state
+		// that powers it, which can be days. The brake write failure raises its
+		// own code, but that one clears on the next lever edge that succeeds,
+		// so without this the vehicle sits parked with a dark ECU and an empty
+		// fault set. setPower clears this code once engine power is actually
+		// back on.
+		desc := fmt.Sprintf("engine controller held unpowered, the engine brake could not be engaged: %v", err)
+		if raiseErr := v.redis.RaiseFault(FaultEcuHeldUnpowered, desc); raiseErr != nil {
+			v.logger.Errorf("Failed to raise fault %d: %v", FaultEcuHeldUnpowered, raiseErr)
 		}
 	} else if err := v.setPower("engine_power", true); err != nil {
 		v.logger.Errorf("%v", err)
