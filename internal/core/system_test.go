@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"sync"
 	"testing"
 	"time"
@@ -170,6 +172,7 @@ type mockHardwareIO struct {
 	digitalOutputs map[string]bool
 	digitalInputs  map[string]bool
 	inputErrs      map[string]error // per-channel ReadDigitalInput failures
+	outputErrs     map[string]error // per-channel WriteDigitalOutput failures
 	initialValues  map[string]bool
 	inputCallbacks map[string]hardware.InputCallback
 	pwmCues        []int
@@ -203,8 +206,27 @@ func (m *mockHardwareIO) ReadDigitalInputDirect(channel string) (bool, error) {
 func (m *mockHardwareIO) WriteDigitalOutput(channel string, value bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.outputErrs[channel]; err != nil {
+		return err
+	}
 	m.digitalOutputs[channel] = value
 	return nil
+}
+
+// failOutput makes subsequent writes to channel fail. Reads and writes of
+// outputErrs share the mutex WriteDigitalOutput already holds, so a test may
+// flip it while the FSM is running.
+func (m *mockHardwareIO) failOutput(channel string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.outputErrs == nil {
+		m.outputErrs = make(map[string]error)
+	}
+	if err == nil {
+		delete(m.outputErrs, channel)
+		return
+	}
+	m.outputErrs[channel] = err
 }
 
 func (m *mockHardwareIO) getDigitalOutput(channel string) bool {
@@ -267,7 +289,9 @@ func (m *mockHardwareIO) SimulateInput(channel string, value bool) error {
 
 // Test helper
 func newTestVehicleSystem() (*VehicleSystem, *mockHardwareIO, *mockMessagingClient) {
-	l := logger.NewLogger(nil, logger.LogLevelError)
+	// A real destination, not nil: at LogLevelError every Errorf call actually
+	// formats and prints, and a nil *log.Logger panics inside it.
+	l := logger.NewLogger(log.New(io.Discard, "", 0), logger.LogLevelError)
 	mockIO := newMockHardwareIO()
 	mockRedis := newMockMessagingClient()
 	system := NewVehicleSystem(mockIO, mockRedis, l)
@@ -1773,9 +1797,7 @@ func TestHopOn_RestoreFromSavedState(t *testing.T) {
 
 	initTestFSM(t, system)
 
-	if err := system.restoreFSMState(types.StateHopOn); err != nil {
-		t.Fatalf("restoreFSMState: %v", err)
-	}
+	system.restoreFSMState(types.StateHopOn)
 
 	if system.machine.CurrentState() != fsm.StateHopOn {
 		t.Errorf("expected StateHopOn after restore, got %v", system.machine.CurrentState())
@@ -1787,6 +1809,126 @@ func TestHopOn_RestoreFromSavedState(t *testing.T) {
 	system.mu.RUnlock()
 	if deadline.IsZero() {
 		t.Errorf("auto-standby timer should be armed after restoring into the at-rest group")
+	}
+}
+
+// ===== Boot State Restore Tests =====
+
+// restoreTestSystem brings up a system with the FSM started and the inputs a
+// boot restore reads, without touching the real Start() path.
+func restoreTestSystem(t *testing.T) (*VehicleSystem, *mockHardwareIO, *mockMessagingClient) {
+	t.Helper()
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.digitalInputs["kickstand"] = true
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	mockIO.digitalInputs["handlebar_position"] = false
+	mockIO.digitalInputs["handlebar_lock_sensor"] = false // locked
+	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	initTestFSM(t, system)
+	return system, mockIO, mockRedis
+}
+
+// A saved state the machine has no state for must never reach SetState, which
+// would hand it a StateID that fails identically on every restart.
+func TestRestoreFSMState_UnknownStateDeclined(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+
+	system.restoreFSMState(types.SystemState("wat"))
+
+	if got := system.machine.CurrentState(); got != fsm.StateStandby {
+		t.Errorf("expected StateStandby after declining an unknown state, got %v", got)
+	}
+	if !mockIO.getDigitalOutput("engine_brake") {
+		t.Error("declined restore must leave the engine brake engaged")
+	}
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Error("declined restore must leave engine power cut")
+	}
+}
+
+// StateUpdating has no transition in or out, so restoring into it would strand
+// the machine for the rest of the power session.
+func TestRestoreFSMState_UpdatingDeclined(t *testing.T) {
+	system, _, _ := restoreTestSystem(t)
+
+	system.restoreFSMState(types.StateUpdating)
+
+	if got := system.machine.CurrentState(); got != fsm.StateStandby {
+		t.Errorf("expected StateStandby after declining updating, got %v", got)
+	}
+}
+
+// A declined restore that finds the steering unlocked arms the lock, because
+// Standby was entered from machine.Start() and EnterStandby's from-parked arm
+// never ran.
+func TestRestoreFSMState_DeclineArmsSteeringLock(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
+	system.cancelHandlebarLock()
+
+	system.restoreFSMState(types.SystemState("wat"))
+
+	system.mu.RLock()
+	armed := system.handlebarDone != nil
+	system.mu.RUnlock()
+	if !armed {
+		t.Error("declined restore with the steering unlocked should arm the lock")
+	}
+	system.cancelHandlebarLock()
+}
+
+// A shutting-down save is handed to the second restore path in Start(), not
+// refused: nothing is asserted and the machine stays where it is.
+func TestRestoreFSMState_ShuttingDownHandedOver(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.setDigitalOutput("engine_power", true)
+
+	system.restoreFSMState(types.StateShuttingDown)
+
+	if got := system.machine.CurrentState(); got != fsm.StateStandby {
+		t.Errorf("expected StateStandby, got %v", got)
+	}
+	if !mockIO.getDigitalOutput("engine_power") {
+		t.Error("handing shutting-down over must not assert the motor-safe outputs")
+	}
+}
+
+// The crash-loop regression. A failing GPIO write inside the entry action used
+// to abort Start(), which main.go turns into a Fatalf, so systemd restarted the
+// service into the same saved state and the same failing write, forever.
+// restoreFSMState must now return normally and leave the machine where the
+// library already committed it.
+func TestRestoreFSMState_EntryActionFailureDoesNotAbort(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
+
+	system.restoreFSMState(types.StateParked)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked after a failed entry action, got %v", got)
+	}
+}
+
+// v0.6.0 fires the state change callback before returning the entry error, so
+// Redis learns about the state the machine is actually in.
+func TestRestoreFSMState_EntryActionFailureStillPublishes(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
+
+	system.restoreFSMState(types.StateParked)
+
+	mockRedis.mu.Lock()
+	published := append([]types.SystemState(nil), mockRedis.publishedStates...)
+	mockRedis.mu.Unlock()
+	found := false
+	for _, s := range published {
+		if s == types.StateParked {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected parked to be published despite the failed entry action, got %v", published)
 	}
 }
 

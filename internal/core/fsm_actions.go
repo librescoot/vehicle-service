@@ -126,20 +126,101 @@ func (v *VehicleSystem) initFSM(ctx context.Context) error {
 	return nil
 }
 
+// restorableStates lists the states a restart may resume into directly.
+// Anything outside the list is refused instead of being handed to SetState:
+// systemStateToStateID passes unrecognised strings straight through, so a
+// typo or a stale value from a future release would become a StateID the
+// machine has never heard of and fail identically on every restart, and
+// StateUpdating has no transition in or out, so resuming into it would
+// strand the machine for the rest of the power session.
+var restorableStates = map[types.SystemState]bool{
+	types.StateStandby:                    true,
+	types.StateParked:                     true,
+	types.StateReadyToDrive:               true,
+	types.StateHopOn:                      true,
+	types.StateHopOnLearning:              true,
+	types.StateWaitingSeatbox:             true,
+	types.StateWaitingHibernation:         true,
+	types.StateWaitingHibernationAdvanced: true,
+	types.StateWaitingHibernationSeatbox:  true,
+	types.StateWaitingHibernationConfirm:  true,
+}
+
 // restoreFSMState restores the FSM to a saved state (must be called after hardware init).
-// Empty savedState means no state was persisted (fresh boot or post-hibernation cold
-// start) — leave the FSM in its initial Standby state. ShuttingDown is also skipped
-// so that a crash mid-shutdown doesn't strand us there; we'd rather fall through to
-// Standby and let the user re-engage the lock cleanly.
-func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) error {
-	if savedState != "" && savedState != types.StateShuttingDown {
-		v.logger.Infof("Restoring FSM to saved state: %s", savedState)
-		if err := v.machine.SetState(systemStateToStateID(savedState)); err != nil {
-			v.logger.Errorf("Failed to restore FSM state: %v", err)
-			return err
-		}
+//
+// It reports nothing to its caller on purpose. A restore failure used to abort
+// Start(), which main.go turns into a Fatalf: systemd would restart the service,
+// read the same state back out of Redis, hit the same failure and die again, on a
+// vehicle that is by definition unlocked and powered up. There is also nothing to
+// abort for, because SetState commits currentState before running the entry action,
+// so the machine is already in the restored state by the time an error comes back.
+func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) {
+	// Nothing persisted: fresh boot or post-hibernation cold start. Stay in the
+	// initial Standby state.
+	if savedState == "" {
+		return
 	}
-	return nil
+
+	// ShuttingDown is not refused, it is handed over: Start() restores it further
+	// down, after the LED cue block, so the shutdown timeout finishes normally.
+	if savedState == types.StateShuttingDown {
+		return
+	}
+
+	if !restorableStates[savedState] {
+		v.declineRestore(savedState, "not a state this vehicle can restore")
+		return
+	}
+
+	v.logger.Infof("Restoring FSM to saved state: %s", savedState)
+	if err := v.machine.SetState(systemStateToStateID(savedState)); err != nil {
+		v.logger.Errorf("Failed to restore FSM state: %v", err)
+		v.assertMotorSafeOutputs()
+	}
+}
+
+// declineRestore refuses a saved state and leaves the machine in Standby.
+// reason names the specific refusal and is logged.
+func (v *VehicleSystem) declineRestore(savedState types.SystemState, reason string) {
+	v.logger.Errorf("Refusing to restore saved state %q: %s, staying in stand-by", savedState, reason)
+	v.assertMotorSafeOutputs()
+	v.lockSteeringAfterDeclinedRestore()
+}
+
+// assertMotorSafeOutputs puts the two outputs that can let the vehicle move into
+// the configuration every non-driving state agrees on. This is not a rollback of
+// anything: a declined restore means the machine sits in Standby while the GPIO
+// initial values were picked from a saved state that may well have been powered,
+// and Standby itself never cuts engine power.
+//
+// Brake before power cut, matching the ordering EnterParked documents.
+func (v *VehicleSystem) assertMotorSafeOutputs() {
+	if err := v.io.WriteDigitalOutput("engine_brake", true); err != nil {
+		v.logger.Errorf("Failed to engage engine brake after declined restore: %v", err)
+	}
+	if err := v.setPower("engine_power", false); err != nil {
+		v.logger.Errorf("Failed to cut engine power after declined restore: %v", err)
+	}
+}
+
+// lockSteeringAfterDeclinedRestore engages the steering lock when a declined
+// restore left the machine in Standby with the lock sensor reading unlocked.
+// Standby was entered from machine.Start() with an empty FromState, so
+// EnterStandby's from-parked arm never ran and nothing else will lock it.
+func (v *VehicleSystem) lockSteeringAfterDeclinedRestore() {
+	if v.machine.CurrentState() != fsm.StateStandby {
+		return
+	}
+	sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+	if err != nil {
+		v.logger.Warnf("Failed to read handlebar lock sensor after declined restore: %v", err)
+		return
+	}
+	if !sensorVal {
+		return
+	}
+	v.logger.Infof("Declined restore left the steering unlocked, arming the lock")
+	v.lockHandlebar(nil)
 }
 
 // === State Entry Actions ===

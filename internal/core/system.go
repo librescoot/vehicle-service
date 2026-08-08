@@ -460,10 +460,15 @@ func (v *VehicleSystem) Start() error {
 		return fmt.Errorf("failed to initialize FSM: %w", err)
 	}
 
-	// Restore saved FSM state now that hardware is initialized
-	if err := v.restoreFSMState(savedState); err != nil {
-		return fmt.Errorf("failed to restore FSM state: %w", err)
-	}
+	// Restore saved FSM state now that hardware is initialized. A restore that
+	// cannot happen is not a startup failure, see restoreFSMState.
+	v.restoreFSMState(savedState)
+
+	// The state the machine actually ended up in. Everything below that used to
+	// branch on savedState (the value Redis asked for) has to branch on this
+	// instead, or a declined restore gets silently undone a few lines later by
+	// hardware asserted from stale intent.
+	restoredState := stateIDToSystemState(v.getCurrentStateID())
 
 	// Check initial handlebar lock sensor state
 	handlebarLockSensorRaw, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
@@ -554,28 +559,23 @@ func (v *VehicleSystem) Start() error {
 	// only happen on confirmed actuations and on Standby entry.
 	v.resyncHandlebarLatchFromSensor()
 
-	// Now that hardware is initialized, set engine brake based on state
-	if savedState != "" && savedState != types.StateShuttingDown {
-		// Apply engine brake based on state
-		var engineBrake bool
-		if savedState == types.StateReadyToDrive {
-			// In drive mode, brake follows physical brake levers
-			brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-			if err != nil {
-				return fmt.Errorf("failed to read brake_left: %w", err)
-			}
-			brakeRight, err := v.io.ReadDigitalInput("brake_right")
-			if err != nil {
-				return fmt.Errorf("failed to read brake_right: %w", err)
-			}
-			engineBrake = brakeLeft || brakeRight
-		} else {
-			// In all other states, brake is always engaged (motor disabled)
-			engineBrake = true
+	// Now that hardware is initialized, set engine brake for the state the
+	// machine is in. Only drive mode lets the brake follow the physical levers;
+	// every other state keeps it engaged so the motor stays disabled.
+	engineBrake := true
+	if restoredState == types.StateReadyToDrive {
+		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
+		if err != nil {
+			v.logger.Errorf("Failed to read brake_left: %v", err)
 		}
-		if err := v.io.WriteDigitalOutput("engine_brake", engineBrake); err != nil {
-			return fmt.Errorf("failed to set engine brake: %w", err)
+		brakeRight, err := v.io.ReadDigitalInput("brake_right")
+		if err != nil {
+			v.logger.Errorf("Failed to read brake_right: %v", err)
 		}
+		engineBrake = brakeLeft || brakeRight
+	}
+	if err := v.io.WriteDigitalOutput("engine_brake", engineBrake); err != nil {
+		v.logger.Errorf("Failed to set engine brake: %v", err)
 	}
 
 	// Play LED cues based on restored state
@@ -583,13 +583,11 @@ func (v *VehicleSystem) Start() error {
 		// Read brake states to determine which LED cue to play
 		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 		if err != nil {
-			v.logger.Infof("Failed to read brake_left: %v", err)
-			return err
+			v.logger.Errorf("Failed to read brake_left: %v", err)
 		}
 		brakeRight, err := v.io.ReadDigitalInput("brake_right")
 		if err != nil {
-			v.logger.Infof("Failed to read brake_right: %v", err)
-			return err
+			v.logger.Errorf("Failed to read brake_right: %v", err)
 		}
 		brakesPressed := brakeLeft || brakeRight
 
