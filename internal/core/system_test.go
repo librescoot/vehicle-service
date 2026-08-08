@@ -18,6 +18,13 @@ import (
 	"vehicle-service/internal/types"
 )
 
+// faultCall records one RaiseFault/ClearFault call.
+type faultCall struct {
+	code        int
+	raised      bool
+	description string
+}
+
 // Mock MessagingClient
 type mockMessagingClient struct {
 	callbacks messaging.Callbacks
@@ -40,6 +47,7 @@ type mockMessagingClient struct {
 	enginePowerSets        []bool
 	restoreAttemptSets     []string
 	restoreAttemptClears   int
+	faultCalls             []faultCall
 
 	// Return values
 	vehicleState      types.SystemState
@@ -189,6 +197,20 @@ func (m *mockMessagingClient) PublishInputEvent(event string) error {
 
 func (m *mockMessagingClient) PublishSeatboxOpened() error {
 	m.publishedSeatboxOpened++
+	return nil
+}
+
+func (m *mockMessagingClient) RaiseFault(code int, description string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.faultCalls = append(m.faultCalls, faultCall{code: code, raised: true, description: description})
+	return nil
+}
+
+func (m *mockMessagingClient) ClearFault(code int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.faultCalls = append(m.faultCalls, faultCall{code: code, raised: false})
 	return nil
 }
 

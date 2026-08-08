@@ -59,8 +59,7 @@ type RedisClient struct {
 	bleWatcher          *ipc.HashWatcher
 
 	// Fault handling
-	faultSet    *ipc.FaultSet
-	faultStream *ipc.StreamPublisher
+	faults *ipc.FaultReporter
 }
 
 func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks) (*RedisClient, error) {
@@ -93,9 +92,11 @@ func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks
 	r.otaPub = client.NewHashPublisher("ota")
 	r.dashboardPub = client.NewHashPublisher("dashboard")
 
-	// Initialize fault handling
-	r.faultSet = client.NewFaultSet("vehicle:fault", "vehicle", "fault")
-	r.faultStream = client.NewStreamPublisher("events:faults", ipc.WithMaxLen(1000))
+	// Initialize fault handling. No options: the defaults already produce the
+	// keys consumers read (vehicle:fault, channel vehicle, payload fault,
+	// events:faults). Restating them would create a second place for the naming
+	// to drift.
+	r.faults = client.NewFaultReporter("vehicle")
 
 	return r, nil
 }
@@ -859,56 +860,26 @@ func (r *RedisClient) PublishMessage(channel, message string) error {
 	return nil
 }
 
-// ReportFaultPresent reports a fault as present to Redis
-func (r *RedisClient) ReportFaultPresent(code int, description string, timestamp int64, info string) error {
-	r.logger.Infof("Reporting fault present: code=%d, description=%s", code, description)
-
-	// Add fault code to active faults set
-	if err := r.faultSet.Add(code); err != nil {
-		r.logger.Infof("Failed to add fault to set: %v", err)
+// RaiseFault marks a fault code active. The description reaches the
+// events:faults stream and is the entire fault UI, so it should name the
+// specific failure and carry the underlying error. Raising a fault that is
+// already active is a no-op server side and emits no stream entry, which also
+// means the first description wins: every one has to stand on its own.
+func (r *RedisClient) RaiseFault(code int, description string) error {
+	if err := r.faults.Raise(code, description); err != nil {
+		r.logger.Errorf("Failed to raise fault %d: %v", code, err)
 		return err
 	}
-
-	// Add fault event to global event stream with metadata
-	eventData := map[string]any{
-		"group":       "vehicle",
-		"code":        fmt.Sprint(code),
-		"description": description,
-		"ts":          fmt.Sprint(timestamp),
-	}
-	if info != "" {
-		eventData["info"] = info
-	}
-	if _, err := r.faultStream.Add(eventData); err != nil {
-		r.logger.Infof("Failed to add fault to stream: %v", err)
-		return err
-	}
-
-	r.logger.Infof("Successfully reported fault %d as present", code)
 	return nil
 }
 
-// ReportFaultAbsent reports a fault as absent (cleared) to Redis
-func (r *RedisClient) ReportFaultAbsent(code int) error {
-	r.logger.Infof("Reporting fault absent: code=%d", code)
-
-	// Remove fault code from active faults set
-	if err := r.faultSet.Remove(code); err != nil {
-		r.logger.Infof("Failed to remove fault from set: %v", err)
+// ClearFault marks a fault code inactive. Clearing a fault that is not active
+// is a no-op.
+func (r *RedisClient) ClearFault(code int) error {
+	if err := r.faults.Clear(code); err != nil {
+		r.logger.Errorf("Failed to clear fault %d: %v", code, err)
 		return err
 	}
-
-	// Add clear event to global event stream (negative code indicates cleared)
-	eventData := map[string]any{
-		"group": "vehicle",
-		"code":  fmt.Sprint(-code), // Negative code indicates fault cleared
-	}
-	if _, err := r.faultStream.Add(eventData); err != nil {
-		r.logger.Infof("Failed to add fault clear to stream: %v", err)
-		return err
-	}
-
-	r.logger.Infof("Successfully reported fault %d as absent", code)
 	return nil
 }
 

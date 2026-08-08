@@ -63,6 +63,10 @@ type MessagingClient interface {
 	PublishInputEvent(event string) error
 	PublishSeatboxOpened() error
 
+	// Faults
+	RaiseFault(code int, description string) error
+	ClearFault(code int) error
+
 	// Commands
 	SendCommand(channel, command string) error
 	PublishMessage(channel, message string) error
