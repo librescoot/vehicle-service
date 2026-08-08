@@ -1,7 +1,6 @@
 package core
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/librescoot/librefsm"
@@ -340,40 +339,6 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 
 	if !unlocked {
 		v.unlockHandlebar()
-	}
-
-	return nil
-}
-
-// updateEngineBrake updates only the engine brake based on current state
-// Used when brake lever state changes but vehicle state hasn't
-func (v *VehicleSystem) updateEngineBrake() error {
-	v.mu.RLock()
-	currentState := v.state
-	v.mu.RUnlock()
-
-	// Read current brake states
-	brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-	if err != nil {
-		return fmt.Errorf("failed to read brake_left: %w", err)
-	}
-	brakeRight, err := v.io.ReadDigitalInput("brake_right")
-	if err != nil {
-		return fmt.Errorf("failed to read brake_right: %w", err)
-	}
-
-	// Engine brake logic:
-	// - In READY_TO_DRIVE: follows brake levers (engaged when either pressed)
-	// - In all other states: always engaged (motor disabled)
-	var engineBrakeEngaged bool
-	if currentState == types.StateReadyToDrive {
-		engineBrakeEngaged = brakeLeft || brakeRight
-	} else {
-		engineBrakeEngaged = true
-	}
-
-	if err := v.io.WriteDigitalOutput("engine_brake", engineBrakeEngaged); err != nil {
-		return fmt.Errorf("failed to set engine brake: %w", err)
 	}
 
 	return nil

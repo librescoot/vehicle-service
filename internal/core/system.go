@@ -901,7 +901,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 	// Publish button event via PUBSUB for immediate response in UI
 	// This happens regardless of vehicle state, letting the UI decide what to do with it
 	var buttonEvent string
-	var shouldPublish bool = true
+	shouldPublish := true
 
 	// Set state string based on value
 	state := "off"
@@ -1701,8 +1701,13 @@ func (v *VehicleSystem) pulseHandlebarLock(lock bool) error {
 		return err
 	}
 	if err := v.io.WriteDigitalOutput("handlebar_lock_open", openVal); err != nil {
-		// Best-effort: deactivate the first output before returning
-		v.io.WriteDigitalOutput("handlebar_lock_close", false)
+		// Best-effort: deactivate the first output before returning. If this
+		// also fails the solenoid coil can stay energized continuously
+		// instead of being pulsed, so log it even though the original error
+		// is still what gets returned.
+		if rbErr := v.io.WriteDigitalOutput("handlebar_lock_close", false); rbErr != nil {
+			v.logger.Errorf("Failed to deactivate handlebar_lock_close after open write failure: %v", rbErr)
+		}
 		return err
 	}
 	time.Sleep(handlebarLockDuration)
@@ -1852,7 +1857,7 @@ func (v *VehicleSystem) Shutdown() {
 	v.mu.Unlock()
 
 	if v.redis != nil {
-		v.redis.Close()
+		_ = v.redis.Close()
 	}
 	if v.io != nil {
 		v.io.Cleanup()

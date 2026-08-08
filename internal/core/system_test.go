@@ -805,10 +805,14 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 
 	// Clear and verify engine_brake is TRUE in parked by re-entering
 	mockIO.digitalOutputs = make(map[string]bool)
-	system.machine.SetState(fsm.StateStandby)
+	if err := system.machine.SetState(fsm.StateStandby); err != nil {
+		t.Fatalf("Failed to set state to Standby: %v", err)
+	}
 	time.Sleep(20 * time.Millisecond)
 	system.dashboardReady = true // Restore after standby clears it
-	system.machine.SetState(fsm.StateParked)
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("Failed to set state to Parked: %v", err)
+	}
 	time.Sleep(50 * time.Millisecond)
 
 	if mockIO.getDigitalOutput("engine_brake") != true {

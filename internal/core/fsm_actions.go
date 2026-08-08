@@ -142,11 +142,6 @@ func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) error {
 	return nil
 }
 
-// sendEvent sends an event to the FSM
-func (v *VehicleSystem) sendEvent(event librefsm.EventID) error {
-	return v.machine.SendSync(librefsm.Event{ID: event})
-}
-
 // === State Entry Actions ===
 
 func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
@@ -285,9 +280,13 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 
 		// Restore blinker if the physical switch is still held
 		if left, err := v.io.ReadDigitalInput("blinker_left"); err == nil && left {
-			v.handleBlinkerChange("blinker_left", true)
+			if err := v.handleBlinkerChange("blinker_left", true); err != nil {
+				v.logger.Warnf("Failed to restore left blinker: %v", err)
+			}
 		} else if right, err := v.io.ReadDigitalInput("blinker_right"); err == nil && right {
-			v.handleBlinkerChange("blinker_right", true)
+			if err := v.handleBlinkerChange("blinker_right", true); err != nil {
+				v.logger.Warnf("Failed to restore right blinker: %v", err)
+			}
 		}
 	}
 

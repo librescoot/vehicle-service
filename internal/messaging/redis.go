@@ -51,7 +51,6 @@ type RedisClient struct {
 	dashboardPub *ipc.HashPublisher
 
 	// Watchers
-	vehicleWatcher      *ipc.HashWatcher
 	dashboardWatcher    *ipc.HashWatcher
 	keycardWatcher      *ipc.HashWatcher
 	settingsWatcher     *ipc.HashWatcher
@@ -161,14 +160,18 @@ func (r *RedisClient) StartListening() error {
 		}
 		return nil
 	})
-	r.dashboardWatcher.Start()
+	if err := r.dashboardWatcher.Start(); err != nil {
+		return fmt.Errorf("failed to start dashboard watcher: %w", err)
+	}
 
 	r.keycardWatcher = r.client.NewHashWatcher("keycard")
 	r.keycardWatcher.OnField("authentication", func(value string) error {
 		r.logger.Infof("Processing keycard authentication")
 		return r.callbacks.KeycardCallback()
 	})
-	r.keycardWatcher.Start()
+	if err := r.keycardWatcher.Start(); err != nil {
+		return fmt.Errorf("failed to start keycard watcher: %w", err)
+	}
 
 	r.settingsWatcher = r.client.NewHashWatcher("settings")
 	r.settingsWatcher.OnAny(func(field, value string) error {
@@ -183,7 +186,9 @@ func (r *RedisClient) StartListening() error {
 	// HGETALL → handlers → buffered messages) picks the seed up regardless of
 	// whether it lands before or after this point — plain Start() would
 	// silently miss any field seeded between the startup reads and here.
-	r.settingsWatcher.StartWithSync()
+	if err := r.settingsWatcher.StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start settings watcher: %w", err)
+	}
 
 	// Watch OTA hash for DBC update activity (feeds the watchdog timer)
 	r.otaWatcher = r.client.NewHashWatcher("ota")
@@ -193,7 +198,9 @@ func (r *RedisClient) StartListening() error {
 		}
 		return nil
 	})
-	r.otaWatcher.Start()
+	if err := r.otaWatcher.Start(); err != nil {
+		return fmt.Errorf("failed to start ota watcher: %w", err)
+	}
 
 	// Watch power-manager state so we can re-read GPIO inputs after resume
 	// from suspend (the kernel may mask edges that occurred while asleep).
@@ -204,7 +211,9 @@ func (r *RedisClient) StartListening() error {
 		}
 		return nil
 	})
-	r.powerManagerWatcher.Start()
+	if err := r.powerManagerWatcher.Start(); err != nil {
+		return fmt.Errorf("failed to start power-manager watcher: %w", err)
+	}
 
 	// Watch BLE link status so vehicle-service can lock on phone disconnect.
 	r.bleWatcher = r.client.NewHashWatcher("ble")
@@ -214,7 +223,9 @@ func (r *RedisClient) StartListening() error {
 		}
 		return nil
 	})
-	r.bleWatcher.Start()
+	if err := r.bleWatcher.Start(); err != nil {
+		return fmt.Errorf("failed to start ble watcher: %w", err)
+	}
 
 	// Start queue command listeners
 	ipc.HandleRequests(r.client, "scooter:seatbox", r.handleSeatboxCommand)

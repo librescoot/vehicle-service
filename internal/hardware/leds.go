@@ -225,7 +225,9 @@ func (l *ImxPwmLed) Init() error {
 		// Configure PWM parameters first
 		if err := l.configurePWM(device); err != nil {
 			l.logger.Printf("Failed to configure PWM for LED %d: %v", i, err)
-			unix.Close(fd)
+			if closeErr := unix.Close(fd); closeErr != nil {
+				l.logger.Printf("Failed to close LED device %s after configuration failure: %v", devPath, closeErr)
+			}
 			continue
 		}
 
@@ -452,8 +454,12 @@ func (l *ImxPwmLed) Cleanup() {
 
 	for i, device := range l.devices {
 		if device != nil {
-			l.setActive(i, false)
-			unix.Close(device.fd)
+			if err := l.setActive(i, false); err != nil {
+				l.logger.Printf("Failed to deactivate LED %d during cleanup: %v", i, err)
+			}
+			if err := unix.Close(device.fd); err != nil {
+				l.logger.Printf("Failed to close LED device %d: %v", i, err)
+			}
 			l.devices[i] = nil
 		}
 	}

@@ -669,8 +669,9 @@ func (io *LinuxHardwareIO) Cleanup() {
 
 	// First close the input file descriptor to interrupt any blocked Read() calls
 	if io.inputFile != nil {
-		io.inputFile.Close()
-		if io.logger != nil {
+		if err := io.inputFile.Close(); err != nil && io.logger != nil {
+			io.logger.Warnf("Failed to close input device file descriptor: %v", err)
+		} else if io.logger != nil {
 			io.logger.Infof("Closed input device file descriptor")
 		}
 	}
@@ -701,15 +702,17 @@ func (io *LinuxHardwareIO) Cleanup() {
 	}
 
 	for name, line := range io.lines {
-		line.Close()
-		if io.logger != nil {
+		if err := line.Close(); err != nil && io.logger != nil {
+			io.logger.Warnf("Failed to close GPIO line for %s: %v", name, err)
+		} else if io.logger != nil {
 			io.logger.Infof("Closed GPIO line for %s", name)
 		}
 	}
 
 	for id, chip := range io.chips {
-		chip.Close()
-		if io.logger != nil {
+		if err := chip.Close(); err != nil && io.logger != nil {
+			io.logger.Warnf("Failed to close GPIO chip %d: %v", id, err)
+		} else if io.logger != nil {
 			io.logger.Infof("Closed GPIO chip %d", id)
 		}
 	}

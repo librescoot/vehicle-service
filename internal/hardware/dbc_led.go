@@ -42,7 +42,7 @@ func NewDbcLed(path string) (*DbcLed, error) {
 		return nil, err
 	}
 	if err := unix.IoctlSetInt(int(f.Fd()), i2cSlaveForce, dbcLedI2CAddr); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("I2C_SLAVE ioctl: %w", err)
 	}
 	return &DbcLed{file: f}, nil
@@ -68,5 +68,5 @@ func (d *DbcLed) Set(color string, brightness uint8) error {
 }
 
 func (d *DbcLed) Close() {
-	d.file.Close()
+	_ = d.file.Close()
 }
