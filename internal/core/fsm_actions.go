@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/librescoot/librefsm"
@@ -167,8 +168,13 @@ func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) {
 		return
 	}
 
+	if savedState == types.StateUpdating {
+		v.declineRestore(fmt.Sprintf("saved state %q cannot be left once entered, forced to stand-by", savedState))
+		return
+	}
+
 	if !restorableStates[savedState] {
-		v.declineRestore(savedState, "not a state this vehicle can restore")
+		v.declineRestore(fmt.Sprintf("saved state %q is not a state this vehicle can restore, forced to stand-by", savedState))
 		return
 	}
 
@@ -183,7 +189,7 @@ func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) {
 		v.logger.Warnf("Failed to read the restore attempt marker: %v", err)
 	} else if attempt == string(savedState) {
 		v.clearRestoreAttempt()
-		v.declineRestore(savedState, "the previous attempt at it was interrupted")
+		v.declineRestore(fmt.Sprintf("restore of saved state %q was already interrupted once, forced to stand-by", savedState))
 		return
 	}
 
@@ -209,11 +215,27 @@ func (v *VehicleSystem) clearRestoreAttempt() {
 }
 
 // declineRestore refuses a saved state and leaves the machine in Standby.
-// reason names the specific refusal and is logged.
-func (v *VehicleSystem) declineRestore(savedState types.SystemState, reason string) {
-	v.logger.Errorf("Refusing to restore saved state %q: %s, staying in stand-by", savedState, reason)
+// description names the specific refusal; it is logged and it is what the rider
+// sees, so it has to read as a statement about the vehicle rather than about
+// this function.
+func (v *VehicleSystem) declineRestore(description string) {
+	v.logger.Errorf("Declining state restore: %s", description)
 	v.assertMotorSafeOutputs()
 	v.lockSteeringAfterDeclinedRestore()
+
+	// Raised last, once the machine has settled in Standby and the outputs have
+	// been asserted, so nothing on the way clears it.
+	//
+	// Nothing clears this within the power session either, and that is the
+	// honest lifetime: the vehicle is not in the state it was left in, and it
+	// will not be until the next boot, where the startup reconcile drops it.
+	// Clearing it on the next successful transition would be worse than
+	// useless: the dashboard polls vehicle:fault every 5s and needs roughly 8s
+	// from power-on, and the transition that would clear it is the same one
+	// that powers the dashboard, so the rider would never see it.
+	if err := v.redis.RaiseFault(FaultStateRestoreRefused, description); err != nil {
+		v.logger.Errorf("Failed to raise fault %d: %v", FaultStateRestoreRefused, err)
+	}
 }
 
 // assertMotorSafeOutputs puts the two outputs that can let the vehicle move into

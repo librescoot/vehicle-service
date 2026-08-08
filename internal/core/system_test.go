@@ -2163,6 +2163,67 @@ func TestRestoreFSMState_InterruptedAttemptDeclined(t *testing.T) {
 	}
 }
 
+// Each refusal raises the restore fault with its own reason, and nothing on the
+// way to Standby clears it again.
+func TestRestoreFSMState_RefusalsRaiseFault(t *testing.T) {
+	cases := []struct {
+		name  string
+		saved types.SystemState
+		want  string
+	}{
+		{
+			name:  "unknown state",
+			saved: types.SystemState("wat"),
+			want:  `saved state "wat" is not a state this vehicle can restore, forced to stand-by`,
+		},
+		{
+			name:  "updating",
+			saved: types.StateUpdating,
+			want:  `saved state "updating" cannot be left once entered, forced to stand-by`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			system, _, mockRedis := restoreTestSystem(t)
+
+			system.restoreFSMState(tc.saved)
+
+			if !faultActive(mockRedis, FaultStateRestoreRefused) {
+				t.Fatal("expected the state restore fault to be raised")
+			}
+			if got := faultDescription(mockRedis, FaultStateRestoreRefused); got != tc.want {
+				t.Errorf("description:\n got %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRestoreFSMState_InterruptedAttemptRaisesFault(t *testing.T) {
+	system, _, mockRedis := restoreTestSystem(t)
+	mockRedis.restoreAttempt = string(types.StateParked)
+
+	system.restoreFSMState(types.StateParked)
+
+	want := `restore of saved state "parked" was already interrupted once, forced to stand-by`
+	if got := faultDescription(mockRedis, FaultStateRestoreRefused); got != want {
+		t.Errorf("description:\n got %q\nwant %q", got, want)
+	}
+	if !faultActive(mockRedis, FaultStateRestoreRefused) {
+		t.Error("expected the state restore fault to be raised")
+	}
+}
+
+// A restore that runs raises nothing.
+func TestRestoreFSMState_CleanRestoreRaisesNoFault(t *testing.T) {
+	system, _, mockRedis := restoreTestSystem(t)
+
+	system.restoreFSMState(types.StateParked)
+
+	if faultActive(mockRedis, FaultStateRestoreRefused) {
+		t.Error("a clean restore must not raise the state restore fault")
+	}
+}
+
 // A marker for some other state is not about this restore.
 func TestRestoreFSMState_MarkerForAnotherStateIgnored(t *testing.T) {
 	system, _, mockRedis := restoreTestSystem(t)
