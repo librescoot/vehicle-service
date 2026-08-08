@@ -18,6 +18,9 @@ type MessagingClient interface {
 	// State management
 	GetVehicleState() (types.SystemState, error)
 	PublishVehicleState(state types.SystemState) error
+	SetRestoreAttempt(state string, ttl time.Duration) error
+	GetRestoreAttempt() (string, error)
+	ClearRestoreAttempt() error
 
 	// Dashboard
 	GetDashboardPower() (bool, error)

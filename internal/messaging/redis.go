@@ -787,6 +787,42 @@ func (r *RedisClient) DeleteDashboardReadyFlag() error {
 	return nil
 }
 
+// restoreAttemptKey holds the state a boot restore is currently attempting.
+// A dedicated top-level key, not a field in the vehicle hash: the hash is a
+// published surface that the dashboard, uplink and lsc all read, and this is
+// process bookkeeping nobody else has any business acting on. vehicle:fault is
+// the precedent for vehicle-prefixed side keys.
+const restoreAttemptKey = "vehicle:restore-attempt"
+
+// SetRestoreAttempt records the state a restore is about to enter, so a restart
+// can tell "we died trying this" from "we have not tried yet". The TTL is the
+// whole safety net: the marker has to outlive a systemd restart and must never
+// cost a legitimate restore hours later.
+func (r *RedisClient) SetRestoreAttempt(state string, ttl time.Duration) error {
+	return r.client.Set(restoreAttemptKey, state, ttl)
+}
+
+// GetRestoreAttempt returns the state of an interrupted restore, or "" when
+// there is none.
+func (r *RedisClient) GetRestoreAttempt() (string, error) {
+	value, err := r.client.Get(restoreAttemptKey)
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to read %s: %w", restoreAttemptKey, err)
+	}
+	return value, nil
+}
+
+// ClearRestoreAttempt drops the marker once a restore has run to a conclusion.
+func (r *RedisClient) ClearRestoreAttempt() error {
+	if _, err := r.client.Del(restoreAttemptKey); err != nil {
+		return fmt.Errorf("failed to delete %s: %w", restoreAttemptKey, err)
+	}
+	return nil
+}
+
 // GetOtaStatus gets the OTA status for a specific component from Redis
 func (r *RedisClient) GetOtaStatus(component string) (string, error) {
 	statusKey := fmt.Sprintf("status:%s", component)

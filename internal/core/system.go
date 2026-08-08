@@ -57,6 +57,12 @@ const (
 
 	// DBC update watchdog — reset on every OTA status write from DBC
 	dbcUpdateWatchdogTimeout = 15 * time.Minute
+
+	// Lifetime of the boot restore marker. Comfortably longer than a systemd
+	// restart (RestartSec defaults to 100ms) and short enough that a marker
+	// left behind by something unrelated cannot cost a legitimate restore
+	// hours later.
+	restoreAttemptTTL = 60 * time.Second
 )
 
 // minLockOnDisconnectSeconds is the floor for a non-zero

@@ -172,10 +172,39 @@ func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) {
 		return
 	}
 
+	// A marker naming this exact state means the last attempt at it never ran
+	// to a conclusion. Losing the error return covers every way SetState can
+	// return; it does not cover a panic inside an entry action, an OOM kill, a
+	// hardware call that never returns, or a watchdog reset, where the process
+	// dies before any recovery code runs and Redis still names the state that
+	// killed it.
+	attempt, err := v.redis.GetRestoreAttempt()
+	if err != nil {
+		v.logger.Warnf("Failed to read the restore attempt marker: %v", err)
+	} else if attempt == string(savedState) {
+		v.clearRestoreAttempt()
+		v.declineRestore(savedState, "the previous attempt at it was interrupted")
+		return
+	}
+
+	if err := v.redis.SetRestoreAttempt(string(savedState), restoreAttemptTTL); err != nil {
+		v.logger.Warnf("Failed to record the restore attempt marker: %v", err)
+	}
+
 	v.logger.Infof("Restoring FSM to saved state: %s", savedState)
 	if err := v.machine.SetState(systemStateToStateID(savedState)); err != nil {
 		v.logger.Errorf("Failed to restore FSM state: %v", err)
 		v.assertMotorSafeOutputs()
+	}
+
+	// Reached on success and on a handled failure alike: both mean the restore
+	// ran to a conclusion, which is exactly what the marker is asking about.
+	v.clearRestoreAttempt()
+}
+
+func (v *VehicleSystem) clearRestoreAttempt() {
+	if err := v.redis.ClearRestoreAttempt(); err != nil {
+		v.logger.Warnf("Failed to clear the restore attempt marker: %v", err)
 	}
 }
 

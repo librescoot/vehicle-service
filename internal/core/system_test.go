@@ -38,14 +38,18 @@ type mockMessagingClient struct {
 	publishedMessages      []struct{ channel, message string }
 	mainPowerSets          []bool
 	enginePowerSets        []bool
+	restoreAttemptSets     []string
+	restoreAttemptClears   int
 
 	// Return values
-	vehicleState    types.SystemState
-	vehicleStateErr error
-	dashboardPower  bool
-	dbcUpdating     bool
-	otaStatus       string
-	hashFieldValue  string
+	vehicleState      types.SystemState
+	vehicleStateErr   error
+	restoreAttempt    string
+	restoreAttemptErr error
+	dashboardPower    bool
+	dbcUpdating       bool
+	otaStatus         string
+	hashFieldValue    string
 }
 
 func newMockMessagingClient() *mockMessagingClient {
@@ -61,6 +65,28 @@ func (m *mockMessagingClient) Close() error                               { retu
 func (m *mockMessagingClient) GetVehicleState() (types.SystemState, error) {
 	return m.vehicleState, m.vehicleStateErr
 }
+func (m *mockMessagingClient) SetRestoreAttempt(state string, ttl time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restoreAttempt = state
+	m.restoreAttemptSets = append(m.restoreAttemptSets, state)
+	return nil
+}
+
+func (m *mockMessagingClient) GetRestoreAttempt() (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.restoreAttempt, m.restoreAttemptErr
+}
+
+func (m *mockMessagingClient) ClearRestoreAttempt() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restoreAttempt = ""
+	m.restoreAttemptClears++
+	return nil
+}
+
 func (m *mockMessagingClient) GetDashboardPower() (bool, error) { return m.dashboardPower, nil }
 func (m *mockMessagingClient) SetDashboardPower(enabled bool) error {
 	m.dashboardPower = enabled
@@ -1929,6 +1955,68 @@ func TestRestoreFSMState_EntryActionFailureStillPublishes(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected parked to be published despite the failed entry action, got %v", published)
+	}
+}
+
+// A marker naming the state we are about to restore means the last attempt at
+// it never ran to a conclusion. Decline rather than repeat it.
+func TestRestoreFSMState_InterruptedAttemptDeclined(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockRedis.restoreAttempt = string(types.StateParked)
+
+	system.restoreFSMState(types.StateParked)
+
+	if got := system.machine.CurrentState(); got != fsm.StateStandby {
+		t.Errorf("expected StateStandby after declining an interrupted restore, got %v", got)
+	}
+	if !mockIO.getDigitalOutput("engine_brake") {
+		t.Error("declined restore must leave the engine brake engaged")
+	}
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Error("declined restore must leave engine power cut")
+	}
+	mockRedis.mu.Lock()
+	marker := mockRedis.restoreAttempt
+	mockRedis.mu.Unlock()
+	if marker != "" {
+		t.Errorf("the marker must be cleared after acting on it, got %q", marker)
+	}
+}
+
+// A marker for some other state is not about this restore.
+func TestRestoreFSMState_MarkerForAnotherStateIgnored(t *testing.T) {
+	system, _, mockRedis := restoreTestSystem(t)
+	mockRedis.restoreAttempt = string(types.StateReadyToDrive)
+
+	system.restoreFSMState(types.StateParked)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked, got %v", got)
+	}
+}
+
+// A clean restore leaves no marker behind.
+func TestRestoreFSMState_CleanRestoreClearsMarker(t *testing.T) {
+	system, _, mockRedis := restoreTestSystem(t)
+
+	system.restoreFSMState(types.StateParked)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked, got %v", got)
+	}
+	mockRedis.mu.Lock()
+	sets := append([]string(nil), mockRedis.restoreAttemptSets...)
+	clears := mockRedis.restoreAttemptClears
+	marker := mockRedis.restoreAttempt
+	mockRedis.mu.Unlock()
+	if len(sets) != 1 || sets[0] != string(types.StateParked) {
+		t.Errorf("expected the marker to be set once to parked, got %v", sets)
+	}
+	if clears == 0 {
+		t.Error("expected the marker to be cleared after a clean restore")
+	}
+	if marker != "" {
+		t.Errorf("expected no marker left behind, got %q", marker)
 	}
 }
 
