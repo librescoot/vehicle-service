@@ -2133,6 +2133,65 @@ func TestEnterReadyToDrive_EnginePowerFailureStillEntersDriveMode(t *testing.T) 
 	}
 }
 
+// ===== Hibernation Force Window Tests =====
+
+// The guard on the force transition replaces the brake recheck the hand-rolled
+// timer callback used to do, so a force timeout with the levers released must
+// still go nowhere.
+func TestHibernationForce_GuardedOnBrakes(t *testing.T) {
+	cases := []struct {
+		name    string
+		pressed bool
+		want    librefsm.StateID
+	}{
+		{name: "both levers held", pressed: true, want: fsm.StateHibernationConfirm},
+		{name: "levers released", pressed: false, want: fsm.StateHibernationAwaitingConfirm},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			system, mockIO, _ := restoreTestSystem(t)
+			mockIO.digitalInputs["brake_left"] = tc.pressed
+			mockIO.digitalInputs["brake_right"] = tc.pressed
+
+			if err := system.machine.SetState(fsm.StateHibernationAwaitingConfirm); err != nil {
+				t.Fatalf("SetState: %v", err)
+			}
+			system.machine.Send(librefsm.Event{ID: fsm.EvHibernationForceTimeout})
+
+			deadline := time.Now().Add(time.Second)
+			for time.Now().Before(deadline) {
+				if system.machine.CurrentState() == tc.want {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if got := system.machine.CurrentState(); got != tc.want {
+				t.Errorf("expected %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
+// Entering awaiting-confirm arms the force timer, and leaving the state cancels
+// it without any manual teardown.
+func TestHibernationForce_TimerScopedToState(t *testing.T) {
+	system, _, _ := restoreTestSystem(t)
+
+	if err := system.machine.SetState(fsm.StateHibernationAwaitingConfirm); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if !system.machine.TimerActive(fsm.TimerHibernationForce) {
+		t.Fatal("expected the force timer to be armed on entry")
+	}
+
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if system.machine.TimerActive(fsm.TimerHibernationForce) {
+		t.Error("expected the force timer to be cancelled on state exit")
+	}
+}
+
 // ===== Boot State Restore Tests =====
 
 // restoreTestSystem brings up a system with the FSM started and the inputs a

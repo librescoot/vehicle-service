@@ -12,8 +12,10 @@ const (
 	WaitingSeatboxTimeout     = 30 * time.Second
 	HibernationInitialTimeout = 15 * time.Second
 	HibernationConfirmTimeout = 30 * time.Second
-	HibernationForceTimeout   = 30 * time.Second
-	HibernationFinalTimeout   = 3 * time.Second
+	// Force window while both levers are held in awaiting-confirm. Wired into
+	// the timer, so changing it changes rider-visible behaviour.
+	HibernationForceTimeout = 15 * time.Second
+	HibernationFinalTimeout = 3 * time.Second
 )
 
 // NewDefinition creates the vehicle FSM definition.
@@ -229,7 +231,12 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		).
 		Transition(StateHibernationAwaitingConfirm, EvKeycardAuth, StateHibernationSeatbox).
 		Transition(StateHibernationAwaitingConfirm, EvSeatboxButton, StateParked).
-		Transition(StateHibernationAwaitingConfirm, EvHibernationForceTimeout, StateHibernationConfirm).
+		// The guard replaces the brake recheck the timer callback used to do by
+		// hand. No other transition takes this event from this state, so a
+		// failing guard means nothing happens, same as before.
+		Transition(StateHibernationAwaitingConfirm, EvHibernationForceTimeout, StateHibernationConfirm,
+			librefsm.WithGuard(actions.AreBrakesPressed),
+		).
 		Transition(StateHibernationAwaitingConfirm, EvHibernationConfirmTimeout, StateParked).
 
 		// Seatbox state -> wait for seatbox to close, button cancels

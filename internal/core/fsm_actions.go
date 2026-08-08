@@ -728,13 +728,6 @@ func (v *VehicleSystem) EnterHibernation(c *librefsm.Context) error {
 
 func (v *VehicleSystem) ExitHibernation(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: ExitHibernation (parent state)")
-	// Cancel any hibernation-related timers
-	v.mu.Lock()
-	if v.hibernationForceTimer != nil {
-		v.hibernationForceTimer.Stop()
-		v.hibernationForceTimer = nil
-	}
-	v.mu.Unlock()
 	return nil
 }
 
@@ -746,38 +739,15 @@ func (v *VehicleSystem) EnterHibernationInitialHold(c *librefsm.Context) error {
 func (v *VehicleSystem) EnterHibernationAwaitingConfirm(c *librefsm.Context) error {
 	v.logger.Infof("FSM: EnterHibernationAwaitingConfirm - initial hold complete, awaiting confirmation")
 
-	// Start 15s timer to force hibernation if brakes still held
-	v.mu.Lock()
-	if v.hibernationForceTimer != nil {
-		v.hibernationForceTimer.Stop()
-	}
-	v.hibernationForceTimer = time.AfterFunc(15*time.Second, func() {
-		// Verify we're still in the awaiting-confirm state before sending event
-		if v.machine.CurrentState() != fsm.StateHibernationAwaitingConfirm {
-			v.logger.Debugf("FSM: Force hibernation timer fired but no longer in awaiting-confirm state")
-			return
-		}
-
-		// Check if brakes are still pressed
-		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-		if err != nil {
-			v.logger.Warnf("Failed to read brake_left for force hibernation: %v", err)
-			return
-		}
-		brakeRight, err := v.io.ReadDigitalInput("brake_right")
-		if err != nil {
-			v.logger.Warnf("Failed to read brake_right for force hibernation: %v", err)
-			return
-		}
-
-		if brakeLeft && brakeRight {
-			v.logger.Infof("FSM: Force hibernation - brakes held for 15s")
-			v.machine.Send(librefsm.Event{ID: fsm.EvHibernationForceTimeout})
-		} else {
-			v.logger.Debugf("FSM: Force hibernation cancelled - brakes released")
-		}
-	})
-	v.mu.Unlock()
+	// Force hibernation if both levers stay held. A state-scoped timer, so
+	// leaving the state cancels it and the "are we still here" recheck a
+	// hand-rolled timer needs disappears. The brake recheck lives on the
+	// transition guard.
+	//
+	// Not WithTimeout on the state: that is a single field, already spent on
+	// HibernationConfirmTimeout, and a second one would silently replace it.
+	c.StartTimer(fsm.TimerHibernationForce, fsm.HibernationForceTimeout,
+		librefsm.Event{ID: fsm.EvHibernationForceTimeout})
 
 	return nil
 }

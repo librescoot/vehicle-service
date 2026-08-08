@@ -118,7 +118,6 @@ type VehicleSystem struct {
 	seatboxClosed              bool              // Cached seatbox lock sensor state (true = closed)
 	dbcBlinkerLed              bool              // Blink DBC boot LED in sync with blinkers (default: false)
 	usb0Policy                 string            // "auto" (default, tracks dashboard_power) or "always-on"
-	hibernationForceTimer      *time.Timer       // Timer for forcing hibernation after 15s of brake hold
 	machine                    *librefsm.Machine // librefsm state machine
 	gestures                   *gestureDetector
 
