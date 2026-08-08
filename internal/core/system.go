@@ -600,8 +600,13 @@ func (v *VehicleSystem) Start() error {
 		}
 	}
 
-	// Play LED cues based on restored state
-	if savedState == types.StateReadyToDrive || savedState == types.StateParked {
+	// Cue the lights for the state the machine actually reached, not the one
+	// Redis remembered. A restore can be refused, which leaves the machine in
+	// stand-by; cueing from the saved state there lights the parked pattern
+	// with nothing downstream to turn it off again, so it stands as an AUX
+	// draw rather than a flicker.
+	restoredInto := v.getCurrentStateID()
+	if restoredInto == fsm.StateReadyToDrive || restoredInto == fsm.StateParked {
 		// Read brake states to determine which LED cue to play
 		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 		if err != nil {
@@ -617,7 +622,7 @@ func (v *VehicleSystem) Start() error {
 			v.logger.Infof("Failed to play LED cue: %v", err)
 		}
 
-		if savedState == types.StateReadyToDrive {
+		if restoredInto == fsm.StateReadyToDrive {
 			if err := v.io.PlayPwmCue(3); err != nil { // PARKED_TO_DRIVE
 				v.logger.Infof("Failed to play LED cue: %v", err)
 			}
