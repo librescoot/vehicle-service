@@ -224,7 +224,7 @@ func (v *VehicleSystem) declineRestore(savedState types.SystemState, reason stri
 //
 // Brake before power cut, matching the ordering EnterParked documents.
 func (v *VehicleSystem) assertMotorSafeOutputs() {
-	if err := v.io.WriteDigitalOutput("engine_brake", true); err != nil {
+	if err := v.writeOutput("engine_brake", true); err != nil {
 		v.logger.Errorf("Failed to engage engine brake after declined restore: %v", err)
 	}
 	if err := v.setPower("engine_power", false); err != nil {
@@ -301,7 +301,7 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 		v.logger.Errorf("%v during transition", err)
 		return err
 	}
-	if err := v.io.WriteDigitalOutput("engine_brake", brakeLeft || brakeRight); err != nil {
+	if err := v.writeOutput("engine_brake", brakeLeft || brakeRight); err != nil {
 		v.logger.Errorf("Failed to set engine brake during transition: %v", err)
 		return err
 	}
@@ -352,7 +352,7 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 	}
 
 	// Engage engine brake BEFORE powering ECU to prevent movement
-	if err := v.io.WriteDigitalOutput("engine_brake", true); err != nil {
+	if err := v.writeOutput("engine_brake", true); err != nil {
 		v.logger.Errorf("Failed to engage engine brake: %v", err)
 		if rbErr := v.setPower("dashboard_power", false); rbErr != nil {
 			v.logger.Errorf("Rollback failed: %v", rbErr)

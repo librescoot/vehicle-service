@@ -214,6 +214,36 @@ func (m *mockMessagingClient) ClearFault(code int) error {
 	return nil
 }
 
+// faultActive reports whether the last call touching code raised it.
+//
+// The trap this helper exists to close: the mock records every call, while
+// FaultReporter collapses repeats server side. So a test must assert on
+// last-write-wins state, never on how many calls were recorded.
+func faultActive(m *mockMessagingClient, code int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	active := false
+	for _, c := range m.faultCalls {
+		if c.code == code {
+			active = c.raised
+		}
+	}
+	return active
+}
+
+// faultDescription returns the description of the last raise of code.
+func faultDescription(m *mockMessagingClient, code int) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	desc := ""
+	for _, c := range m.faultCalls {
+		if c.code == code && c.raised {
+			desc = c.description
+		}
+	}
+	return desc
+}
+
 // Mock HardwareIO
 type mockHardwareIO struct {
 	mu             sync.Mutex // guards recorded calls; runBlinker plays cues from its own goroutine
@@ -1857,6 +1887,134 @@ func TestHopOn_RestoreFromSavedState(t *testing.T) {
 	system.mu.RUnlock()
 	if deadline.IsZero() {
 		t.Errorf("auto-standby timer should be armed after restoring into the at-rest group")
+	}
+}
+
+// ===== Output Fault Tests =====
+
+// A tracked output that cannot be written raises its channel's code, and the
+// machine still ends up where the transition sent it. The entry action is a
+// side effect; only a guard can stop a transition.
+func TestWriteOutput_EnginePowerFailureRaisesFault(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.failOutput("engine_power", fmt.Errorf("gpio line busy"))
+
+	// The SetState error is deliberately ignored: whether the entry action
+	// reported one is not what callers act on, the fault is the record.
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked despite the failed write, got %v", got)
+	}
+	if !faultActive(mockRedis, FaultEnginePowerOutput) {
+		t.Error("expected the engine power output fault to be raised")
+	}
+	if desc := faultDescription(mockRedis, FaultEnginePowerOutput); desc != "engine_power output write failed: gpio line busy" {
+		t.Errorf("unexpected fault description: %q", desc)
+	}
+}
+
+// The fault clears on the next successful write to the same channel, which is
+// why the code is keyed on the channel and not on the call site.
+func TestWriteOutput_EnginePowerFaultClearsOnNextWrite(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.failOutput("engine_power", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+	if !faultActive(mockRedis, FaultEnginePowerOutput) {
+		t.Fatal("expected the engine power output fault to be raised")
+	}
+
+	mockIO.failOutput("engine_power", nil)
+	_ = system.machine.SetState(fsm.StateStandby)
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if faultActive(mockRedis, FaultEnginePowerOutput) {
+		t.Error("expected the engine power output fault to clear on the next successful write")
+	}
+}
+
+func TestWriteOutput_DashboardPowerFailureRaisesFault(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.digitalInputs["kickstand"] = false
+	mockIO.digitalInputs["handlebar_lock_sensor"] = true
+	system.dashboardReady = true
+	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateReadyToDrive)
+
+	if !faultActive(mockRedis, FaultDashboardPowerOutput) {
+		t.Error("expected the dashboard power output fault to be raised")
+	}
+}
+
+func TestWriteOutput_EngineBrakeFailureRaisesFault(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if !faultActive(mockRedis, FaultEngineBrakeOutput) {
+		t.Error("expected the engine brake output fault to be raised")
+	}
+}
+
+// engine_brake is rewritten on every brake lever edge, so its fault is close to
+// self-clearing in practice.
+func TestWriteOutput_EngineBrakeFaultClearsOnBrakeEdge(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	system.initialized = true
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+	if !faultActive(mockRedis, FaultEngineBrakeOutput) {
+		t.Fatal("expected the engine brake output fault to be raised")
+	}
+
+	mockIO.failOutput("engine_brake", nil)
+	if err := system.handleInputChange("brake_left", true); err != nil {
+		t.Fatalf("brake edge: %v", err)
+	}
+
+	if faultActive(mockRedis, FaultEngineBrakeOutput) {
+		t.Error("expected the engine brake output fault to clear on the next lever edge")
+	}
+}
+
+// Channels outside the map are not fault reported: a stuck horn is not
+// something a rider or a mechanic acts on through the fault view.
+func TestWriteOutput_UntrackedChannelReportsNothing(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.failOutput("horn", fmt.Errorf("gpio line busy"))
+
+	if err := system.writeOutput("horn", true); err == nil {
+		t.Error("expected the write error to be returned unchanged")
+	}
+
+	mockRedis.mu.Lock()
+	calls := len(mockRedis.faultCalls)
+	mockRedis.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("expected no fault traffic for an untracked channel, got %d calls", calls)
+	}
+}
+
+// The startup reconcile clears every code this service owns.
+func TestClearOwnedFaults(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+
+	system.clearOwnedFaults()
+
+	for _, code := range ownedFaultCodes {
+		if faultActive(mockRedis, code) {
+			t.Errorf("fault %d should not be active after the startup reconcile", code)
+		}
+	}
+	mockRedis.mu.Lock()
+	calls := len(mockRedis.faultCalls)
+	mockRedis.mu.Unlock()
+	if calls != len(ownedFaultCodes) {
+		t.Errorf("expected one clear per owned code, got %d calls for %d codes", calls, len(ownedFaultCodes))
 	}
 }
 

@@ -426,6 +426,11 @@ func (v *VehicleSystem) Start() error {
 		return fmt.Errorf("failed to initialize hardware: %w", err)
 	}
 
+	// Every GPIO line has just been re-requested successfully, so nothing this
+	// process knows of is standing. Reconcile before the FSM starts, so a fault
+	// raised by the state restore below survives its own boot.
+	v.clearOwnedFaults()
+
 	// Configure per-channel debounce before registering callbacks
 	v.io.SetDebounce("handlebar_position", handlebarPositionDebounce)
 	v.io.SetDebounce("brake_left", brakeDebounce)
@@ -580,7 +585,7 @@ func (v *VehicleSystem) Start() error {
 		}
 		engineBrake = brakeLeft || brakeRight
 	}
-	if err := v.io.WriteDigitalOutput("engine_brake", engineBrake); err != nil {
+	if err := v.writeOutput("engine_brake", engineBrake); err != nil {
 		v.logger.Errorf("Failed to set engine brake: %v", err)
 	}
 
@@ -1029,7 +1034,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		allowed := v.isHornAllowed() && !v.seatboxBlocksHorn()
 		hornValue := value && allowed // Only activate if both button pressed AND allowed
 
-		if err := v.io.WriteDigitalOutput("horn", hornValue); err != nil {
+		if err := v.writeOutput("horn", hornValue); err != nil {
 			return err
 		}
 		return v.redis.SetHornButton(value) // Still publish button state even if horn disabled
@@ -1162,7 +1167,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			engineBrakeEngaged = true // Always engaged (motor disabled) outside drive mode
 		}
 
-		if err := v.io.WriteDigitalOutput("engine_brake", engineBrakeEngaged); err != nil {
+		if err := v.writeOutput("engine_brake", engineBrakeEngaged); err != nil {
 			return fmt.Errorf("failed to control engine brake: %w", err)
 		}
 
@@ -1575,6 +1580,56 @@ func (v *VehicleSystem) handleDashboardPowerChange(enabled bool) error {
 	return nil
 }
 
+// writeOutput writes a digital output and keeps the fault set in step with the
+// result. The write error is returned unchanged, so callers behave exactly as
+// they did before; only the fault reporting is new. A failure to report a fault
+// is logged and swallowed, because it must never propagate into vehicle logic.
+//
+// Channels absent from outputFaultCodes pass straight through, which keeps
+// "does this channel report faults" a property of the map rather than a
+// per-call-site judgement.
+//
+// There is deliberately no in-process record of which codes are set. The three
+// tracked channels are written at human-event rates against a local Redis, the
+// fast channels are not in the map, and FaultReporter already collapses repeats
+// server side. Set membership stays the only copy of the state; a second copy in
+// process memory is the drift this reporting exists to avoid. Revisit only with
+// a measurement.
+func (v *VehicleSystem) writeOutput(channel string, value bool) error {
+	err := v.io.WriteDigitalOutput(channel, value)
+
+	code, tracked := outputFaultCodes[channel]
+	if !tracked {
+		return err
+	}
+
+	if err != nil {
+		if reportErr := v.redis.RaiseFault(code, fmt.Sprintf("%s output write failed: %v", channel, err)); reportErr != nil {
+			v.logger.Errorf("Failed to raise fault %d: %v", code, reportErr)
+		}
+		return err
+	}
+
+	if reportErr := v.redis.ClearFault(code); reportErr != nil {
+		v.logger.Errorf("Failed to clear fault %d: %v", code, reportErr)
+	}
+	return nil
+}
+
+// clearOwnedFaults drops every fault this service owns. Called once at startup,
+// right after the GPIO lines have been re-requested successfully: a process that
+// just started has no evidence of a standing failure, and anything genuinely
+// broken re-raises within one state transition. The alternative, carrying the
+// set over from the previous run, keeps stale faults alive with no way to tell
+// them from live ones.
+func (v *VehicleSystem) clearOwnedFaults() {
+	for _, code := range ownedFaultCodes {
+		if err := v.redis.ClearFault(code); err != nil {
+			v.logger.Warnf("Failed to clear fault %d at startup: %v", code, err)
+		}
+	}
+}
+
 // setPower controls a power output (dashboard_power or engine_power) with consistent logging
 func (v *VehicleSystem) setPower(component string, enabled bool) error {
 	// Handle dashboard ready clearing BEFORE changing power state
@@ -1595,7 +1650,7 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 		}
 	}
 
-	if err := v.io.WriteDigitalOutput(component, enabled); err != nil {
+	if err := v.writeOutput(component, enabled); err != nil {
 		action := "enable"
 		if !enabled {
 			action = "disable"
@@ -1654,11 +1709,11 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 
 // pulseOutput activates an output for a duration then deactivates it
 func (v *VehicleSystem) pulseOutput(name string, duration time.Duration) error {
-	if err := v.io.WriteDigitalOutput(name, true); err != nil {
+	if err := v.writeOutput(name, true); err != nil {
 		return err
 	}
 	time.Sleep(duration)
-	if err := v.io.WriteDigitalOutput(name, false); err != nil {
+	if err := v.writeOutput(name, false); err != nil {
 		return err
 	}
 	return nil
@@ -1701,23 +1756,23 @@ func (v *VehicleSystem) setHandlebarLatch(isLocked bool) {
 func (v *VehicleSystem) pulseHandlebarLock(lock bool) error {
 	closeVal := lock
 	openVal := !lock
-	if err := v.io.WriteDigitalOutput("handlebar_lock_close", closeVal); err != nil {
+	if err := v.writeOutput("handlebar_lock_close", closeVal); err != nil {
 		return err
 	}
-	if err := v.io.WriteDigitalOutput("handlebar_lock_open", openVal); err != nil {
+	if err := v.writeOutput("handlebar_lock_open", openVal); err != nil {
 		// Best-effort: deactivate the first output before returning. If this
 		// also fails the solenoid coil can stay energized continuously
 		// instead of being pulsed, so log it even though the original error
 		// is still what gets returned.
-		if rbErr := v.io.WriteDigitalOutput("handlebar_lock_close", false); rbErr != nil {
+		if rbErr := v.writeOutput("handlebar_lock_close", false); rbErr != nil {
 			v.logger.Errorf("Failed to deactivate handlebar_lock_close after open write failure: %v", rbErr)
 		}
 		return err
 	}
 	time.Sleep(handlebarLockDuration)
 	// Both outputs low (coast)
-	err1 := v.io.WriteDigitalOutput("handlebar_lock_close", false)
-	err2 := v.io.WriteDigitalOutput("handlebar_lock_open", false)
+	err1 := v.writeOutput("handlebar_lock_close", false)
+	err2 := v.writeOutput("handlebar_lock_open", false)
 	if err1 != nil {
 		return err1
 	}

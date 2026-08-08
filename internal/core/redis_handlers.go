@@ -37,7 +37,7 @@ func (v *VehicleSystem) handleHornRequest(on bool) error {
 		return nil // Silent failure - don't activate horn but don't error
 	}
 
-	return v.io.WriteDigitalOutput("horn", on)
+	return v.writeOutput("horn", on)
 }
 
 // handleBlinkerRequest handles blinker state requests from Redis
