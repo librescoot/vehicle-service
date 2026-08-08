@@ -649,17 +649,14 @@ func (v *VehicleSystem) Start() error {
 	return nil
 }
 
-// checkHibernationConditions sends brake events - FSM decides what to do based on state
+// checkHibernationConditions sends brake events - FSM decides what to do based on state.
+//
+// It deliberately does not consult the brake-hibernation setting. That check
+// used to live here and suppressed EvBrakesReleased along with EvBrakesPressed,
+// so turning the setting off while sitting in the initial hold meant the cancel
+// event never arrived and the rider had to wait the timeouts out instead of
+// releasing the levers. The setting is a guard on the entry transition now.
 func (v *VehicleSystem) checkHibernationConditions() {
-	// Check if brake hibernation is enabled
-	v.mu.RLock()
-	hibernationEnabled := v.brakeHibernationEnabled
-	v.mu.RUnlock()
-
-	if !hibernationEnabled {
-		return
-	}
-
 	brakeLeft, err := v.io.ReadDigitalInput("brake_left")
 	if err != nil {
 		v.logger.Infof("Failed to read brake_left for hibernation check: %v", err)

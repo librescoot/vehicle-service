@@ -165,9 +165,13 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 			librefsm.WithGuard(actions.IsKickstandDown),
 			librefsm.WithAction(actions.OnSeatboxButton),
 		).
-		// Hibernation entry: both brakes pressed in parked state
+		// Hibernation entry: both brakes pressed in parked state, and the
+		// setting allows it. The setting belongs here rather than in the sender:
+		// suppressing the event upstream also suppressed EvBrakesReleased, so
+		// turning the setting off while already in the hold left the rider
+		// unable to cancel by releasing the levers.
 		Transition(StateParked, EvBrakesPressed, StateHibernationInitialHold,
-			librefsm.WithGuard(actions.AreBrakesPressed),
+			librefsm.WithGuards(actions.IsBrakeHibernationEnabled, actions.AreBrakesPressed),
 		).
 		// Hop-on / hop-off engage variants
 		Transition(StateParked, EvHopOnEngage, StateHopOn).
@@ -204,7 +208,13 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 
 		// From ShuttingDown
 		Transition(StateShuttingDown, EvShutdownTimeout, StateStandby).
-		Transition(StateShuttingDown, EvUnlock, StateParked).
+		// Aborting a shutdown is only safe while the DBC has not been told to
+		// halt: once it has, its kernel is on the way out and EnterParked's
+		// dashboard power-up would be a no-op on a GPIO that was never cut. The
+		// unlock handler queues the request for replay from standby instead.
+		Transition(StateShuttingDown, EvUnlock, StateParked,
+			librefsm.WithGuard(actions.CanAbortShutdown),
+		).
 
 		// From WaitingSeatbox - timeout or seatbox closed proceeds with lock
 		Transition(StateWaitingSeatbox, EvWaitingSeatboxTimeout, StateShuttingDown).

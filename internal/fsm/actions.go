@@ -39,6 +39,8 @@ type Actions interface {
 	IsSeatboxClosed(c *librefsm.Context) bool
 	AreBrakesPressed(c *librefsm.Context) bool
 	IsHandlebarUnlocked(c *librefsm.Context) bool // True when handlebar lock sensor shows unlocked
+	CanAbortShutdown(c *librefsm.Context) bool    // True while the DBC has not been told to halt
+	IsBrakeHibernationEnabled(c *librefsm.Context) bool
 
 	// Transition actions
 	OnShutdownTimeout(c *librefsm.Context) error

@@ -111,11 +111,10 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 
 	switch state {
 	case "unlock":
-		// If we're in shutting-down and have already told the DBC to halt,
-		// the abort path is no longer safe: the DBC kernel is dying and
-		// setPower("dashboard_power", true) in EnterParked would be a no-op
-		// on a GPIO that was never cut. Queue the unlock; EnterStandby
-		// will replay it once the GPIO has been cycled.
+		// Queue the unlock for replay once EnterStandby has cycled the GPIO.
+		// The veto itself lives on the ShuttingDown to Parked transition, which
+		// is where it applies to every dispatch path rather than only this one;
+		// what stays here is the side effect the guard cannot express.
 		if currentState == types.StateShuttingDown && v.dbcPoweroffSent.Load() {
 			v.pendingUnlock.Store(true)
 			v.logger.Infof("Unlock deferred: DBC shutdown in progress, will replay from standby")

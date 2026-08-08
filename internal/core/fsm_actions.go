@@ -920,6 +920,19 @@ func (v *VehicleSystem) IsHandlebarUnlocked(c *librefsm.Context) bool {
 	return v.handlebarUnlocked
 }
 
+// CanAbortShutdown reports whether a shutdown in progress can still be turned
+// around. False once the DBC has been told to halt.
+func (v *VehicleSystem) CanAbortShutdown(c *librefsm.Context) bool {
+	return !v.dbcPoweroffSent.Load()
+}
+
+// IsBrakeHibernationEnabled reports the brake-hold hibernation setting.
+func (v *VehicleSystem) IsBrakeHibernationEnabled(c *librefsm.Context) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.brakeHibernationEnabled
+}
+
 func (v *VehicleSystem) AreBrakesPressed(c *librefsm.Context) bool {
 	brakeLeft, _ := v.io.ReadDigitalInput("brake_left")
 	brakeRight, _ := v.io.ReadDigitalInput("brake_right")

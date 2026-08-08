@@ -1408,6 +1408,12 @@ func TestEnterParked_FromShuttingDown_ReplaysLightsCue(t *testing.T) {
 	// assert cleanly on what EnterParked emits.
 	mockIO.pwmCues = nil
 
+	// The abort path only exists while the DBC has not been told to halt, which
+	// is what CanAbortShutdown guards. EnterShuttingDown published the poweroff
+	// above, so put the tracker back where an abortable shutdown leaves it: a
+	// DBC update in progress, or a publish that did not go out.
+	system.dbcPoweroffSent.Store(false)
+
 	// Abort path: EvUnlock during ShuttingDown goes back to Parked.
 	system.machine.Send(librefsm.Event{ID: fsm.EvUnlock})
 	time.Sleep(50 * time.Millisecond)
@@ -2130,6 +2136,84 @@ func TestEnterReadyToDrive_EnginePowerFailureStillEntersDriveMode(t *testing.T) 
 	// The work below the failed write still ran.
 	if !mockIO.getDigitalOutput("engine_brake") {
 		t.Error("the engine brake write must still follow the levers after a failed power write")
+	}
+}
+
+// ===== Smuggled Predicate Tests =====
+
+// The shutdown abort veto applies to every dispatch path now, not only to the
+// Redis unlock handler it used to live in.
+func TestCanAbortShutdown_GuardsTheAbortTransition(t *testing.T) {
+	system, _, _ := restoreTestSystem(t)
+	if err := system.machine.SetState(fsm.StateShuttingDown); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.dbcPoweroffSent.Store(true)
+
+	system.machine.Send(librefsm.Event{ID: fsm.EvUnlock})
+	time.Sleep(50 * time.Millisecond)
+
+	if got := system.machine.CurrentState(); got != fsm.StateShuttingDown {
+		t.Errorf("a halted DBC must block the abort, got %v", got)
+	}
+
+	system.dbcPoweroffSent.Store(false)
+	system.machine.Send(librefsm.Event{ID: fsm.EvUnlock})
+	time.Sleep(50 * time.Millisecond)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected the abort to run once the DBC is not halting, got %v", got)
+	}
+}
+
+// Turning brake hibernation off must still let the rider cancel by releasing
+// the levers: the setting gates entry, not the events.
+func TestBrakeHibernation_SettingGatesEntryNotCancel(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	system.brakeHibernationEnabled = true
+	system.initialized = true
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+
+	mockIO.digitalInputs["brake_left"] = true
+	mockIO.digitalInputs["brake_right"] = true
+	system.checkHibernationConditions()
+	time.Sleep(50 * time.Millisecond)
+	if got := system.machine.CurrentState(); got != fsm.StateHibernationInitialHold {
+		t.Fatalf("expected StateHibernationInitialHold, got %v", got)
+	}
+
+	// The rider turns the setting off mid-hold, then releases the levers.
+	system.mu.Lock()
+	system.brakeHibernationEnabled = false
+	system.mu.Unlock()
+	mockIO.digitalInputs["brake_left"] = false
+	mockIO.digitalInputs["brake_right"] = false
+	system.checkHibernationConditions()
+	time.Sleep(50 * time.Millisecond)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("releasing the levers must cancel the hold, got %v", got)
+	}
+}
+
+// With the setting off, holding both levers goes nowhere.
+func TestBrakeHibernation_DisabledBlocksEntry(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	system.brakeHibernationEnabled = false
+	system.initialized = true
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+
+	mockIO.digitalInputs["brake_left"] = true
+	mockIO.digitalInputs["brake_right"] = true
+	system.checkHibernationConditions()
+	time.Sleep(50 * time.Millisecond)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked with brake hibernation disabled, got %v", got)
 	}
 }
 
