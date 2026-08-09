@@ -179,9 +179,11 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.logger.Infof("Starting DBC update process")
 		v.mu.Lock()
 		v.dbcUpdating = true
+		v.dbcHeartbeatSeen = false
 		v.startDbcWatchdog()
+		watchdogTimeout := v.dbcWatchdogDuration()
 		v.mu.Unlock()
-		v.logger.Infof("DBC update watchdog started (timeout: %v)", dbcUpdateWatchdogTimeout)
+		v.logger.Infof("DBC update watchdog started (timeout: %v)", watchdogTimeout)
 
 		// Persist to Redis
 		if err := v.redis.SetDbcUpdating(true); err != nil {
@@ -776,6 +778,7 @@ func (v *VehicleSystem) handleDbcWatchdogTimeout() {
 	deferredPower := v.deferredDashboardPower
 	v.deferredDashboardPower = nil
 	currentState := v.state
+	mapDownloading := v.mapDownloading
 	v.mu.Unlock()
 
 	v.logger.Warnf("DBC update watchdog expired — no OTA activity for %v, clearing stuck state", dbcUpdateWatchdogTimeout)
@@ -788,18 +791,16 @@ func (v *VehicleSystem) handleDbcWatchdogTimeout() {
 		v.logger.Warnf("Failed to remove DBC update inhibitor after watchdog timeout: %v", err)
 	}
 
-	var powerOff bool
-	if deferredPower != nil {
-		if *deferredPower {
-			v.logger.Debugf("Applying deferred dashboard power ON after watchdog timeout")
-			if err := v.setPower("dashboard_power", true); err != nil {
-				v.logger.Errorf("Failed to apply deferred dashboard power ON: %v", err)
-			}
-		} else if currentState == types.StateStandby {
-			powerOff = true
+	if deferredPower != nil && *deferredPower {
+		v.logger.Debugf("Applying deferred dashboard power ON after watchdog timeout")
+		if err := v.setPower("dashboard_power", true); err != nil {
+			v.logger.Errorf("Failed to apply deferred dashboard power ON: %v", err)
 		}
-	} else if currentState == types.StateStandby {
-		powerOff = true
+	}
+
+	powerOff := shouldPowerOffAfterWatchdog(currentState, deferredPower, mapDownloading)
+	if !powerOff && mapDownloading && shouldPowerOffAfterWatchdog(currentState, deferredPower, false) {
+		v.logger.Infof("DBC update watchdog expired but a map download still holds power, leaving the dashboard on")
 	}
 
 	if powerOff {
@@ -810,4 +811,27 @@ func (v *VehicleSystem) handleDbcWatchdogTimeout() {
 			}
 		})
 	}
+}
+
+// shouldPowerOffAfterWatchdog decides whether a wedged DBC update should
+// power the dashboard off, given the deferred power request from a shutdown
+// that arrived mid-update (if any), the FSM state when the watchdog fired,
+// and whether a map download still holds the same power rail.
+//
+// A map download is the other holder of this power rail and has its own cap.
+// A wedged OTA must not cut power out from under it.
+func shouldPowerOffAfterWatchdog(state types.SystemState, deferredPower *bool, mapDownloading bool) bool {
+	var powerOff bool
+	if deferredPower != nil {
+		if !*deferredPower && state == types.StateStandby {
+			powerOff = true
+		}
+	} else if state == types.StateStandby {
+		powerOff = true
+	}
+
+	if powerOff && mapDownloading {
+		powerOff = false
+	}
+	return powerOff
 }

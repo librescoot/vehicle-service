@@ -57,6 +57,7 @@ type mockMessagingClient struct {
 	dashboardPower    bool
 	dbcUpdating       bool
 	otaStatus         string
+	otaHeartbeat      string
 	hashFieldValue    string
 }
 
@@ -107,7 +108,10 @@ func (m *mockMessagingClient) SetDbcUpdating(updating bool) error {
 	m.dbcUpdating = updating
 	return nil
 }
-func (m *mockMessagingClient) GetOtaStatus(component string) (string, error)  { return m.otaStatus, nil }
+func (m *mockMessagingClient) GetOtaStatus(component string) (string, error) { return m.otaStatus, nil }
+func (m *mockMessagingClient) GetOtaHeartbeat(component string) (string, error) {
+	return m.otaHeartbeat, nil
+}
 func (m *mockMessagingClient) SetInhibitor(id, inhibitType, why string) error { return nil }
 func (m *mockMessagingClient) RemoveInhibitor(id string) error                { return nil }
 func (m *mockMessagingClient) GetHashField(hash, field string) (string, error) {
@@ -712,6 +716,70 @@ func TestHandleUpdateRequestInvalid(t *testing.T) {
 	err := system.handleUpdateRequest("invalid")
 	if err == nil {
 		t.Error("Expected error for invalid action")
+	}
+}
+
+// ===== DBC Update Watchdog Tests =====
+
+func TestDbcWatchdogDuration_FallsBackWithoutHeartbeat(t *testing.T) {
+	v := &VehicleSystem{}
+	// An older DBC image publishes no heartbeat. Cutting its dashboard power
+	// at three minutes could interrupt an install, so it keeps the long
+	// timeout until it proves it speaks heartbeat.
+	if got := v.dbcWatchdogDuration(); got != dbcUpdateWatchdogTimeout {
+		t.Errorf("without a heartbeat: %v, want %v", got, dbcUpdateWatchdogTimeout)
+	}
+}
+
+func TestDbcWatchdogDuration_ShortensOnceHeartbeatSeen(t *testing.T) {
+	v := &VehicleSystem{dbcHeartbeatSeen: true}
+	if got := v.dbcWatchdogDuration(); got != dbcUpdateHeartbeatTimeout {
+		t.Errorf("with a heartbeat: %v, want %v", got, dbcUpdateHeartbeatTimeout)
+	}
+}
+
+func TestDbcWatchdogTimeouts_AreOrdered(t *testing.T) {
+	if dbcUpdateHeartbeatTimeout >= dbcUpdateWatchdogTimeout {
+		t.Fatalf("the heartbeat timeout (%v) must be shorter than the fallback (%v)",
+			dbcUpdateHeartbeatTimeout, dbcUpdateWatchdogTimeout)
+	}
+	// Must clear several heartbeat intervals (update-service writes one every
+	// 30s) so one lost write is survivable.
+	if dbcUpdateHeartbeatTimeout < 3*30*time.Second {
+		t.Errorf("heartbeat timeout %v leaves no slack for a missed tick", dbcUpdateHeartbeatTimeout)
+	}
+}
+
+func TestDbcWatchdogTimeout_YieldsToMapDownload(t *testing.T) {
+	// A wedged OTA must not cut the rail a map download is still using.
+	if shouldPowerOffAfterWatchdog(types.StateStandby, nil, true) {
+		t.Error("must not power off while a map download holds the rail")
+	}
+	if !shouldPowerOffAfterWatchdog(types.StateStandby, nil, false) {
+		t.Error("must power off in standby when nothing else holds the rail")
+	}
+}
+
+func TestShouldPowerOffAfterWatchdog_NotInStandby(t *testing.T) {
+	if shouldPowerOffAfterWatchdog(types.StateParked, nil, false) {
+		t.Error("must not power off outside standby")
+	}
+}
+
+func TestShouldPowerOffAfterWatchdog_DeferredPowerOnSuppressesOff(t *testing.T) {
+	on := true
+	if shouldPowerOffAfterWatchdog(types.StateStandby, &on, false) {
+		t.Error("a deferred power-ON request must not also power off")
+	}
+}
+
+func TestShouldPowerOffAfterWatchdog_DeferredPowerOffHonoured(t *testing.T) {
+	off := false
+	if !shouldPowerOffAfterWatchdog(types.StateStandby, &off, false) {
+		t.Error("a deferred power-OFF request in standby should power off")
+	}
+	if shouldPowerOffAfterWatchdog(types.StateStandby, &off, true) {
+		t.Error("a map download must still suppress a deferred power-OFF")
 	}
 }
 

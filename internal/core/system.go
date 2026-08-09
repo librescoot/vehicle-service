@@ -55,8 +55,12 @@ const (
 	seatboxLockDuration       = 200 * time.Millisecond
 	parkDebounceTime          = 1 * time.Second
 
-	// DBC update watchdog — reset on every OTA status write from DBC
-	dbcUpdateWatchdogTimeout = 15 * time.Minute
+	// DBC update watchdog. The long timeout is the fallback for a DBC whose
+	// update-service is too old to publish a heartbeat: cutting its power
+	// early could interrupt an install. Once a heartbeat has been seen, a
+	// silent update really is wedged and three minutes is plenty.
+	dbcUpdateWatchdogTimeout  = 15 * time.Minute
+	dbcUpdateHeartbeatTimeout = 3 * time.Minute
 
 	// How long the DBC may stay powered past a shutdown request because the
 	// dashboard is mid map download. Unlike a DBC OTA, an unfinished map
@@ -112,6 +116,7 @@ type VehicleSystem struct {
 	hibernationRequest         bool              // Track if hibernation was requested during shutdown
 	shutdownFromParked         bool              // Track if shutdown was initiated from parked state
 	dbcUpdating                bool              // Track if DBC update is in progress
+	dbcHeartbeatSeen           bool              // DBC has published an ota heartbeat this update
 	mapDownloading             bool              // Dashboard is mid map/tile download
 	mapHoldTimer               *time.Timer       // Caps how long that defers DBC power off
 	mapHoldGeneration          uint64            // Generation counter to invalidate stale callbacks
@@ -351,12 +356,26 @@ func (v *VehicleSystem) Start() error {
 		restoreDbcUpdate = true
 	}
 
+	// Seed the heartbeat-seen flag from the ota hash: the watcher uses
+	// Start(), not StartWithSync(), so it never replays past field values,
+	// and without this a restart mid-update would silently fall back to the
+	// long watchdog timeout.
+	dbcHeartbeatSeen := false
+	if hb, err := v.redis.GetOtaHeartbeat("dbc"); err != nil {
+		v.logger.Warnf("Failed to read DBC OTA heartbeat on startup: %v", err)
+	} else if hb != "" {
+		v.logger.Infof("DBC has published an OTA heartbeat, using the short update watchdog")
+		dbcHeartbeatSeen = true
+	}
+
 	if restoreDbcUpdate {
 		v.mu.Lock()
 		v.dbcUpdating = true
+		v.dbcHeartbeatSeen = dbcHeartbeatSeen
 		v.startDbcWatchdog()
+		watchdogTimeout := v.dbcWatchdogDuration()
 		v.mu.Unlock()
-		v.logger.Infof("Restored DBC updating state, watchdog started (timeout: %v)", dbcUpdateWatchdogTimeout)
+		v.logger.Infof("Restored DBC updating state, watchdog started (timeout: %v)", watchdogTimeout)
 
 		// Re-set suspend-only inhibitor so pm-service keeps MDB awake during DBC update
 		if err := v.redis.SetInhibitor("dbc-update", "suspend-only", "DBC update in progress (restored on startup)"); err != nil {
@@ -1847,13 +1866,26 @@ func (v *VehicleSystem) publishState() error {
 	return nil
 }
 
-// resetDbcWatchdog resets the DBC update watchdog timer on OTA activity.
-// Called from the ota pub/sub watcher whenever any :dbc field changes.
+// dbcWatchdogDuration picks the watchdog timeout for the current update.
+// Must be called with v.mu held (or on a value not yet shared).
+func (v *VehicleSystem) dbcWatchdogDuration() time.Duration {
+	if v.dbcHeartbeatSeen {
+		return dbcUpdateHeartbeatTimeout
+	}
+	return dbcUpdateWatchdogTimeout
+}
+
+// resetDbcWatchdog resets the DBC update watchdog timer on OTA activity, and
+// notes whether the DBC is publishing heartbeats so the short timeout can
+// apply. Called from the ota pub/sub watcher whenever any :dbc field changes.
 func (v *VehicleSystem) resetDbcWatchdog(field string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if field == "heartbeat:dbc" {
+		v.dbcHeartbeatSeen = true
+	}
 	if v.dbcWatchdogTimer != nil {
-		v.dbcWatchdogTimer.Reset(dbcUpdateWatchdogTimeout)
+		v.dbcWatchdogTimer.Reset(v.dbcWatchdogDuration())
 	}
 	return nil
 }
@@ -1883,7 +1915,7 @@ func (v *VehicleSystem) startDbcWatchdog() {
 	}
 	v.dbcWatchdogGeneration++
 	gen := v.dbcWatchdogGeneration
-	v.dbcWatchdogTimer = time.AfterFunc(dbcUpdateWatchdogTimeout, func() {
+	v.dbcWatchdogTimer = time.AfterFunc(v.dbcWatchdogDuration(), func() {
 		v.mu.RLock()
 		currentGen := v.dbcWatchdogGeneration
 		v.mu.RUnlock()

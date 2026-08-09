@@ -32,6 +32,7 @@ type MessagingClient interface {
 	GetDbcUpdating() (bool, error)
 	SetDbcUpdating(updating bool) error
 	GetOtaStatus(component string) (string, error)
+	GetOtaHeartbeat(component string) (string, error)
 
 	// Power inhibitors
 	SetInhibitor(id, inhibitType, why string) error
