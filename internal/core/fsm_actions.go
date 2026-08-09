@@ -551,10 +551,16 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 		}
 	}
 
-	// Turn off dashboard power when entering standby, unless DBC update is in progress
+	// Turn off dashboard power when entering standby, unless a DBC update or a
+	// map download is still running. The map download hold is capped by
+	// startMapHoldTimer, which applies this deferral when it expires.
 	v.mu.Lock()
-	if v.dbcUpdating {
-		v.logger.Debugf("DBC update in progress, deferring dashboard power OFF until update completes")
+	if v.dbcUpdating || v.mapDownloading {
+		if v.dbcUpdating {
+			v.logger.Debugf("DBC update in progress, deferring dashboard power OFF until update completes")
+		} else {
+			v.logger.Debugf("Map download in progress, deferring dashboard power OFF for up to %v", dbcMapDownloadHoldMax)
+		}
 		powerOff := false
 		v.deferredDashboardPower = &powerOff
 		v.mu.Unlock()
@@ -657,11 +663,23 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 	// Once the publish succeeds, dbcPoweroffSent is set and the abort path
 	// (ShuttingDown -> Parked on EvUnlock) is gated off in the unlock
 	// handler: a late unlock gets queued and replayed from Standby.
-	v.mu.RLock()
+	v.mu.Lock()
 	updating := v.dbcUpdating
 	hibernating := v.hibernationRequest
-	v.mu.RUnlock()
-	if !updating || hibernating {
+	// A map download also defers the shutdown, but only for a capped window,
+	// and never against hibernation: the MDB is about to cut power anyway.
+	mapHolding := v.mapDownloading && !hibernating
+	if mapHolding {
+		v.startMapHoldTimer()
+	} else if v.mapDownloading {
+		v.mapDownloading = false
+		v.stopMapHoldTimer()
+	}
+	v.mu.Unlock()
+	if mapHolding {
+		v.logger.Infof("Deferring DBC poweroff, map download in progress (up to %v)", dbcMapDownloadHoldMax)
+	}
+	if (!updating && !mapHolding) || hibernating {
 		if updating && hibernating {
 			v.logger.Infof("Hibernate requested, forcing DBC shutdown despite active update")
 			v.mu.Lock()
@@ -682,7 +700,7 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 			// whether to queue the request for post-standby replay.
 			v.dbcPoweroffSent.Store(true)
 		}
-	} else {
+	} else if updating {
 		v.logger.Infof("Skipping DBC poweroff, update in progress")
 	}
 

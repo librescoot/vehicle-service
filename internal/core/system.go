@@ -58,6 +58,13 @@ const (
 	// DBC update watchdog — reset on every OTA status write from DBC
 	dbcUpdateWatchdogTimeout = 15 * time.Minute
 
+	// How long the DBC may stay powered past a shutdown request because the
+	// dashboard is mid map download. Unlike a DBC OTA, an unfinished map
+	// download is not damaging: the .part file resumes on the next session.
+	// So this is a courtesy window, not an open-ended hold, and it is capped
+	// so a dashboard that never releases cannot drain the battery.
+	dbcMapDownloadHoldMax = 3 * time.Minute
+
 	// Lifetime of the boot restore marker. Comfortably longer than a systemd
 	// restart (RestartSec defaults to 100ms) and short enough that a marker
 	// left behind by something unrelated cannot cost a legitimate restore
@@ -105,6 +112,9 @@ type VehicleSystem struct {
 	hibernationRequest         bool              // Track if hibernation was requested during shutdown
 	shutdownFromParked         bool              // Track if shutdown was initiated from parked state
 	dbcUpdating                bool              // Track if DBC update is in progress
+	mapDownloading             bool              // Dashboard is mid map/tile download
+	mapHoldTimer               *time.Timer       // Caps how long that defers DBC power off
+	mapHoldGeneration          uint64            // Generation counter to invalidate stale callbacks
 	dbcWatchdogTimer           *time.Timer       // Watchdog timer for DBC updates, reset on OTA activity
 	dbcWatchdogGeneration      uint64            // Generation counter to invalidate stale callbacks
 	deferredDashboardPower     *bool             // Deferred dashboard power state (nil = no change needed)
@@ -168,6 +178,7 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		LedCueCallback:         vs.handleLedCueRequest,
 		LedFadeCallback:        vs.handleLedFadeRequest,
 		UpdateCallback:         vs.handleUpdateRequest,
+		DbcHoldCallback:        vs.handleDbcHoldRequest,
 		HardwareCallback:       vs.handleHardwareRequest,
 		SettingsCallback:       vs.handleSettingsUpdate,
 		OtaDbcActivityCallback: vs.resetDbcWatchdog,
@@ -1874,6 +1885,35 @@ func (v *VehicleSystem) startDbcWatchdog() {
 		}
 		v.handleDbcWatchdogTimeout()
 	})
+}
+
+// startMapHoldTimer caps how long a map download may keep DBC power up past a
+// shutdown request. Must be called with v.mu held.
+func (v *VehicleSystem) startMapHoldTimer() {
+	if v.mapHoldTimer != nil {
+		v.mapHoldTimer.Stop()
+	}
+	v.mapHoldGeneration++
+	gen := v.mapHoldGeneration
+	v.mapHoldTimer = time.AfterFunc(dbcMapDownloadHoldMax, func() {
+		v.mu.RLock()
+		currentGen := v.mapHoldGeneration
+		v.mu.RUnlock()
+		if currentGen != gen {
+			return
+		}
+		v.releaseMapDownloadHold(fmt.Sprintf("hold expired after %v", dbcMapDownloadHoldMax))
+	})
+}
+
+// stopMapHoldTimer stops the map download hold timer.
+// Must be called with v.mu held.
+func (v *VehicleSystem) stopMapHoldTimer() {
+	if v.mapHoldTimer != nil {
+		v.mapHoldTimer.Stop()
+		v.mapHoldTimer = nil
+	}
+	v.mapHoldGeneration++
 }
 
 // stopDbcWatchdog stops the DBC update watchdog timer.

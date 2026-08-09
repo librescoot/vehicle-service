@@ -677,6 +677,82 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 // handleDbcWatchdogTimeout is called when the DBC update watchdog expires —
 // no OTA status writes from the DBC for the watchdog timeout duration.
 // Clears the stuck dbcUpdating state and applies deferred power changes.
+// handleDbcHoldRequest lets the dashboard ask for DBC power to survive a
+// shutdown request while it is mid map or tile download. Unlike a DBC OTA the
+// hold is capped (see dbcMapDownloadHoldMax): an interrupted download resumes
+// from its .part file next session, so this buys time to finish rather than
+// blocking shutdown outright.
+func (v *VehicleSystem) handleDbcHoldRequest(action string) error {
+	switch action {
+	case "map-download":
+		v.mu.Lock()
+		already := v.mapDownloading
+		v.mapDownloading = true
+		v.mu.Unlock()
+		if !already {
+			v.logger.Infof("Dashboard is downloading maps, DBC power off deferred up to %v", dbcMapDownloadHoldMax)
+		}
+		return nil
+
+	case "release":
+		v.releaseMapDownloadHold("dashboard finished downloading")
+		return nil
+
+	default:
+		return fmt.Errorf("unknown DBC hold action: %s", action)
+	}
+}
+
+// releaseMapDownloadHold clears the hold and applies whatever dashboard power
+// change the shutdown path deferred while it was set.
+func (v *VehicleSystem) releaseMapDownloadHold(reason string) {
+	v.mu.Lock()
+	if !v.mapDownloading {
+		v.mu.Unlock()
+		return
+	}
+	v.mapDownloading = false
+	v.stopMapHoldTimer()
+	updating := v.dbcUpdating
+	deferredPower := v.deferredDashboardPower
+	currentState := v.state
+	// A DBC OTA outranks a map download: leave its deferral in place and let
+	// complete-dbc or the OTA watchdog resolve it.
+	if !updating {
+		v.deferredDashboardPower = nil
+	}
+	v.mu.Unlock()
+
+	v.logger.Infof("Map download hold released: %s", reason)
+
+	if updating {
+		return
+	}
+
+	if deferredPower != nil && *deferredPower {
+		v.logger.Debugf("Applying deferred dashboard power ON after map download hold")
+		if err := v.setPower("dashboard_power", true); err != nil {
+			v.logger.Errorf("Failed to apply deferred dashboard power ON: %v", err)
+		}
+		return
+	}
+
+	if currentState != types.StateStandby {
+		return
+	}
+
+	// We are in standby with the DBC still powered because of the hold. Give it
+	// the clean shutdown EnterShuttingDown skipped, then cut the GPIO.
+	if err := v.redis.PublishMessage("dbc:command", "poweroff"); err != nil {
+		v.logger.Warnf("Failed to send DBC poweroff after map download hold: %v", err)
+	}
+	time.AfterFunc(5*time.Second, func() {
+		if err := v.setPower("dashboard_power", false); err != nil {
+			v.logger.Errorf("Failed to turn off dashboard power after map download hold: %v", err)
+		}
+	})
+}
+
 func (v *VehicleSystem) handleDbcWatchdogTimeout() {
 	v.mu.Lock()
 	if !v.dbcUpdating {

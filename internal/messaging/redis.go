@@ -27,6 +27,7 @@ type Callbacks struct {
 	LedCueCallback         func(int) error
 	LedFadeCallback        func(int, int) error
 	UpdateCallback         func(string) error // "start", "complete"
+	DbcHoldCallback        func(string) error // "map-download", "release"
 	HardwareCallback       func(string) error // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
 	SettingsCallback       func(string) error // setting key that was updated (e.g., "scooter.brake-hibernation")
 	OtaDbcActivityCallback func() error       // Called on any OTA hash field change for DBC component
@@ -236,6 +237,7 @@ func (r *RedisClient) StartListening() error {
 	ipc.HandleRequests(r.client, "scooter:led:cue", r.handleLedCueCommand)
 	ipc.HandleRequests(r.client, "scooter:led:fade", r.handleLedFadeCommand)
 	ipc.HandleRequests(r.client, "scooter:update", r.handleUpdateCommand)
+	ipc.HandleRequests(r.client, "scooter:dbc-hold", r.handleDbcHoldCommand)
 	ipc.HandleRequests(r.client, "scooter:hardware", r.handleHardwareCommand)
 	ipc.HandleRequests(r.client, "scooter:hop-on", r.handleHopOnCommand)
 
@@ -340,6 +342,13 @@ func (r *RedisClient) handleUpdateCommand(value string) error {
 		r.logger.Infof("Invalid update command value: %s", value)
 		return fmt.Errorf("invalid update command: %s", value)
 	}
+}
+
+func (r *RedisClient) handleDbcHoldCommand(value string) error {
+	if r.callbacks.DbcHoldCallback == nil {
+		return nil
+	}
+	return r.callbacks.DbcHoldCallback(value)
 }
 
 // handleHardwareCommand processes hardware power control commands
