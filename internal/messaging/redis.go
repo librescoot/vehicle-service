@@ -26,15 +26,15 @@ type Callbacks struct {
 	ForceLockCallback      func() error       // New callback for force-lock
 	LedCueCallback         func(int) error
 	LedFadeCallback        func(int, int) error
-	UpdateCallback         func(string) error // "start", "complete"
-	DbcHoldCallback        func(string) error // "map-download", "release"
-	HardwareCallback       func(string) error // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
-	SettingsCallback       func(string) error // setting key that was updated (e.g., "scooter.brake-hibernation")
-	OtaDbcActivityCallback func() error       // Called on any OTA hash field change for DBC component
-	HopOnCallback          func(string) error // "engage", "release"
-	PowerStateCallback     func(string) error // power-manager state: "running", "suspend-pending", ...
-	MenuOpenCallback       func(bool) error   // scootui-qt menu open/closed
-	BleCallback            func(string) error // ble hash 'status' field: "connected" / "disconnected"
+	UpdateCallback         func(string) error       // "start", "complete"
+	DbcHoldCallback        func(string) error       // "map-download", "release"
+	HardwareCallback       func(string) error       // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
+	SettingsCallback       func(string) error       // setting key that was updated (e.g., "scooter.brake-hibernation")
+	OtaDbcActivityCallback func(field string) error // Called on any OTA hash field change for DBC component
+	HopOnCallback          func(string) error       // "engage", "release"
+	PowerStateCallback     func(string) error       // power-manager state: "running", "suspend-pending", ...
+	MenuOpenCallback       func(bool) error         // scootui-qt menu open/closed
+	BleCallback            func(string) error       // ble hash 'status' field: "connected" / "disconnected"
 }
 
 type RedisClient struct {
@@ -196,7 +196,7 @@ func (r *RedisClient) StartListening() error {
 	r.otaWatcher = r.client.NewHashWatcher("ota")
 	r.otaWatcher.OnAny(func(field, value string) error {
 		if strings.HasSuffix(field, ":dbc") && r.callbacks.OtaDbcActivityCallback != nil {
-			return r.callbacks.OtaDbcActivityCallback()
+			return r.callbacks.OtaDbcActivityCallback(field)
 		}
 		return nil
 	})
@@ -845,6 +845,22 @@ func (r *RedisClient) GetOtaStatus(component string) (string, error) {
 		return "", fmt.Errorf("failed to get OTA status for component %s: %w", component, err)
 	}
 	return status, nil
+}
+
+// GetOtaHeartbeat returns the last heartbeat marker a component published, or
+// an empty string if it has never published one. Used on startup to decide
+// whether the short DBC watchdog is safe to apply.
+func (r *RedisClient) GetOtaHeartbeat(component string) (string, error) {
+	heartbeatKey := fmt.Sprintf("heartbeat:%s", component)
+	heartbeat, err := r.client.HGet("ota", heartbeatKey)
+	if errors.Is(err, redis.Nil) || (err == nil && heartbeat == "") {
+		// Heartbeat field doesn't exist (no OTA in progress), return empty
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to get OTA heartbeat for component %s: %w", component, err)
+	}
+	return heartbeat, nil
 }
 
 // SendCommand sends a command to a Redis list (for communication with other services)

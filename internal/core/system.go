@@ -1849,7 +1849,7 @@ func (v *VehicleSystem) publishState() error {
 
 // resetDbcWatchdog resets the DBC update watchdog timer on OTA activity.
 // Called from the ota pub/sub watcher whenever any :dbc field changes.
-func (v *VehicleSystem) resetDbcWatchdog() error {
+func (v *VehicleSystem) resetDbcWatchdog(field string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.dbcWatchdogTimer != nil {
