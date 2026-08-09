@@ -341,11 +341,21 @@ func (v *VehicleSystem) Start() error {
 		restoreDbcUpdate = true
 	}
 
-	// Also check OTA status as a fallback/secondary check
+	// Also check OTA status as a fallback/secondary check.
+	//
+	// pending-reboot is not in this set. For the DBC it means "installed,
+	// waiting for a power cycle to apply": update-service does not reboot the
+	// DBC, it leaves the staged image for the next power-on. dbcUpdating
+	// defers the dashboard power cut on entering standby, skips the DBC
+	// poweroff on shutdown, and rejects cycle-dashboard-power and
+	// dashboard:off, so holding power for that status blocks the power cycle
+	// the staged update is waiting for. A DBC that dies mid-operation without
+	// signalling completion still restores, via the vehicle:dbc-updating flag
+	// checked above.
 	dbcStatus, err := v.redis.GetOtaStatus("dbc")
 	if err != nil {
 		v.logger.Warnf("Failed to get DBC OTA status on startup: %v", err)
-	} else if dbcStatus == "downloading" || dbcStatus == "preparing" || dbcStatus == "installing" || dbcStatus == "pending-reboot" {
+	} else if dbcStatus == "downloading" || dbcStatus == "preparing" || dbcStatus == "installing" {
 		v.logger.Infof("DBC update in progress on startup (status=%s), restoring dbcUpdating flag", dbcStatus)
 		if !restoreDbcUpdate {
 			// Sync the Redis flag if it wasn't already set
