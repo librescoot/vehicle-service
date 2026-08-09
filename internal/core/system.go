@@ -1698,6 +1698,22 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 			v.logger.Warnf("Failed to stop ppp-link: %v", err)
 			// Continue anyway - power change must not be blocked
 		}
+
+		// Cutting this rail is also the only reliable place to release the
+		// "download-transfer:dbc" suspend inhibitor. update-service on the
+		// DBC sets it for the duration of an OTA transfer and removes it
+		// itself when the transfer ends, but that removal is a deferred call
+		// in the same process we are about to kill: if we cut power mid
+		// transfer, that process dies without ever running it, and the
+		// inhibitor is orphaned in this board's Redis. We are the one
+		// process guaranteed to run exactly when that happens, so despite
+		// this being another board's inhibitor, we are the only place that
+		// can reliably clean it up. A missing/already-removed inhibitor is
+		// not an error worth blocking the power change over.
+		if err := v.redis.RemoveInhibitor("download-transfer:dbc"); err != nil {
+			v.logger.Warnf("Failed to remove download-transfer:dbc inhibitor: %v", err)
+			// Continue anyway - power change must not be blocked
+		}
 	}
 
 	if err := v.writeOutput(component, enabled); err != nil {

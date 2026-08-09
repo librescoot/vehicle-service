@@ -48,6 +48,7 @@ type mockMessagingClient struct {
 	restoreAttemptSets     []string
 	restoreAttemptClears   int
 	faultCalls             []faultCall
+	removedInhibitors      []string
 
 	// Return values
 	vehicleState      types.SystemState
@@ -113,7 +114,12 @@ func (m *mockMessagingClient) GetOtaHeartbeat(component string) (string, error) 
 	return m.otaHeartbeat, nil
 }
 func (m *mockMessagingClient) SetInhibitor(id, inhibitType, why string) error { return nil }
-func (m *mockMessagingClient) RemoveInhibitor(id string) error                { return nil }
+func (m *mockMessagingClient) RemoveInhibitor(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.removedInhibitors = append(m.removedInhibitors, id)
+	return nil
+}
 func (m *mockMessagingClient) GetHashField(hash, field string) (string, error) {
 	return m.hashFieldValue, nil
 }
@@ -2019,6 +2025,44 @@ func TestWriteOutput_DashboardPowerFailureRaisesFault(t *testing.T) {
 
 	if !faultActive(mockRedis, FaultDashboardPowerOutput) {
 		t.Error("expected the dashboard power output fault to be raised")
+	}
+}
+
+// Cutting dashboard power kills update-service on the DBC mid-transfer before
+// its deferred cleanup runs, orphaning the "download-transfer:dbc" suspend
+// inhibitor in this board's Redis. setPower is the single choke point for
+// every dashboard power-off, so it must release that inhibitor itself.
+func TestSetPower_DashboardOff_RemovesOrphanedDbcDownloadInhibitor(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	found := false
+	for _, id := range mockRedis.removedInhibitors {
+		if id == "download-transfer:dbc" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected download-transfer:dbc inhibitor to be removed, got %v", mockRedis.removedInhibitors)
+	}
+}
+
+// Powering the dashboard on must not touch the inhibitor: only the power-off
+// path is where the orphan can occur.
+func TestSetPower_DashboardOn_DoesNotRemoveDbcDownloadInhibitor(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+
+	if err := system.setPower("dashboard_power", true); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	for _, id := range mockRedis.removedInhibitors {
+		if id == "download-transfer:dbc" {
+			t.Errorf("did not expect download-transfer:dbc inhibitor removal on power-on, got %v", mockRedis.removedInhibitors)
+		}
 	}
 }
 
