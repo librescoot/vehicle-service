@@ -779,9 +779,14 @@ func (v *VehicleSystem) handleDbcWatchdogTimeout() {
 	v.deferredDashboardPower = nil
 	currentState := v.state
 	mapDownloading := v.mapDownloading
+	// Snapshot the timeout that actually elapsed (heartbeat vs. no-heartbeat)
+	// while still holding the mutex, in the same read as the other state
+	// above: dbcWatchdogDuration reads dbcHeartbeatSeen, which is only safe
+	// to read under v.mu.
+	elapsedTimeout := v.dbcWatchdogDuration()
 	v.mu.Unlock()
 
-	v.logger.Warnf("DBC update watchdog expired — no OTA activity for %v, clearing stuck state", dbcUpdateWatchdogTimeout)
+	v.logger.Warnf("DBC update watchdog expired, no OTA activity for %v, clearing stuck state", elapsedTimeout)
 
 	if err := v.redis.SetDbcUpdating(false); err != nil {
 		v.logger.Warnf("Failed to persist DBC updating state after watchdog timeout: %v", err)
