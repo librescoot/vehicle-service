@@ -369,6 +369,13 @@ func (v *VehicleSystem) Start() error {
 		}
 	}
 
+	// A map download hold is never restored: it is a 3 minute courtesy window,
+	// and dropping it fails open to normal power management. Clear any
+	// inhibitor a crash mid-hold left behind, or the MDB would never suspend.
+	if err := v.redis.RemoveInhibitor("map-download"); err != nil {
+		v.logger.Warnf("Failed to remove stale map download inhibitor on startup: %v", err)
+	}
+
 	// Read dashboard power from Redis BEFORE hardware initialization
 	// This ensures GPIO starts with correct value (no power interruption)
 	if savedState != "" && savedState != types.StateShuttingDown {

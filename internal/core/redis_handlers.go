@@ -691,6 +691,13 @@ func (v *VehicleSystem) handleDbcHoldRequest(action string) error {
 		v.mu.Unlock()
 		if !already {
 			v.logger.Infof("Dashboard is downloading maps, DBC power off deferred up to %v", dbcMapDownloadHoldMax)
+			// Deferring the DBC power cut alone buys nothing: pm-service starts
+			// suspending the MDB 60s into standby, which takes the modem the
+			// download runs over with it. Keep the MDB awake for the same
+			// window, the way a DBC update does.
+			if err := v.redis.SetInhibitor("map-download", "suspend-only", "map download in progress"); err != nil {
+				v.logger.Warnf("Failed to set map download inhibitor: %v", err)
+			}
 		}
 		return nil
 
@@ -724,6 +731,10 @@ func (v *VehicleSystem) releaseMapDownloadHold(reason string) {
 	v.mu.Unlock()
 
 	v.logger.Infof("Map download hold released: %s", reason)
+
+	if err := v.redis.RemoveInhibitor("map-download"); err != nil {
+		v.logger.Warnf("Failed to remove map download inhibitor: %v", err)
+	}
 
 	if updating {
 		return
