@@ -742,7 +742,22 @@ func (v *VehicleSystem) releaseMapDownloadHold(reason string) {
 		return
 	}
 
-	if deferredPower != nil && *deferredPower {
+	// Nothing deferred means nothing asked for the display to change: it is up
+	// because an operator turned it on, or because something else still wants
+	// it. Ending our own hold is not a reason to switch off someone else's
+	// display, so leave the power alone and let the state machine decide if it
+	// ever needs to.
+	// Nothing deferred means nothing asked for the display to change: it is up
+	// because an operator turned it on, or because something else still wants
+	// it. Ending our own hold is not a reason to switch off someone else's
+	// display, so leave the power alone and let the state machine decide if it
+	// ever needs to.
+	if deferredPower == nil {
+		v.logger.Debugf("No deferred dashboard power after map download hold, leaving the DBC powered")
+		return
+	}
+
+	if *deferredPower {
 		v.logger.Debugf("Applying deferred dashboard power ON after map download hold")
 		if err := v.setPower("dashboard_power", true); err != nil {
 			v.logger.Errorf("Failed to apply deferred dashboard power ON: %v", err)
@@ -754,8 +769,9 @@ func (v *VehicleSystem) releaseMapDownloadHold(reason string) {
 		return
 	}
 
-	// We are in standby with the DBC still powered because of the hold. Give it
-	// the clean shutdown EnterShuttingDown skipped, then cut the GPIO.
+	// A power OFF was deferred by the shutdown path while the hold was set, so
+	// this is that decision being carried out rather than a new one. Give the
+	// DBC the clean shutdown EnterShuttingDown skipped, then cut the GPIO.
 	if err := v.redis.PublishMessage("dbc:command", "poweroff"); err != nil {
 		v.logger.Warnf("Failed to send DBC poweroff after map download hold: %v", err)
 	}

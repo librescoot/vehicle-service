@@ -3213,3 +3213,53 @@ func TestHandleBlinkerChangeUnexpectedChannel(t *testing.T) {
 		t.Error("Expected error for unexpected channel")
 	}
 }
+
+// A map download that ends while the vehicle sits in standby must not switch
+// off a display nobody asked it to switch off. Only a power change the
+// shutdown path actually deferred may be applied on release.
+func TestReleaseMapDownloadHold_NoDeferral_LeavesDbcPowered(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateStandby); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.initialized = true
+
+	// Display is up for a reason of its own (an operator turned it on), so
+	// nothing was deferred.
+	system.mu.Lock()
+	system.mapDownloading = true
+	system.deferredDashboardPower = nil
+	system.mu.Unlock()
+
+	system.releaseMapDownloadHold("test: download finished")
+
+	if n := countPublishedMessages(mockRedis, "dbc:command", "poweroff"); n != 0 {
+		t.Fatalf("expected no dbc:command poweroff with nothing deferred, got %d", n)
+	}
+}
+
+// The same release must still carry out a power off the shutdown path deferred
+// while the hold was set, since that decision was the state machine's.
+func TestReleaseMapDownloadHold_DeferredOff_PowersDown(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateStandby); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.initialized = true
+
+	powerOff := false
+	system.mu.Lock()
+	system.mapDownloading = true
+	system.deferredDashboardPower = &powerOff
+	system.mu.Unlock()
+
+	system.releaseMapDownloadHold("test: download finished")
+
+	if n := countPublishedMessages(mockRedis, "dbc:command", "poweroff"); n != 1 {
+		t.Fatalf("expected exactly one dbc:command poweroff for a deferred off, got %d", n)
+	}
+}
