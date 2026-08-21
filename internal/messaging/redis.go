@@ -607,8 +607,7 @@ func (r *RedisClient) SetHandlebarPosition(isOnPlace bool) error {
 		state = "on-place"
 	}
 
-	err := r.client.HSet("vehicle", "handlebar:position", state)
-	if err != nil {
+	if err := r.vehiclePub.Set("handlebar:position", state); err != nil {
 		r.logger.Warnf("Failed to set handlebar position: %v", err)
 		return err
 	}
