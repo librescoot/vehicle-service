@@ -60,6 +60,10 @@ type mockMessagingClient struct {
 	otaStatus         string
 	otaHeartbeat      string
 	hashFieldValue    string
+	// hashFields overrides hashFieldValue for a specific "hash/field"; tests that
+	// need more than one field at a time set entries here.
+	hashFields    map[string]string
+	usb0GateSets  []bool
 }
 
 func newMockMessagingClient() *mockMessagingClient {
@@ -121,7 +125,16 @@ func (m *mockMessagingClient) RemoveInhibitor(id string) error {
 	return nil
 }
 func (m *mockMessagingClient) GetHashField(hash, field string) (string, error) {
+	if v, ok := m.hashFields[hash+"/"+field]; ok {
+		return v, nil
+	}
 	return m.hashFieldValue, nil
+}
+func (m *mockMessagingClient) SetUsb0Gate(open bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.usb0GateSets = append(m.usb0GateSets, open)
+	return nil
 }
 func (m *mockMessagingClient) PublishAutoStandbyDeadline(deadline time.Time) error { return nil }
 func (m *mockMessagingClient) ClearAutoStandbyDeadline() error                     { return nil }
@@ -266,6 +279,7 @@ type mockHardwareIO struct {
 	pwmCues        []int
 	pwmFades       []struct{ ch, idx int }
 	resyncCount    int
+	usb0Enabled    []bool
 }
 
 func newMockHardwareIO() *mockHardwareIO {
@@ -364,7 +378,12 @@ func (m *mockHardwareIO) PlayPwmFade(ch int, idx int) error {
 }
 
 func (m *mockHardwareIO) SetDbcLed(color string, brightness uint8) error { return nil }
-func (m *mockHardwareIO) SetUsb0Enabled(enabled bool) error              { return nil }
+func (m *mockHardwareIO) SetUsb0Enabled(enabled bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.usb0Enabled = append(m.usb0Enabled, enabled)
+	return nil
+}
 func (m *mockHardwareIO) SetPppLinkEnabled(enabled bool) error           { return nil }
 
 // SimulateInput triggers an input callback

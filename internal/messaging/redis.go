@@ -772,6 +772,25 @@ func (r *RedisClient) PublishGovernorChange(governor string) error {
 	return nil
 }
 
+// SetUsb0Gate records this boot's usb0 gate decision in the system hash.
+//
+// The field exists for the boot failsafe timer, which raises usb0 itself when
+// the field is still absent at its deadline: that is the only signal that
+// separates "vehicle-service decided to keep usb0 down" from "vehicle-service
+// never got far enough to decide". It is deliberately never written for an
+// unresolved gate.
+func (r *RedisClient) SetUsb0Gate(open bool) error {
+	state := "closed"
+	if open {
+		state = "open"
+	}
+	if err := r.systemPub.Set("usb0-gate", state); err != nil {
+		r.logger.Warnf("Failed to set usb0-gate: %v", err)
+		return err
+	}
+	return nil
+}
+
 // SetBacklightEnabled sets the dashboard backlight-enabled flag in Redis
 func (r *RedisClient) SetBacklightEnabled(enabled bool) error {
 	value := "false"

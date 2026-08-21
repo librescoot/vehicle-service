@@ -133,6 +133,7 @@ type VehicleSystem struct {
 	seatboxClosed              bool              // Cached seatbox lock sensor state (true = closed)
 	dbcBlinkerLed              bool              // Blink DBC boot LED in sync with blinkers (default: false)
 	usb0Policy                 string            // "auto" (default, tracks dashboard_power) or "always-on"
+	usb0GateDone               chan struct{}     // Closed to release a usb0 gate resolver still waiting on keycard counts
 	machine                    *librefsm.Machine // librefsm state machine
 	gestures                   *gestureDetector
 
@@ -495,6 +496,11 @@ func (v *VehicleSystem) Start() error {
 	// hands the wheel to setPower so usb0 follows dashboard_power;
 	// "always-on" keeps usb0 up regardless. The policy is a user setting
 	// in the `settings` hash.
+	//
+	// The link comes out of the boot down (10-usb0.network sets
+	// ActivationPolicy=manual), so a gate that cannot be resolved yet costs
+	// nothing but a few seconds of waiting. Raising it on a guess costs
+	// rather more, so the gate is resolved before the link is touched.
 	usb0PolicySetting, err := v.redis.GetHashField("settings", "scooter.usb0-policy")
 	if err != nil {
 		v.logger.Warnf("Failed to read usb0 policy setting on startup: %v (using default auto)", err)
@@ -505,16 +511,7 @@ func (v *VehicleSystem) Start() error {
 	} else if usb0PolicySetting != "" && usb0PolicySetting != "auto" {
 		v.logger.Warnf("Unknown usb0 policy value on startup: %q, using default auto", usb0PolicySetting)
 	}
-	v.mu.RLock()
-	policy := v.usb0Policy
-	v.mu.RUnlock()
-	effective := v.usb0AutoEffective()
-	v.logger.Infof("usb0 policy=%s, auto-effective=%v", policy, effective)
-	if !effective {
-		if err := v.io.SetUsb0Enabled(true); err != nil {
-			v.logger.Warnf("Failed to bring usb0 up at startup: %v", err)
-		}
-	}
+	v.startUsb0GateResolver()
 
 	// Initialize and start librefsm state machine now that hardware is up.
 	// EnterStandby (the default initial state) drives PWM/GPIO immediately,
@@ -1748,21 +1745,26 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 				v.logger.Warnf("Failed to start ppp-link: %v", err)
 			}
 		}
-		if v.usb0AutoEffective() {
+		// An open gate keeps usb0 up regardless of dashboard_power: either the
+		// user picked always-on, or auto is gated by insufficient keycard
+		// pairings. Either way installer/diag tools need reachability, and
+		// reasserting here corrects a transient bounce on the next transition.
+		//
+		// A gate that is still unknown follows dashboard_power like a closed
+		// one. The worst case is usb0 staying down for the few seconds the
+		// boot-time resolver needs; the alternative is asserting the link up
+		// on counts that have not arrived yet.
+		if v.usb0GateState() == usb0GateOpen {
+			if err := v.io.SetUsb0Enabled(true); err != nil {
+				v.logger.Warnf("Failed to reassert usb0 always-on: %v", err)
+			}
+		} else {
 			if err := v.io.SetUsb0Enabled(enabled); err != nil {
 				v.logger.Warnf("Failed to set usb0 link: %v", err)
 				// Don't return error - dashboard power state was set successfully
 			}
-		} else {
-			// Keep usb0 up regardless of dashboard_power: either the user
-			// picked always-on, or auto is gated by insufficient keycard
-			// pairings. Either way installer/diag tools need reachability.
-			// Reassert so a transient bounce gets corrected on the next
-			// state transition.
-			if err := v.io.SetUsb0Enabled(true); err != nil {
-				v.logger.Warnf("Failed to reassert usb0 always-on: %v", err)
-			}
 		}
+		v.recordUsb0Gate(v.usb0GateState())
 	}
 
 	// Persist engine_power commanded state to Redis so ecu-service can gate
@@ -1990,50 +1992,12 @@ func (v *VehicleSystem) stopDbcWatchdog() {
 	}
 }
 
-// usb0AutoEffective reports whether the usb0=auto policy should actually
-// take effect right now. Even when the user has opted in to auto, we keep
-// usb0 up until enough keycards are paired to recover from a lockout —
-// otherwise a bad pairing could leave the scooter unreachable to both the
-// owner (no working card) and the installer (no usb0).
-//
-// Threshold: (master >= 1 AND authorized >= 1) OR authorized >= 2.
-// Counts are published to the "system" hash by keycard-service.
-func (v *VehicleSystem) usb0AutoEffective() bool {
-	v.mu.RLock()
-	policy := v.usb0Policy
-	v.mu.RUnlock()
-	if policy != "auto" {
-		return false
-	}
-
-	master := v.readKeycardCount("keycard-master-count")
-	authorized := v.readKeycardCount("keycard-authorized-count")
-
-	if master >= 1 && authorized >= 1 {
-		return true
-	}
-	if authorized >= 2 {
-		return true
-	}
-	return false
-}
-
-func (v *VehicleSystem) readKeycardCount(field string) int {
-	raw, err := v.redis.GetHashField("system", field)
-	if err != nil || raw == "" {
-		return 0
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil {
-		v.logger.Warnf("Bad %s in system hash: %q (%v)", field, raw, err)
-		return 0
-	}
-	return n
-}
-
 func (v *VehicleSystem) Shutdown() {
 	// Stop blinker if running
 	v.stopBlinker()
+
+	// Release a usb0 gate resolver still waiting on the keycard counts
+	v.stopUsb0GateResolver()
 
 	// Stop any running handlebar lock/unlock goroutine
 	v.cancelHandlebarLock()

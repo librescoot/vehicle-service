@@ -614,22 +614,25 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 		v.mu.Lock()
 		v.usb0Policy = policy
 		v.mu.Unlock()
-		effective := v.usb0AutoEffective()
-		v.logger.Infof("usb0 policy updated to: %s (auto-effective=%v)", policy, effective)
+		gate := v.usb0GateState()
+		v.logger.Infof("usb0 policy updated to: %s (gate=%s)", policy, gate)
 		// Apply immediately so the link reflects the new policy without
-		// waiting for the next dashboard transition.
-		if effective {
+		// waiting for the next dashboard transition. An unknown gate is left
+		// to the boot-time resolver, which is still waiting on the counts.
+		switch gate {
+		case usb0GateOpen:
+			if ioErr := v.io.SetUsb0Enabled(true); ioErr != nil {
+				v.logger.Warnf("Failed to bring usb0 up: %v", ioErr)
+			}
+		case usb0GateClosed:
 			dashboardPower, dpErr := v.redis.GetDashboardPower()
 			if dpErr != nil {
 				v.logger.Warnf("Failed to read dashboard power while applying usb0=auto: %v", dpErr)
 			} else if ioErr := v.io.SetUsb0Enabled(dashboardPower); ioErr != nil {
 				v.logger.Warnf("Failed to sync usb0 to dashboard_power=%v: %v", dashboardPower, ioErr)
 			}
-		} else {
-			if ioErr := v.io.SetUsb0Enabled(true); ioErr != nil {
-				v.logger.Warnf("Failed to bring usb0 up: %v", ioErr)
-			}
 		}
+		v.recordUsb0Gate(gate)
 
 	case "scooter.handlebar-unlocked":
 		value, err := v.redis.GetHashField("settings", settingKey)

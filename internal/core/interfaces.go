@@ -41,6 +41,9 @@ type MessagingClient interface {
 	// Settings
 	GetHashField(hash, field string) (string, error)
 
+	// usb0 gate decision (system hash), read by the boot failsafe timer
+	SetUsb0Gate(open bool) error
+
 	// Auto-standby
 	PublishAutoStandbyDeadline(deadline time.Time) error
 	ClearAutoStandbyDeadline() error
