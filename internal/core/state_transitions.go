@@ -159,10 +159,19 @@ func (v *VehicleSystem) lockHandlebar(onLocked func()) {
 		v.logger.Debugf("Started 60 second window for handlebar lock")
 
 		v.mu.RLock()
-		timerC := v.handlebarTimer.C
+		timer := v.handlebarTimer
 		v.mu.RUnlock()
+		if timer == nil {
+			// cancelHandlebarLock, or this window's own cleanup running from
+			// the position callback, cleared the timer between the line that
+			// set it and here. The window is already closed, so there is
+			// nothing left to wait on. The position callback above reads the
+			// same field and has always guarded it this way.
+			v.logger.Debugf("Handlebar lock window closed before the wait began")
+			return
+		}
 		select {
-		case <-timerC:
+		case <-timer.C:
 			cleanup()
 			v.logger.Debugf("Handlebar lock window expired")
 		case <-done:
