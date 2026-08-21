@@ -295,6 +295,8 @@ func (m *mockHardwareIO) Initialize() error { return nil }
 func (m *mockHardwareIO) Cleanup()          {}
 
 func (m *mockHardwareIO) ReadDigitalInput(channel string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err := m.inputErrs[channel]; err != nil {
 		return false, err
 	}
@@ -302,6 +304,8 @@ func (m *mockHardwareIO) ReadDigitalInput(channel string) (bool, error) {
 }
 
 func (m *mockHardwareIO) ReadDigitalInputDirect(channel string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.digitalInputs[channel], nil
 }
 
@@ -343,20 +347,65 @@ func (m *mockHardwareIO) setDigitalOutput(channel string, value bool) {
 	m.digitalOutputs[channel] = value
 }
 
+// setDigitalInput, clearDigitalOutputs and setInputErrs exist so tests reach
+// the mock's maps through the same mutex the service does. Assigning them
+// directly races with any goroutine the test left running: the handlebar
+// lock and unlock paths both write outputs from their own goroutines and
+// outlive the test body that started them.
+func (m *mockHardwareIO) setDigitalInput(channel string, value bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.digitalInputs[channel] = value
+}
+
+func (m *mockHardwareIO) clearDigitalOutputs() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.digitalOutputs = make(map[string]bool)
+}
+
+func (m *mockHardwareIO) setInputErrs(errs map[string]error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inputErrs = errs
+}
+
 func (m *mockHardwareIO) SetInitialValue(name string, value bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.initialValues[name] = value
 }
 
+// RegisterInputCallback shares the mutex because the service re-registers
+// callbacks from its own goroutines: lockHandlebar and cancelHandlebarLock
+// both do, and two of those overlapping is enough to race on the map.
 func (m *mockHardwareIO) RegisterInputCallback(channel string, callback hardware.InputCallback) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.inputCallbacks[channel] = callback
 }
 
 func (m *mockHardwareIO) SetDebounce(channel string, duration time.Duration) {}
 
+// ResyncInputs snapshots under the mutex and calls the callbacks without it.
+// They run service code that writes back through WriteDigitalOutput, which
+// takes the same mutex, so holding it across the calls would deadlock.
 func (m *mockHardwareIO) ResyncInputs() error {
+	m.mu.Lock()
 	m.resyncCount++
+	type resync struct {
+		channel string
+		cb      hardware.InputCallback
+		value   bool
+	}
+	pending := make([]resync, 0, len(m.inputCallbacks))
 	for channel, cb := range m.inputCallbacks {
-		if err := cb(channel, m.digitalInputs[channel]); err != nil {
+		pending = append(pending, resync{channel: channel, cb: cb, value: m.digitalInputs[channel]})
+	}
+	m.mu.Unlock()
+
+	for _, p := range pending {
+		if err := p.cb(p.channel, p.value); err != nil {
 			return err
 		}
 	}
@@ -864,12 +913,12 @@ func TestEnterReadyToDrive_EngineBrakeDisabled(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
 	// Set up initial conditions: kickstand up, no brakes pressed
-	mockIO.digitalInputs["kickstand"] = false   // up
-	mockIO.digitalInputs["brake_left"] = false  // not pressed
-	mockIO.digitalInputs["brake_right"] = false // not pressed
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked (pressed)
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true   // closed
+	mockIO.setDigitalInput("kickstand", false)   // up
+	mockIO.setDigitalInput("brake_left", false)  // not pressed
+	mockIO.setDigitalInput("brake_right", false) // not pressed
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked (pressed)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)   // closed
 
 	initTestFSM(t, system)
 
@@ -881,7 +930,7 @@ func TestEnterReadyToDrive_EngineBrakeDisabled(t *testing.T) {
 	system.dashboardReady = true
 
 	// Clear any previous outputs
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.clearDigitalOutputs()
 
 	// Trigger transition to ReadyToDrive via kickstand up event
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
@@ -905,12 +954,12 @@ func TestEnterReadyToDrive_EngineBrakeFollowsBrakes(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
 	// Set up initial conditions: kickstand up, LEFT brake pressed
-	mockIO.digitalInputs["kickstand"] = false   // up
-	mockIO.digitalInputs["brake_left"] = true   // pressed
-	mockIO.digitalInputs["brake_right"] = false // not pressed
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", false)   // up
+	mockIO.setDigitalInput("brake_left", true)   // pressed
+	mockIO.setDigitalInput("brake_right", false) // not pressed
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -922,7 +971,7 @@ func TestEnterReadyToDrive_EngineBrakeFollowsBrakes(t *testing.T) {
 	system.dashboardReady = true
 
 	// Clear outputs
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.clearDigitalOutputs()
 
 	// Trigger transition to ReadyToDrive
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
@@ -939,11 +988,11 @@ func TestEnterParked_EngineBrakeEnabled(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
 	// Set up initial conditions: start with kickstand up, then will put it down
-	mockIO.digitalInputs["kickstand"] = false   // up (will change to down)
-	mockIO.digitalInputs["brake_left"] = false  // not pressed
-	mockIO.digitalInputs["brake_right"] = false // not pressed
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", false)   // up (will change to down)
+	mockIO.setDigitalInput("brake_left", false)  // not pressed
+	mockIO.setDigitalInput("brake_right", false) // not pressed
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -956,10 +1005,10 @@ func TestEnterParked_EngineBrakeEnabled(t *testing.T) {
 	system.readyToDriveEntryTime = time.Now().Add(-2 * time.Second) // bypass debounce
 
 	// Clear outputs
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.clearDigitalOutputs()
 
 	// Simulate kickstand going down
-	mockIO.digitalInputs["kickstand"] = true // down
+	mockIO.setDigitalInput("kickstand", true) // down
 
 	// Trigger transition to Parked
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandDown})
@@ -982,12 +1031,12 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	// The bug caused engine_brake to be inverted after transitions.
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true // down (parked)
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true) // down (parked)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -999,7 +1048,7 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	system.dashboardReady = true
 
 	// Clear and verify engine_brake is TRUE in parked by re-entering
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.clearDigitalOutputs()
 	if err := system.machine.SetState(fsm.StateStandby); err != nil {
 		t.Fatalf("Failed to set state to Standby: %v", err)
 	}
@@ -1015,8 +1064,8 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	}
 
 	// Now transition to ReadyToDrive
-	mockIO.digitalInputs["kickstand"] = false // up
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.setDigitalInput("kickstand", false) // up
+	mockIO.clearDigitalOutputs()
 	system.dashboardReady = true // Ensure dashboard ready for guard
 
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
@@ -1033,9 +1082,9 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	}
 
 	// Now go back to Parked
-	mockIO.digitalInputs["kickstand"] = true // down
+	mockIO.setDigitalInput("kickstand", true) // down
 	system.readyToDriveEntryTime = time.Now().Add(-2 * time.Second)
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.clearDigitalOutputs()
 
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandDown})
 	time.Sleep(50 * time.Millisecond)
@@ -1054,11 +1103,11 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 func TestEnterStandby_FromShuttingDown(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1068,7 +1117,7 @@ func TestEnterStandby_FromShuttingDown(t *testing.T) {
 	}
 	system.initialized = true
 
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.clearDigitalOutputs()
 
 	// Transition to Standby (via timeout event)
 	system.machine.Send(librefsm.Event{ID: fsm.EvShutdownTimeout})
@@ -1086,12 +1135,12 @@ func TestKickstandDown_DeferredDuringDebounce(t *testing.T) {
 	// is still down the transition to Parked should fire.
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = false // up
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", false) // up
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1110,7 +1159,7 @@ func TestKickstandDown_DeferredDuringDebounce(t *testing.T) {
 	}
 
 	// Immediately put kickstand down (within debounce window)
-	mockIO.digitalInputs["kickstand"] = true // down
+	mockIO.setDigitalInput("kickstand", true) // down
 	if err := system.handleInputChange("kickstand", true); err != nil {
 		t.Fatalf("handleInputChange failed: %v", err)
 	}
@@ -1136,12 +1185,12 @@ func TestKickstandDown_DeferredCancelledByKickstandUp(t *testing.T) {
 	// be cancelled (GPIO re-read shows kickstand is up).
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = false // up
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", false) // up
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1160,14 +1209,14 @@ func TestKickstandDown_DeferredCancelledByKickstandUp(t *testing.T) {
 	}
 
 	// Kickstand down within debounce window
-	mockIO.digitalInputs["kickstand"] = true
+	mockIO.setDigitalInput("kickstand", true)
 	if err := system.handleInputChange("kickstand", true); err != nil {
 		t.Fatalf("handleInputChange (down) failed: %v", err)
 	}
 
 	// Kickstand back up before debounce expires — this cancels the deferred timer
 	// and sends EvKickstandUp immediately (no-op since already in RTD)
-	mockIO.digitalInputs["kickstand"] = false
+	mockIO.setDigitalInput("kickstand", false)
 	if err := system.handleInputChange("kickstand", false); err != nil {
 		t.Fatalf("handleInputChange (up) failed: %v", err)
 	}
@@ -1184,11 +1233,11 @@ func TestKickstandDown_DeferredCancelledByKickstandUp(t *testing.T) {
 func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1221,9 +1270,9 @@ func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
 func TestHandleInputChange_48vDetect_PublishesMainPower(t *testing.T) {
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 	if err := system.machine.SetState(fsm.StateParked); err != nil {
@@ -1265,11 +1314,11 @@ func countPublishedMessages(mock *mockMessagingClient, channel, message string) 
 func TestUnlockDuringShutdown_PoweroffSent_Defers(t *testing.T) {
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1311,11 +1360,11 @@ func TestUnlockDuringShutdown_PoweroffSent_Defers(t *testing.T) {
 func TestUnlockDuringShutdown_DbcUpdating_AbortsCleanly(t *testing.T) {
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1362,11 +1411,11 @@ func TestUnlockDuringShutdown_DbcUpdating_AbortsCleanly(t *testing.T) {
 func TestShutdownToStandby_ClearsFlag_NoAutoUnlock(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1401,11 +1450,11 @@ func TestShutdownToStandby_ClearsFlag_NoAutoUnlock(t *testing.T) {
 func TestDeferredUnlock_ReplayedFromStandby(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1449,11 +1498,11 @@ func TestDeferredUnlock_ReplayedFromStandby(t *testing.T) {
 func TestReEnterShuttingDown_ClearsPendingUnlock(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1484,11 +1533,11 @@ func TestReEnterShuttingDown_ClearsPendingUnlock(t *testing.T) {
 func TestEnterParked_FromShuttingDown_ReplaysLightsCue(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1542,12 +1591,12 @@ func TestEnterParked_FromShuttingDown_ReplaysLightsCue(t *testing.T) {
 func TestRegression_LockThenUnlockDuringShutdown_EndsInParkedWithLights(t *testing.T) {
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1628,9 +1677,9 @@ func TestRegression_LockThenUnlockDuringShutdown_EndsInParkedWithLights(t *testi
 func TestRegression_MultipleUnlocksDuringShutdown_QueueIdempotently(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1672,9 +1721,9 @@ func TestRegression_MultipleUnlocksDuringShutdown_QueueIdempotently(t *testing.T
 func TestRegression_SecondLockClearsQueuedUnlock(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1719,9 +1768,9 @@ func TestRegression_SecondLockClearsQueuedUnlock(t *testing.T) {
 func TestRegression_UnlockInParkedIsNotQueued(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1747,9 +1796,9 @@ func TestRegression_UnlockInParkedIsNotQueued(t *testing.T) {
 func TestRegression_UnlockInStandbyIsNotQueued(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1785,12 +1834,12 @@ func TestRegression_UnlockInStandbyIsNotQueued(t *testing.T) {
 func TestHopOn_AutoStandbyDeadlinePreserved(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 	system.autoStandbySeconds = 900 // mirror the production default
 
 	initTestFSM(t, system)
@@ -1837,10 +1886,10 @@ func TestHopOn_AutoStandbyDeadlinePreserved(t *testing.T) {
 func TestHopOn_KickstandEventsBlocked(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 	if err := system.machine.SetState(fsm.StateHopOn); err != nil {
@@ -1869,8 +1918,8 @@ func TestHopOn_KickstandEventsBlocked(t *testing.T) {
 func TestHopOn_LockTransitionsToShuttingDown(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true // closed -> guard passes
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true) // closed -> guard passes
 
 	initTestFSM(t, system)
 	if err := system.machine.SetState(fsm.StateHopOn); err != nil {
@@ -1893,8 +1942,8 @@ func TestHopOn_LockTransitionsToShuttingDown(t *testing.T) {
 func TestHopOn_KeycardAuthUnlocksToParked(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 	if err := system.machine.SetState(fsm.StateHopOn); err != nil {
@@ -1917,8 +1966,8 @@ func TestHopOn_KeycardAuthUnlocksToParked(t *testing.T) {
 func TestHopOnLearning_KeycardAuthLocksToShuttingDown(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 	if err := system.machine.SetState(fsm.StateHopOnLearning); err != nil {
@@ -1939,10 +1988,10 @@ func TestHopOnLearning_KeycardAuthLocksToShuttingDown(t *testing.T) {
 func TestHopOnLearning_NoSideEffects(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 	if err := system.machine.SetState(fsm.StateParked); err != nil {
@@ -2035,8 +2084,8 @@ func TestWriteOutput_EnginePowerFaultClearsOnNextWrite(t *testing.T) {
 
 func TestWriteOutput_DashboardPowerFailureRaisesFault(t *testing.T) {
 	system, mockIO, mockRedis := restoreTestSystem(t)
-	mockIO.digitalInputs["kickstand"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
 	system.dashboardReady = true
 	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
 
@@ -2273,8 +2322,8 @@ func TestEnterParked_NoDashboardRollback(t *testing.T) {
 // and no rider-visible state.
 func TestEnterReadyToDrive_DashboardFailureLeavesDriveMode(t *testing.T) {
 	system, mockIO, mockRedis := restoreTestSystem(t)
-	mockIO.digitalInputs["kickstand"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
 	system.dashboardReady = true
 	system.initialized = true
 	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
@@ -2307,9 +2356,9 @@ func TestEnterReadyToDrive_DashboardFailureLeavesDriveMode(t *testing.T) {
 // decide whether a transition happens; entry actions are side effects.
 func TestEnterReadyToDrive_EnginePowerFailureStillEntersDriveMode(t *testing.T) {
 	system, mockIO, mockRedis := restoreTestSystem(t)
-	mockIO.digitalInputs["kickstand"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["brake_left"] = true
+	mockIO.setDigitalInput("kickstand", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("brake_left", true)
 	system.dashboardReady = true
 	mockIO.failOutput("engine_power", fmt.Errorf("gpio line busy"))
 
@@ -2364,8 +2413,8 @@ func TestBrakeHibernation_SettingGatesEntryNotCancel(t *testing.T) {
 		t.Fatalf("SetState: %v", err)
 	}
 
-	mockIO.digitalInputs["brake_left"] = true
-	mockIO.digitalInputs["brake_right"] = true
+	mockIO.setDigitalInput("brake_left", true)
+	mockIO.setDigitalInput("brake_right", true)
 	system.checkHibernationConditions()
 	time.Sleep(50 * time.Millisecond)
 	if got := system.machine.CurrentState(); got != fsm.StateHibernationInitialHold {
@@ -2376,8 +2425,8 @@ func TestBrakeHibernation_SettingGatesEntryNotCancel(t *testing.T) {
 	system.mu.Lock()
 	system.brakeHibernationEnabled = false
 	system.mu.Unlock()
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
 	system.checkHibernationConditions()
 	time.Sleep(50 * time.Millisecond)
 
@@ -2395,8 +2444,8 @@ func TestBrakeHibernation_DisabledBlocksEntry(t *testing.T) {
 		t.Fatalf("SetState: %v", err)
 	}
 
-	mockIO.digitalInputs["brake_left"] = true
-	mockIO.digitalInputs["brake_right"] = true
+	mockIO.setDigitalInput("brake_left", true)
+	mockIO.setDigitalInput("brake_right", true)
 	system.checkHibernationConditions()
 	time.Sleep(50 * time.Millisecond)
 
@@ -2422,8 +2471,8 @@ func TestHibernationForce_GuardedOnBrakes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			system, mockIO, _ := restoreTestSystem(t)
-			mockIO.digitalInputs["brake_left"] = tc.pressed
-			mockIO.digitalInputs["brake_right"] = tc.pressed
+			mockIO.setDigitalInput("brake_left", tc.pressed)
+			mockIO.setDigitalInput("brake_right", tc.pressed)
 
 			if err := system.machine.SetState(fsm.StateHibernationAwaitingConfirm); err != nil {
 				t.Fatalf("SetState: %v", err)
@@ -2471,12 +2520,12 @@ func TestHibernationForce_TimerScopedToState(t *testing.T) {
 func restoreTestSystem(t *testing.T) (*VehicleSystem, *mockHardwareIO, *mockMessagingClient) {
 	t.Helper()
 	system, mockIO, mockRedis := newTestVehicleSystem()
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = false // locked
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", false) // locked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 	initTestFSM(t, system)
 	return system, mockIO, mockRedis
 }
@@ -2518,7 +2567,7 @@ func TestRestoreFSMState_UpdatingDeclined(t *testing.T) {
 // window's temporary callback would be overwritten and expire against nothing.
 func TestRestoreFSMState_DeclineArmsSteeringLock(t *testing.T) {
 	system, mockIO, _ := restoreTestSystem(t)
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
 	system.cancelHandlebarLock()
 
 	system.restoreFSMState(types.SystemState("wat"))
@@ -2551,7 +2600,7 @@ func TestRestoreFSMState_DeclineArmsSteeringLock(t *testing.T) {
 // pending mark must still be consumed so a later call cannot re-arm it.
 func TestRestoreFSMState_DeclineLeavesLockedSteeringAlone(t *testing.T) {
 	system, mockIO, _ := restoreTestSystem(t)
-	mockIO.digitalInputs["handlebar_lock_sensor"] = false // locked
+	mockIO.setDigitalInput("handlebar_lock_sensor", false) // locked
 	system.cancelHandlebarLock()
 
 	system.restoreFSMState(types.SystemState("wat"))
@@ -2571,7 +2620,7 @@ func TestRestoreFSMState_DeclineLeavesLockedSteeringAlone(t *testing.T) {
 // A clean restore never marks the lock pending, so Start()'s call is a no-op.
 func TestRestoreFSMState_CleanRestoreDoesNotArmSteeringLock(t *testing.T) {
 	system, mockIO, _ := restoreTestSystem(t)
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
 	system.cancelHandlebarLock()
 
 	system.restoreFSMState(types.StateParked)
@@ -2769,12 +2818,12 @@ func rtdLockTestSetup(t *testing.T) (*VehicleSystem, *mockHardwareIO) {
 	t.Helper()
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = false // up
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = false // unlocked
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", false) // up
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", false) // unlocked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -2849,7 +2898,7 @@ func TestFSM_EvForceLockFromReadyToDrive_GoesToStandby(t *testing.T) {
 func TestKeycardAuth_TripleTapWithBrakeFromReadyToDrive_ForceLocks(t *testing.T) {
 	system, mockIO := rtdLockTestSetup(t)
 
-	mockIO.digitalInputs["brake_left"] = true
+	mockIO.setDigitalInput("brake_left", true)
 
 	for i := 0; i < 3; i++ {
 		if err := system.keycardAuthPassed(); err != nil {
@@ -2928,12 +2977,12 @@ func TestClampLockOnDisconnectNegative(t *testing.T) {
 func parkedTestSystem(t *testing.T) (*VehicleSystem, *mockHardwareIO, *mockMessagingClient) {
 	t.Helper()
 	system, mockIO, mockRedis := newTestVehicleSystem()
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 	initTestFSM(t, system)
 	if err := system.machine.SetState(fsm.StateParked); err != nil {
 		t.Fatalf("SetState Parked: %v", err)
@@ -3101,7 +3150,7 @@ func TestBleCallbackWired(t *testing.T) {
 func TestHandleBlinkerChangeLeftOn(t *testing.T) {
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["blinker_left"] = true
+	mockIO.setDigitalInput("blinker_left", true)
 	if err := system.handleBlinkerChange("blinker_left", true); err != nil {
 		t.Fatalf("handleBlinkerChange failed: %v", err)
 	}
@@ -3123,8 +3172,8 @@ func TestHandleBlinkerChangeHazardBothOn(t *testing.T) {
 	// sees the first switch already active in the input cache.
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["blinker_left"] = true
-	mockIO.digitalInputs["blinker_right"] = true
+	mockIO.setDigitalInput("blinker_left", true)
+	mockIO.setDigitalInput("blinker_right", true)
 	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
 		t.Fatalf("handleBlinkerChange failed: %v", err)
 	}
@@ -3146,13 +3195,13 @@ func TestHandleBlinkerChangeHazardReleaseOneSide(t *testing.T) {
 	// PUBSUB event must carry the released edge, not the combined state.
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["blinker_left"] = true
-	mockIO.digitalInputs["blinker_right"] = true
+	mockIO.setDigitalInput("blinker_left", true)
+	mockIO.setDigitalInput("blinker_right", true)
 	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
 		t.Fatalf("hazard setup failed: %v", err)
 	}
 
-	mockIO.digitalInputs["blinker_left"] = false
+	mockIO.setDigitalInput("blinker_left", false)
 	if err := system.handleBlinkerChange("blinker_left", false); err != nil {
 		t.Fatalf("handleBlinkerChange failed: %v", err)
 	}
@@ -3172,12 +3221,12 @@ func TestHandleBlinkerChangeHazardReleaseOneSide(t *testing.T) {
 func TestHandleBlinkerChangeAllOff(t *testing.T) {
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["blinker_right"] = true
+	mockIO.setDigitalInput("blinker_right", true)
 	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
 		t.Fatalf("setup failed: %v", err)
 	}
 
-	mockIO.digitalInputs["blinker_right"] = false
+	mockIO.setDigitalInput("blinker_right", false)
 	if err := system.handleBlinkerChange("blinker_right", false); err != nil {
 		t.Fatalf("handleBlinkerChange failed: %v", err)
 	}
@@ -3208,13 +3257,13 @@ func TestHandleBlinkerChangePeerReadErrorFallsBackToLastState(t *testing.T) {
 	// last known blinker state instead of assuming the peer is inactive.
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["blinker_left"] = true
+	mockIO.setDigitalInput("blinker_left", true)
 	if err := system.handleBlinkerChange("blinker_left", true); err != nil {
 		t.Fatalf("setup failed: %v", err)
 	}
 
-	mockIO.inputErrs = map[string]error{"blinker_left": fmt.Errorf("ioctl failed")}
-	mockIO.digitalInputs["blinker_right"] = true
+	mockIO.setInputErrs(map[string]error{"blinker_left": fmt.Errorf("ioctl failed")})
+	mockIO.setDigitalInput("blinker_right", true)
 	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
 		t.Fatalf("handleBlinkerChange failed: %v", err)
 	}
