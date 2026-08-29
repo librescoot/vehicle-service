@@ -475,7 +475,7 @@ func (v *VehicleSystem) handleHopOnRequest(action string) error {
 
 // handleSettingsUpdate processes settings changes from Redis
 func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
-	v.logger.Infof("Handling settings update: %s", settingKey)
+	v.logger.Debugf("Handling settings update: %s", settingKey)
 
 	switch settingKey {
 	case "scooter.brake-hibernation":

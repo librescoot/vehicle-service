@@ -178,7 +178,7 @@ func (r *RedisClient) StartListening() error {
 	r.settingsWatcher = r.client.NewHashWatcher("settings")
 	r.settingsWatcher.OnAny(func(field, value string) error {
 		if r.callbacks.SettingsCallback != nil {
-			r.logger.Infof("Processing settings update: %s", field)
+			r.logger.Debugf("Processing settings update: %s", field)
 			return r.callbacks.SettingsCallback(field)
 		}
 		return nil
