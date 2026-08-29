@@ -82,33 +82,35 @@ const (
 const minLockOnDisconnectSeconds = 5
 
 type VehicleSystem struct {
-	state                  types.SystemState
-	dashboardReady         bool
-	logger                 *logger.Logger
-	io                     HardwareIO
-	redis                  MessagingClient
-	mu                     sync.RWMutex
-	blinkerState           atomic.Int32 // BlinkerState; written from IO callbacks and the Redis blinker handler
-	blinkerStopChan        chan struct{}
-	blinkerExited          chan struct{}     // closed by runBlinker when it returns; stopBlinker waits on it
-	blinkerStartNanos      atomic.Int64      // UnixNano when blinker goroutine started (0 if inactive)
-	blinkerCueIndex        atomic.Int32      // Currently playing blinker cue index (-1 if none)
-	menuOpen               atomic.Bool       // True while scootui-qt reports its menu is open; suppresses brake-light LED cues
-	dbcPoweroffSent        atomic.Bool       // True once EnterShuttingDown published dbc:command poweroff; cleared on EnterShuttingDown entry and EnterStandby
-	pendingUnlock          atomic.Bool       // True when an unlock arrived during a committed shutdown; replayed from EnterStandby
-	ledCurves              *led.CurveLibrary // LED fade/cue metadata for timing
-	initialized            bool
-	handlebarUnlocked      bool          // Track if handlebar has been unlocked in this power cycle
-	handlebarLatchedLocked bool          // Last commanded/confirmed lock state, immune to spurious sensor edges
-	handlebarLatchInit     bool          // True once latch has been seeded from sensor or actuation
-	handlebarTimer         *time.Timer   // Timer for handlebar position window
-	handlebarDone          chan struct{} // Done channel for handlebar lock goroutine
-	handlebarUnlockDone    chan struct{} // Done channel for handlebar unlock goroutine
-	readyToDriveEntryTime  time.Time     // Track when we entered ready-to-drive state for park debounce
-	kickstandDebounceTimer *time.Timer   // Deferred kickstand-down check after debounce window
-	keycardTapCount        int
-	lastKeycardTapTime     time.Time
-	forceStandbyNoLock     bool
+	state                    types.SystemState
+	dashboardReady           bool
+	dashboardReadyEventKnown bool // Whether the current ready value has reached the FSM; guarded by mu.
+	lastDashboardReadyEvent  bool // Last ready value delivered to the FSM; guarded by mu.
+	logger                   *logger.Logger
+	io                       HardwareIO
+	redis                    MessagingClient
+	mu                       sync.RWMutex
+	blinkerState             atomic.Int32 // BlinkerState; written from IO callbacks and the Redis blinker handler
+	blinkerStopChan          chan struct{}
+	blinkerExited            chan struct{}     // closed by runBlinker when it returns; stopBlinker waits on it
+	blinkerStartNanos        atomic.Int64      // UnixNano when blinker goroutine started (0 if inactive)
+	blinkerCueIndex          atomic.Int32      // Currently playing blinker cue index (-1 if none)
+	menuOpen                 atomic.Bool       // True while scootui-qt reports its menu is open; suppresses brake-light LED cues
+	dbcPoweroffSent          atomic.Bool       // True once EnterShuttingDown published dbc:command poweroff; cleared on EnterShuttingDown entry and EnterStandby
+	pendingUnlock            atomic.Bool       // True when an unlock arrived during a committed shutdown; replayed from EnterStandby
+	ledCurves                *led.CurveLibrary // LED fade/cue metadata for timing
+	initialized              bool
+	handlebarUnlocked        bool          // Track if handlebar has been unlocked in this power cycle
+	handlebarLatchedLocked   bool          // Last commanded/confirmed lock state, immune to spurious sensor edges
+	handlebarLatchInit       bool          // True once latch has been seeded from sensor or actuation
+	handlebarTimer           *time.Timer   // Timer for handlebar position window
+	handlebarDone            chan struct{} // Done channel for handlebar lock goroutine
+	handlebarUnlockDone      chan struct{} // Done channel for handlebar unlock goroutine
+	readyToDriveEntryTime    time.Time     // Track when we entered ready-to-drive state for park debounce
+	kickstandDebounceTimer   *time.Timer   // Deferred kickstand-down check after debounce window
+	keycardTapCount          int
+	lastKeycardTapTime       time.Time
+	forceStandbyNoLock       bool
 	// handlebarUnlockedOverride is set by the scooter.handlebar-unlocked
 	// setting (service mode). While true, auto re-lock on standby/shutdown is
 	// suppressed and the latch is held released. Guarded by mu.
@@ -934,9 +936,8 @@ func (v *VehicleSystem) seatboxBlocksHorn() bool {
 }
 
 func (v *VehicleSystem) handleDashboardReady(ready bool) error {
-	v.logger.Infof("Handling dashboard ready state: %v", ready)
-
-	// Skip state transitions during initialization
+	// Skip state transitions during initialization. Start replays a ready
+	// state after the FSM is available, so don't mark it as delivered here.
 	if !v.initialized {
 		v.logger.Infof("Skipping dashboard ready handling - system not yet initialized")
 		v.mu.Lock()
@@ -945,11 +946,13 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 		return nil
 	}
 
-	v.mu.Lock()
-	v.dashboardReady = ready
-	v.mu.Unlock()
+	if !v.recordDashboardReadyEvent(ready) {
+		v.logger.Debugf("Ignoring duplicate dashboard ready state: %v", ready)
+		return nil
+	}
 
-	// Send appropriate event - FSM handles transitions based on current state and guards
+	v.logger.Infof("Handling dashboard ready state: %v", ready)
+	// Send appropriate event - FSM handles transitions based on current state and guards.
 	if ready {
 		v.logger.Infof("Dashboard ready, sending EvDashboardReady")
 		v.machine.Send(librefsm.Event{ID: fsm.EvDashboardReady})
@@ -959,6 +962,22 @@ func (v *VehicleSystem) handleDashboardReady(ready bool) error {
 	}
 
 	return nil
+}
+
+// recordDashboardReadyEvent updates the current dashboard state and returns
+// whether the FSM must see this value. The dashboard deliberately republishes
+// readiness after reconnects because it cannot know whether a prior message
+// arrived; only this consumer can safely suppress an already-handled value.
+func (v *VehicleSystem) recordDashboardReadyEvent(ready bool) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.dashboardReadyEventKnown && v.lastDashboardReadyEvent == ready {
+		return false
+	}
+	v.dashboardReady = ready
+	v.lastDashboardReadyEvent = ready
+	v.dashboardReadyEventKnown = true
+	return true
 }
 
 func (v *VehicleSystem) handleInputChange(channel string, value bool) error {

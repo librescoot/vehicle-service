@@ -895,6 +895,29 @@ func TestHardwareIOInputCallback(t *testing.T) {
 	}
 }
 
+func TestRecordDashboardReadyEventDeduplicatesDeliveredState(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+
+	if !system.recordDashboardReadyEvent(true) {
+		t.Fatal("first ready event must be delivered")
+	}
+	if system.recordDashboardReadyEvent(true) {
+		t.Fatal("duplicate ready event must be ignored")
+	}
+	if !system.recordDashboardReadyEvent(false) {
+		t.Fatal("ready-to-not-ready transition must be delivered")
+	}
+	if system.recordDashboardReadyEvent(false) {
+		t.Fatal("duplicate not-ready event must be ignored")
+	}
+
+	system.mu.RLock()
+	defer system.mu.RUnlock()
+	if !system.dashboardReadyEventKnown || system.dashboardReady || system.lastDashboardReadyEvent {
+		t.Fatalf("unexpected final dashboard state: known=%v ready=%v last=%v", system.dashboardReadyEventKnown, system.dashboardReady, system.lastDashboardReadyEvent)
+	}
+}
+
 // ===== State Transition Tests =====
 // These tests verify the engine brake behavior during state transitions.
 // This was a regression where updateEngineBrake() was called at the end of
