@@ -689,6 +689,9 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 			if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
 				v.logger.Warnf("Failed to remove DBC update inhibitor: %v", err)
 			}
+			if err := v.redis.RemoveInhibitor("install:dbc"); err != nil {
+				v.logger.Warnf("Failed to remove DBC install inhibitor: %v", err)
+			}
 		}
 		if err := v.redis.PublishMessage("dbc:command", "poweroff"); err != nil {
 			v.logger.Warnf("Failed to send DBC poweroff: %v", err)

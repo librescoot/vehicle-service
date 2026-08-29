@@ -395,9 +395,12 @@ func (v *VehicleSystem) Start() error {
 			v.logger.Warnf("Failed to set DBC update inhibitor on startup: %v", err)
 		}
 	} else {
-		// Not restoring DBC update, clean up any stale inhibitor from a previous run
+		// Not restoring DBC update, clean up stale lifecycle/install inhibitors.
 		if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
 			v.logger.Warnf("Failed to remove stale DBC update inhibitor on startup: %v", err)
+		}
+		if err := v.redis.RemoveInhibitor("install:dbc"); err != nil {
+			v.logger.Warnf("Failed to remove stale DBC install inhibitor on startup: %v", err)
 		}
 	}
 

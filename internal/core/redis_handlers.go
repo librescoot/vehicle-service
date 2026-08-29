@@ -217,9 +217,12 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 			v.logger.Warnf("Failed to persist DBC updating state to Redis: %v", err)
 		}
 
-		// Remove suspend-only inhibitor now that DBC update is done
+		// Remove both the lifecycle hold and the install-time reboot block.
 		if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
 			v.logger.Warnf("Failed to remove DBC update inhibitor: %v", err)
+		}
+		if err := v.redis.RemoveInhibitor("install:dbc"); err != nil {
+			v.logger.Warnf("Failed to remove DBC install inhibitor: %v", err)
 		}
 
 		// Handle deferred power-on request
@@ -813,6 +816,9 @@ func (v *VehicleSystem) handleDbcWatchdogTimeout() {
 
 	if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
 		v.logger.Warnf("Failed to remove DBC update inhibitor after watchdog timeout: %v", err)
+	}
+	if err := v.redis.RemoveInhibitor("install:dbc"); err != nil {
+		v.logger.Warnf("Failed to remove DBC install inhibitor after watchdog timeout: %v", err)
 	}
 
 	if deferredPower != nil && *deferredPower {
