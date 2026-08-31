@@ -3,8 +3,6 @@ package core
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -459,24 +457,17 @@ func (v *VehicleSystem) Start() error {
 		}
 	}
 
-	// Reload PWM LED kernel module, log outcomes for diagnostics
-	v.logger.Infof("Reloading PWM LED kernel module (imx_pwm_led)")
-	if err := exec.Command("rmmod", "imx_pwm_led").Run(); err != nil {
-		v.logger.Infof("Warning: Failed to remove PWM LED module: %v", err)
+	reused, fallbackReason, removeErr, err := preparePWMDriver(systemPWMDriverOps())
+	if err != nil {
+		return err
+	}
+	if reused {
+		v.logger.Infof("Reusing verified imx_pwm_led module and device nodes")
 	} else {
-		v.logger.Infof("Successfully removed existing imx_pwm_led module (if present)")
-	}
-	if err := exec.Command("modprobe", "imx_pwm_led").Run(); err != nil {
-		return fmt.Errorf("failed to load PWM LED module: %w", err)
-	}
-	v.logger.Infof("Successfully inserted imx_pwm_led module, waiting for device nodes")
-
-	// Give udev some time to create /dev/pwm_led* nodes (up to 1s)
-	for i := 0; i < 10; i++ {
-		if _, err := os.Stat("/dev/pwm_led0"); err == nil {
-			break
+		v.logger.Infof("Reloaded imx_pwm_led module (existing driver unsuitable: %s)", fallbackReason)
+		if removeErr != nil {
+			v.logger.Infof("Warning: Failed to remove PWM LED module before reload: %v", removeErr)
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Initialize hardware (will use initial values set above)
