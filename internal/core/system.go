@@ -227,7 +227,7 @@ func (v *VehicleSystem) Start() error {
 	// would clobber the state the restore below is meant to bring back.
 	//
 	// The published value is the saved state when there is one, stand-by
-	// otherwise — not a blanket stand-by. bluetooth-service holds the previous
+	// otherwise, not a blanket stand-by. bluetooth-service holds the previous
 	// BLE state rather than trusting an unrecognized one, but a recognized
 	// stand-by during a restore would make the app fire an unlock into a closed
 	// window. Reporting the state the vehicle is about to restore into is honest
