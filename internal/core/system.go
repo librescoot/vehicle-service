@@ -220,6 +220,31 @@ func (v *VehicleSystem) Start() error {
 		savedState = "" // No saved state available; FSM stays in default Standby
 	}
 
+	// Publish the vehicle state before the slow hardware bring-up (PWM module
+	// reload, LED fade/cue loading, GPIO config) so the app can see the scooter
+	// over BLE as early as possible. This must stay below GetVehicleState:
+	// both read and write the same vehicle:state field, and publishing first
+	// would clobber the state the restore below is meant to bring back.
+	//
+	// The published value is the saved state when there is one, stand-by
+	// otherwise — not a blanket stand-by. bluetooth-service holds the previous
+	// BLE state rather than trusting an unrecognized one, but a recognized
+	// stand-by during a restore would make the app fire an unlock into a closed
+	// window. Reporting the state the vehicle is about to restore into is honest
+	// in both directions: if the restore succeeds, that is the state it reaches;
+	// if it declines, the FSM path republishes stand-by as the correction. The
+	// publishState() at the end of Start() still reports the state the machine
+	// actually settled in.
+	earlyState := savedState
+	if earlyState == "" {
+		earlyState = types.StateStandby
+	}
+	if err := v.redis.PublishVehicleState(earlyState); err != nil {
+		// Strictly an optimization: the authoritative publish at the end of
+		// Start() still fails startup if state cannot be published.
+		v.logger.Warnf("Failed to publish early vehicle state: %v", err)
+	}
+
 	// Read initial brake hibernation setting from Redis
 	brakeHibernationSetting, err := v.redis.GetHashField("settings", "scooter.brake-hibernation")
 	if err != nil {
