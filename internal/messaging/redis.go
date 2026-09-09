@@ -17,24 +17,25 @@ import (
 )
 
 type Callbacks struct {
-	DashboardCallback      func(bool) error
-	KeycardCallback        func() error
-	SeatboxCallback        func(bool) error   // true for "on", false for "off"
-	HornCallback           func(bool) error   // true for "on", false for "off"
-	BlinkerCallback        func(string) error // "off", "left", "right", "both"
-	StateCallback          func(string) error // "unlock", "lock", "lock-hibernate"
-	ForceLockCallback      func() error       // New callback for force-lock
-	LedCueCallback         func(int) error
-	LedFadeCallback        func(int, int) error
-	UpdateCallback         func(string) error       // "start", "complete"
-	DbcHoldCallback        func(string) error       // "map-download", "release"
-	HardwareCallback       func(string) error       // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
-	SettingsCallback       func(string) error       // setting key that was updated (e.g., "scooter.brake-hibernation")
-	OtaDbcActivityCallback func(field string) error // Called on any OTA hash field change for DBC component
-	HopOnCallback          func(string) error       // "engage", "release"
-	PowerStateCallback     func(string) error       // power-manager state: "running", "suspend-pending", ...
-	MenuOpenCallback       func(bool) error         // scootui-qt menu open/closed
-	BleCallback            func(string) error       // ble hash 'status' field: "connected" / "disconnected"
+	LockIgnoreSeatboxCallback func(time.Time) error
+	DashboardCallback         func(bool) error
+	KeycardCallback           func() error
+	SeatboxCallback           func(bool) error   // true for "on", false for "off"
+	HornCallback              func(bool) error   // true for "on", false for "off"
+	BlinkerCallback           func(string) error // "off", "left", "right", "both"
+	StateCallback             func(string) error // "unlock", "lock", "lock-hibernate"
+	ForceLockCallback         func() error       // New callback for force-lock
+	LedCueCallback            func(int) error
+	LedFadeCallback           func(int, int) error
+	UpdateCallback            func(string) error       // "start", "complete"
+	DbcHoldCallback           func(string) error       // "map-download", "release"
+	HardwareCallback          func(string) error       // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
+	SettingsCallback          func(string) error       // setting key that was updated (e.g., "scooter.brake-hibernation")
+	OtaDbcActivityCallback    func(field string) error // Called on any OTA hash field change for DBC component
+	HopOnCallback             func(string) error       // "engage", "release"
+	PowerStateCallback        func(string) error       // power-manager state: "running", "suspend-pending", ...
+	MenuOpenCallback          func(bool) error         // scootui-qt menu open/closed
+	BleCallback               func(string) error       // ble hash 'status' field: "connected" / "disconnected"
 }
 
 type RedisClient struct {
@@ -228,6 +229,8 @@ func (r *RedisClient) StartListening() error {
 	if err := r.bleWatcher.Start(); err != nil {
 		return fmt.Errorf("failed to start ble watcher: %w", err)
 	}
+
+	ipc.HandleCalls(r.client, "scooter:lock", r.handleLockCall, ipc.WithCallConcurrency(1))
 
 	// Start queue command listeners
 	ipc.HandleRequests(r.client, "scooter:seatbox", r.handleSeatboxCommand)

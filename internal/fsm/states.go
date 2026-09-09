@@ -42,6 +42,7 @@ const (
 	// External commands (from Redis)
 	EvUnlock            librefsm.EventID = "unlock"
 	EvLock              librefsm.EventID = "lock"
+	EvLockIgnoreSeatbox librefsm.EventID = "lock-ignore-seatbox"
 	EvLockHibernate     librefsm.EventID = "lock-hibernate"
 	EvForceLock         librefsm.EventID = "force-lock"
 	EvDashboardReady    librefsm.EventID = "dashboard-ready"

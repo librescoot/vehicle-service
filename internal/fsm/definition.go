@@ -143,6 +143,16 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		).
 		Transition(StateAtRest, EvAutoStandbyTimeout, StateShuttingDown).
 
+		// Only these exact leaves accept the seatbox override; never inherit it
+		// from AtRest (hop-on) or a wildcard (drive). Check expiry in the FSM,
+		// after queueing, rather than relying on the external handler precheck.
+		Transition(StateParked, EvLockIgnoreSeatbox, StateShuttingDown,
+			librefsm.WithGuard(acceptLockIgnoreSeatbox),
+		).
+		Transition(StateWaitingSeatbox, EvLockIgnoreSeatbox, StateShuttingDown,
+			librefsm.WithGuard(acceptLockIgnoreSeatbox),
+		).
+
 		// From Parked - unlock/kickstand-up/dashboard-ready to ReadyToDrive if conditions met.
 		Transition(StateParked, EvUnlock, StateReadyToDrive,
 			librefsm.WithGuard(actions.CanEnterReadyToDrive), // Requires both kickstand up AND dashboard ready
