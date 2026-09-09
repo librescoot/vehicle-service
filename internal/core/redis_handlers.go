@@ -127,8 +127,8 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 		return v.machine.SendSync(librefsm.Event{ID: fsm.EvUnlock})
 
 	case "lock":
-		if currentState != types.StateParked {
-			return fmt.Errorf("vehicle must be parked to lock (use force-lock from drive)")
+		if currentState != types.StateParked && currentState != types.StateWaitingSeatbox {
+			return fmt.Errorf("vehicle must be parked or waiting for seatbox to lock (use force-lock from drive)")
 		}
 		v.logger.Infof("Sending EvLock")
 		return v.machine.SendSync(librefsm.Event{ID: fsm.EvLock})
@@ -159,10 +159,9 @@ func (v *VehicleSystem) handleLedFadeRequest(ledChannel int, fadeIndex int) erro
 }
 
 // handleForceLockRequest handles force-lock requests from Redis
-// It initiates a forced transition to standby state, skipping the handlebar lock
+// It initiates graceful shutdown, skipping the handlebar lock
 func (v *VehicleSystem) handleForceLockRequest() error {
-	// Send EvForceLock - the OnForceLock action sets the forceStandbyNoLock flag
-	v.logger.Infof("Sending EvForceLock: transitioning to STANDBY (no lock)")
+	v.logger.Infof("Sending EvForceLock: requesting graceful shutdown (no handlebar lock)")
 	return v.machine.SendSync(librefsm.Event{ID: fsm.EvForceLock})
 }
 

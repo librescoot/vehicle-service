@@ -2902,8 +2902,8 @@ func TestKeycardAuth_SingleTapFromReadyToDrive_NoShutdown(t *testing.T) {
 	}
 }
 
-// EvForceLock from ready-to-drive must transition straight to standby.
-func TestFSM_EvForceLockFromReadyToDrive_GoesToStandby(t *testing.T) {
+// EvForceLock from ready-to-drive must transition through graceful shutdown.
+func TestFSM_EvForceLockFromReadyToDrive_GoesToShuttingDown(t *testing.T) {
 	system, _ := rtdLockTestSetup(t)
 
 	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvForceLock}); err != nil {
@@ -2911,8 +2911,8 @@ func TestFSM_EvForceLockFromReadyToDrive_GoesToStandby(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	if system.getCurrentState() != types.StateStandby {
-		t.Errorf("EvForceLock from ReadyToDrive must reach Standby, got %v", system.getCurrentState())
+	if system.getCurrentState() != types.StateShuttingDown {
+		t.Errorf("EvForceLock from ReadyToDrive must reach ShuttingDown, got %v", system.getCurrentState())
 	}
 }
 
@@ -2930,8 +2930,8 @@ func TestKeycardAuth_TripleTapWithBrakeFromReadyToDrive_ForceLocks(t *testing.T)
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	if system.getCurrentState() != types.StateStandby {
-		t.Errorf("Three keycard taps with brake from RTD must reach Standby, got %v", system.getCurrentState())
+	if system.getCurrentState() != types.StateShuttingDown {
+		t.Errorf("Three keycard taps with brake from RTD must reach ShuttingDown, got %v", system.getCurrentState())
 	}
 }
 

@@ -108,7 +108,6 @@ type VehicleSystem struct {
 	kickstandDebounceTimer   *time.Timer   // Deferred kickstand-down check after debounce window
 	keycardTapCount          int
 	lastKeycardTapTime       time.Time
-	forceStandbyNoLock       bool
 	// handlebarUnlockedOverride is set by the scooter.handlebar-unlocked
 	// setting (service mode). While true, auto re-lock on standby/shutdown is
 	// suppressed and the latch is held released. Guarded by mu.
@@ -157,7 +156,6 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		redis:                   redis,
 		initialized:             false,
 		keycardTapCount:         0,
-		forceStandbyNoLock:      false,
 		brakeHibernationEnabled: true,   // Default to enabled for backward compatibility
 		hornEnableMode:          "true", // Default to always enabled for backward compatibility
 		hornWhenSeatboxOpen:     false,  // Default: mute manual horn while seatbox open in unlocked states

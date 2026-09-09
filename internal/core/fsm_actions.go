@@ -516,19 +516,10 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 		v.logger.Warnf("Failed to turn off blinkers on standby: %v", err)
 	}
 
-	v.mu.Lock()
-	forcedStandby := v.forceStandbyNoLock
-	if forcedStandby {
-		v.forceStandbyNoLock = false
-	}
-	v.mu.Unlock()
-
 	prevState := stateIDToSystemState(c.FromState)
 	isFromParked := (prevState == types.StateParked)
 
-	if forcedStandby {
-		v.logger.Debugf("Forced standby: skipping handlebar lock.")
-	} else if isFromParked {
+	if isFromParked {
 		v.mu.RLock()
 		override := v.handlebarUnlockedOverride
 		v.mu.RUnlock()
@@ -637,11 +628,19 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 		v.playLedCue(7, "parked brake off to standby")
 	}
 
-	// Start handlebar locking immediately, unless service mode holds it released.
+	// The no-lock intent belongs only to this transition, not a persistent flag.
+	// An ignored event, failed exit, or later aborted shutdown cannot leak it
+	// into an ordinary lock. librefsm passes the triggering event to OnEnter.
+	forced := c.Event != nil && c.Event.ID == fsm.EvForceLock
+
+	// Start handlebar locking unless forced shutdown or service mode forbids it.
 	v.mu.RLock()
 	override := v.handlebarUnlockedOverride
 	v.mu.RUnlock()
-	if override {
+	if forced {
+		v.cancelHandlebarLock()
+		v.logger.Debugf("Force-lock: skipping handlebar lock during shutdown")
+	} else if override {
 		v.logger.Debugf("Service mode: skipping handlebar lock during shutdown")
 	} else {
 		v.logger.Debugf("Starting handlebar locking during shutdown")
@@ -858,8 +857,8 @@ func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
 func (v *VehicleSystem) ExitHopOn(c *librefsm.Context) error {
 	// Tear down any still-open positioning window so it can't lock the
 	// handlebar after we've left hop-on. The Parked exit path also cancels via
-	// EnterParked->unlockHandlebarIfNeeded, but force-lock->Standby and
-	// WaitingSeatbox do not, so cancel here unconditionally.
+	// EnterParked->unlockHandlebarIfNeeded, but WaitingSeatbox does not.
+	// Cancel here unconditionally, before releasing the lock we owned.
 	v.cancelHandlebarLock()
 
 	v.mu.Lock()
@@ -1042,10 +1041,7 @@ func (v *VehicleSystem) OnLockHibernate(c *librefsm.Context) error {
 }
 
 func (v *VehicleSystem) OnForceLock(c *librefsm.Context) error {
-	v.logger.Infof("FSM: Force-lock - setting force-standby flag")
-	v.mu.Lock()
-	v.forceStandbyNoLock = true
-	v.mu.Unlock()
+	v.logger.Infof("FSM: Force-lock - graceful shutdown without handlebar locking")
 	return nil
 }
 

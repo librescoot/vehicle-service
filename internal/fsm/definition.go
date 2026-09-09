@@ -132,7 +132,7 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 			librefsm.WithGuard(actions.IsSeatboxClosed),
 		).
 		Transition(StateAtRest, EvLock, StateWaitingSeatbox). // Fallback if seatbox open
-		Transition(StateAtRest, EvForceLock, StateStandby,
+		Transition(StateAtRest, EvForceLock, StateShuttingDown,
 			librefsm.WithAction(actions.OnForceLock),
 		).
 		Transition(StateAtRest, EvKeycardAuth, StateShuttingDown, // Keycard tap locks
@@ -202,7 +202,7 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// keycardAuthPassed which routes to EvForceLock).
 		Transition(StateReadyToDrive, EvKickstandDown, StateParked).
 		Transition(StateReadyToDrive, EvDashboardNotReady, StateParked). // Safety: dashboard disconnect
-		Transition(StateReadyToDrive, EvForceLock, StateStandby,
+		Transition(StateReadyToDrive, EvForceLock, StateShuttingDown,
 			librefsm.WithAction(actions.OnForceLock),
 		).
 
@@ -222,7 +222,7 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateWaitingSeatbox, EvKeycardAuth, StateShuttingDown). // Second tap forces lock
 		Transition(StateWaitingSeatbox, EvLock, StateShuttingDown).        // Explicit lock command forces lock
 		Transition(StateWaitingSeatbox, EvUnlock, StateParked).            // Unlock cancels
-		Transition(StateWaitingSeatbox, EvForceLock, StateStandby,
+		Transition(StateWaitingSeatbox, EvForceLock, StateShuttingDown,
 			librefsm.WithAction(actions.OnForceLock),
 		).
 
