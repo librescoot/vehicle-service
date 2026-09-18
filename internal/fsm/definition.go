@@ -118,8 +118,13 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// === Transitions ===
 
 		// From Standby - unlock events transition to Parked
-		Transition(StateStandby, EvUnlock, StateParked).
-		Transition(StateStandby, EvKeycardAuth, StateParked).             // Keycard tap unlocks from standby
+		Transition(StateStandby, EvUnlock, StateParked,
+			librefsm.WithAction(actions.OnUnlock),
+		).
+		// Keycard tap unlocks from standby
+		Transition(StateStandby, EvKeycardAuth, StateParked,
+			librefsm.WithAction(actions.OnUnlock),
+		).
 		Transition(StateStandby, EvDbcUpdateComplete, StateShuttingDown). // DBC update complete, give DBC time to poweroff
 
 		// === StateAtRest parent: family-wide transitions ===
@@ -146,6 +151,7 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// From Parked - unlock/kickstand-up/dashboard-ready to ReadyToDrive if conditions met.
 		Transition(StateParked, EvUnlock, StateReadyToDrive,
 			librefsm.WithGuard(actions.CanEnterReadyToDrive), // Requires both kickstand up AND dashboard ready
+			librefsm.WithAction(actions.OnUnlock),
 		).
 		Transition(StateParked, EvKickstandUp, StateReadyToDrive,
 			librefsm.WithGuards(actions.IsDashboardReady, actions.IsHandlebarUnlocked),
@@ -183,16 +189,26 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// StateAtRest above and are inherited via the parent walk.
 		// Physical inputs like kickstand-up are pre-empted by
 		// BlockedEvents on the state itself.
-		Transition(StateHopOn, EvHopOnRelease, StateParked).
-		Transition(StateHopOn, EvUnlock, StateParked).
+		Transition(StateHopOn, EvHopOnRelease, StateParked,
+			librefsm.WithAction(actions.OnUnlock),
+		).
+		Transition(StateHopOn, EvUnlock, StateParked,
+			librefsm.WithAction(actions.OnUnlock),
+		).
 		// Keycard tap in HopOn unlocks (same as mobile-app unlock) rather
 		// than inheriting StateAtRest's "tap to lock" behavior — a rider
 		// returning to a hop-on'd scooter expects the keycard to release it.
-		Transition(StateHopOn, EvKeycardAuth, StateParked).
+		Transition(StateHopOn, EvKeycardAuth, StateParked,
+			librefsm.WithAction(actions.OnUnlock),
+		).
 
 		// From HopOnLearning — same exit shape as HopOn.
-		Transition(StateHopOnLearning, EvHopOnRelease, StateParked).
-		Transition(StateHopOnLearning, EvUnlock, StateParked).
+		Transition(StateHopOnLearning, EvHopOnRelease, StateParked,
+			librefsm.WithAction(actions.OnUnlock),
+		).
+		Transition(StateHopOnLearning, EvUnlock, StateParked,
+			librefsm.WithAction(actions.OnUnlock),
+		).
 
 		// From ReadyToDrive: only force-lock can shut down from drive.
 		// EvLock and a single EvKeycardAuth are intentionally unhandled here:
@@ -214,6 +230,7 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		// unlock handler queues the request for replay from standby instead.
 		Transition(StateShuttingDown, EvUnlock, StateParked,
 			librefsm.WithGuard(actions.CanAbortShutdown),
+			librefsm.WithAction(actions.OnUnlock),
 		).
 
 		// From WaitingSeatbox - timeout or seatbox closed proceeds with lock
@@ -221,7 +238,10 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateWaitingSeatbox, EvSeatboxClosed, StateShuttingDown).
 		Transition(StateWaitingSeatbox, EvKeycardAuth, StateShuttingDown). // Second tap forces lock
 		Transition(StateWaitingSeatbox, EvLock, StateShuttingDown).        // Explicit lock command forces lock
-		Transition(StateWaitingSeatbox, EvUnlock, StateParked).            // Unlock cancels
+		// Unlock cancels the wait.
+		Transition(StateWaitingSeatbox, EvUnlock, StateParked,
+			librefsm.WithAction(actions.OnUnlock),
+		).
 		Transition(StateWaitingSeatbox, EvForceLock, StateShuttingDown,
 			librefsm.WithAction(actions.OnForceLock),
 		).
@@ -261,7 +281,9 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 
 		// Global transitions from any hibernation state (via parent)
 		// Physical events that cancel hibernation from any substate
-		Transition(StateHibernation, EvUnlock, StateParked).
+		Transition(StateHibernation, EvUnlock, StateParked,
+			librefsm.WithAction(actions.OnUnlock),
+		).
 		// Raising the kickstand cancels hibernation. If the rider is also
 		// ready to drive (dashboard up, handlebar unlocked) skip the Parked
 		// hop and go straight to RTD — otherwise the parent fallback to

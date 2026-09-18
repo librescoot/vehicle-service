@@ -129,6 +129,7 @@ type VehicleSystem struct {
 	lastBleStatus              string            // Last observed ble/status ("connected"/"disconnected")
 	hornEnableMode             string            // Horn enable mode: "true", "false", or "in-drive" (default: "true")
 	hornWhenSeatboxOpen        bool              // Allow manual horn button while seatbox open + unlocked (default: false = muted, guards against the seat lid honking)
+	openSeatboxOnUnlock        bool              // Open the seatbox whenever the scooter leaves a locked state (default: false; advanced setting, no dashboard UI)
 	seatboxClosed              bool              // Cached seatbox lock sensor state (true = closed)
 	dbcBlinkerLed              bool              // Blink DBC boot LED in sync with blinkers (default: false)
 	usb0Policy                 string            // "auto" (default, tracks dashboard_power) or "always-on"
@@ -159,6 +160,7 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		brakeHibernationEnabled: true,   // Default to enabled for backward compatibility
 		hornEnableMode:          "true", // Default to always enabled for backward compatibility
 		hornWhenSeatboxOpen:     false,  // Default: mute manual horn while seatbox open in unlocked states
+		openSeatboxOnUnlock:     false,  // Default: leave the seatbox alone on unlock
 		seatboxClosed:           true,   // Safe default until first sensor read (closed = no suppression)
 		usb0Policy:              "auto", // Default: bring usb0 down in standby; setPower tracks dashboard_power
 	}
@@ -341,6 +343,20 @@ func (v *VehicleSystem) Start() error {
 		v.logger.Infof("Horn-when-seatbox-open setting on startup: %s", hornWhenSeatboxOpenSetting)
 	} else {
 		v.logger.Infof("No horn-when-seatbox-open setting found on startup, using default (false)")
+	}
+
+	// Read initial "open seatbox on unlock" setting from Redis
+	openSeatboxOnUnlockSetting, err := v.redis.GetHashField("settings", "scooter.open-seatbox-on-unlock")
+	if err != nil {
+		v.logger.Warnf("Failed to read open-seatbox-on-unlock setting on startup: %v", err)
+		// Continue with default (false = do not touch the seatbox on unlock)
+	} else if openSeatboxOnUnlockSetting != "" {
+		v.mu.Lock()
+		v.openSeatboxOnUnlock = openSeatboxOnUnlockSetting == "true"
+		v.mu.Unlock()
+		v.logger.Infof("Open-seatbox-on-unlock setting on startup: %s", openSeatboxOnUnlockSetting)
+	} else {
+		v.logger.Infof("No open-seatbox-on-unlock setting found on startup, using default (false)")
 	}
 
 	// Read initial DBC blinker LED setting from Redis
@@ -1918,6 +1934,16 @@ func (v *VehicleSystem) openSeatboxLock() {
 		}
 		v.logger.Infof("Seatbox lock toggled for 0.2s")
 	}()
+}
+
+// openSeatbox is the single entry point for releasing the seatbox latch. The
+// button, the scooter:seatbox request, and unlock auto-open all go through it
+// so the published event and the latch pulse cannot diverge.
+func (v *VehicleSystem) openSeatbox() {
+	if err := v.redis.PublishSeatboxOpened(); err != nil {
+		v.logger.Warnf("Failed to publish seatbox opened event: %v", err)
+	}
+	v.openSeatboxLock()
 }
 
 func (v *VehicleSystem) publishState() error {

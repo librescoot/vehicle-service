@@ -16,10 +16,7 @@ import (
 func (v *VehicleSystem) handleSeatboxRequest(on bool) error {
 	v.logger.Debugf("Handling seatbox request: %v", on)
 	if on {
-		if err := v.redis.PublishSeatboxOpened(); err != nil {
-			v.logger.Warnf("Failed to publish seatbox opened event: %v", err)
-		}
-		v.openSeatboxLock()
+		v.openSeatbox()
 	}
 	return nil
 }
@@ -589,6 +586,17 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 		v.hornWhenSeatboxOpen = value == "true"
 		v.mu.Unlock()
 		v.logger.Infof("Horn-when-seatbox-open updated to: %v", value == "true")
+
+	case "scooter.open-seatbox-on-unlock":
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+		v.mu.Lock()
+		v.openSeatboxOnUnlock = value == "true"
+		v.mu.Unlock()
+		v.logger.Infof("Open-seatbox-on-unlock updated to: %v", value == "true")
 
 	case "scooter.dbc-blinker-led":
 		value, err := v.redis.GetHashField("settings", settingKey)

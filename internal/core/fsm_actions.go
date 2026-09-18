@@ -299,6 +299,28 @@ func (v *VehicleSystem) lockSteeringAfterDeclinedRestore() {
 
 // === State Entry Actions ===
 
+// OnUnlock opens the seatbox when an unlock transition is taken and the
+// advanced scooter.open-seatbox-on-unlock setting is on. It is a transition
+// action, not a state entry action, because librefsm can invoke a target
+// state's OnEnter twice when that target is also its parent's default child —
+// opening the latch twice on one unlock. There is no close command, so the
+// lid stays open until it is pushed shut.
+func (v *VehicleSystem) OnUnlock(c *librefsm.Context) error {
+	v.mu.RLock()
+	enabled := v.openSeatboxOnUnlock
+	v.mu.RUnlock()
+	if !enabled {
+		return nil
+	}
+	event := "unlock"
+	if c != nil && c.Event != nil {
+		event = string(c.Event.ID)
+	}
+	v.logger.Infof("FSM: %s - opening seatbox (open-seatbox-on-unlock)", event)
+	v.openSeatbox()
+	return nil
+}
+
 func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: EnterReadyToDrive")
 
@@ -1047,14 +1069,6 @@ func (v *VehicleSystem) OnForceLock(c *librefsm.Context) error {
 
 func (v *VehicleSystem) OnSeatboxButton(c *librefsm.Context) error {
 	v.logger.Infof("FSM: Seatbox button pressed - opening seatbox")
-
-	// 1. Publish event first (for immediate UI response via PUBSUB)
-	if err := v.redis.PublishSeatboxOpened(); err != nil {
-		v.logger.Warnf("Failed to publish seatbox opened event: %v", err)
-	}
-
-	// 2. Open physical seatbox lock (async, fire-and-forget)
-	v.openSeatboxLock()
-
+	v.openSeatbox()
 	return nil
 }
