@@ -20,6 +20,12 @@ func lockSemanticsSystem(t *testing.T, state librefsm.StateID, closed bool) (*Ve
 	io.setDigitalInput("handlebar_lock_sensor", true)
 	io.setDigitalInput("seatbox_lock_sensor", closed)
 	initTestFSM(t, v)
+	// Hop-on is only reached from parked in production, where the dashboard is
+	// already powered. SetState starts from stand-by, so seed the power state
+	// the parked->hop-on transition would have inherited.
+	if state == fsm.StateHopOn || state == fsm.StateHopOnLearning {
+		io.setDigitalOutput("dashboard_power", true)
+	}
 	t.Cleanup(func() {
 		v.machine.Stop()
 		v.cancelHandlebarLock()
