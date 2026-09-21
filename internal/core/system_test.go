@@ -3354,3 +3354,135 @@ func TestReleaseMapDownloadHold_DeferredOff_PowersDown(t *testing.T) {
 		t.Fatalf("expected exactly one dbc:command poweroff for a deferred off, got %d", n)
 	}
 }
+
+// ===== Brake-light suppression while the scootui-qt menu is open =====
+//
+// Menu navigation taps skip the on-cue, but a lever held when the menu opened
+// must not leave the brake light stuck on.
+
+func brakeCuesContain(cues []int, want int) bool {
+	for _, c := range cues {
+		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
+// bringUpParked wires the inputs and state of a parked scooter with the
+// dashboard up, where the menu exists.
+func bringUpParked(t *testing.T, system *VehicleSystem, mockIO *mockHardwareIO) {
+	t.Helper()
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState Parked: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	system.initialized = true
+	mockIO.pwmCues = nil // drop EnterParked's lights-on cues
+}
+
+// A lever held when the menu opens has its release cue run anyway, so the
+// brake light returns to its parked level instead of staying at full.
+func TestBrakeCue_ReleasedWhileMenuOpen_TurnsLightOff(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+	bringUpParked(t, system, mockIO)
+
+	mockIO.setDigitalInput("brake_right", true)
+	if err := system.handleInputChange("brake_right", true); err != nil {
+		t.Fatalf("press: %v", err)
+	}
+	if err := system.handleMenuOpen(true); err != nil {
+		t.Fatalf("handleMenuOpen: %v", err)
+	}
+
+	mockIO.pwmCues = nil
+	mockIO.setDigitalInput("brake_right", false)
+	if err := system.handleInputChange("brake_right", false); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	if !brakeCuesContain(mockIO.pwmCues, 5) {
+		t.Errorf("releasing the last brake while the menu is open must play the off-cue (5), got %v",
+			mockIO.pwmCues)
+	}
+}
+
+// Navigation taps stay dark: pressing a lever while parked with the menu open
+// plays no on-cue, so tapping through the menu does not flash the brake light.
+func TestBrakeCue_MenuOpenWhileParked_SkipsOnCue(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+	bringUpParked(t, system, mockIO)
+
+	if err := system.handleMenuOpen(true); err != nil {
+		t.Fatalf("handleMenuOpen: %v", err)
+	}
+
+	mockIO.pwmCues = nil
+	mockIO.setDigitalInput("brake_left", true)
+	if err := system.handleInputChange("brake_left", true); err != nil {
+		t.Fatalf("press: %v", err)
+	}
+
+	if brakeCuesContain(mockIO.pwmCues, 4) {
+		t.Errorf("pressing a lever with the menu open while parked must not play the on-cue (4), got %v",
+			mockIO.pwmCues)
+	}
+}
+
+// A brake-navigated screen can outlive the parked state. The stale menu-open
+// flag must not keep muting the brake light once the rider is in drive mode.
+func TestBrakeCue_MenuFlagInDrive_StillPlaysOnCue(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+	bringUpParked(t, system, mockIO)
+
+	if err := system.handleMenuOpen(true); err != nil {
+		t.Fatalf("handleMenuOpen: %v", err)
+	}
+	if err := system.machine.SetState(fsm.StateReadyToDrive); err != nil {
+		t.Fatalf("SetState ReadyToDrive: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	mockIO.setDigitalInput("brake_left", true)
+	if err := system.handleInputChange("brake_left", true); err != nil {
+		t.Fatalf("press: %v", err)
+	}
+
+	if !brakeCuesContain(mockIO.pwmCues, 4) {
+		t.Errorf("braking in drive mode must play the on-cue (4) even with a stale menu-open flag, got %v",
+			mockIO.pwmCues)
+	}
+}
+
+// Closing the menu with a lever still held replays the on-cue that the
+// suppression skipped when the lever went down.
+func TestBrakeCue_MenuCloseWithBrakeHeld_ReplaysOnCue(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+	bringUpParked(t, system, mockIO)
+
+	if err := system.handleMenuOpen(true); err != nil {
+		t.Fatalf("handleMenuOpen: %v", err)
+	}
+
+	mockIO.setDigitalInput("brake_left", true)
+	if err := system.handleInputChange("brake_left", true); err != nil {
+		t.Fatalf("press: %v", err)
+	}
+
+	mockIO.pwmCues = nil
+	if err := system.handleMenuOpen(false); err != nil {
+		t.Fatalf("handleMenuOpen: %v", err)
+	}
+
+	if !brakeCuesContain(mockIO.pwmCues, 4) {
+		t.Errorf("closing the menu with a brake held must replay the on-cue (4), got %v",
+			mockIO.pwmCues)
+	}
+}

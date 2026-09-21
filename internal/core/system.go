@@ -190,11 +190,8 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		OtaDbcActivityCallback: vs.resetDbcWatchdog,
 		HopOnCallback:          vs.handleHopOnRequest,
 		PowerStateCallback:     vs.handlePowerStateChange,
-		MenuOpenCallback: func(open bool) error {
-			vs.menuOpen.Store(open)
-			return nil
-		},
-		BleCallback: vs.handleBleStatusChange,
+		MenuOpenCallback:       vs.handleMenuOpen,
+		BleCallback:            vs.handleBleStatusChange,
 	})
 	return vs
 }
@@ -1013,6 +1010,39 @@ func (v *VehicleSystem) recordDashboardReadyEvent(ready bool) bool {
 	return true
 }
 
+// handleMenuOpen tracks scootui-qt's menu state. The menu is navigated with
+// brake-lever taps, so the brake-light on-cue is skipped while it is open (see
+// handleInputChange).
+func (v *VehicleSystem) handleMenuOpen(open bool) error {
+	if v.menuOpen.Swap(open) == open {
+		return nil
+	}
+	if !open {
+		v.resyncBrakeLight()
+	}
+	return nil
+}
+
+// resyncBrakeLight replays the on-cue if a lever is still held after a menu
+// closes, clearing the dim state left by a press that was suppressed while it
+// was open.
+func (v *VehicleSystem) resyncBrakeLight() {
+	v.mu.RLock()
+	state := v.state
+	v.mu.RUnlock()
+	if state != types.StateParked && state != types.StateReadyToDrive {
+		return
+	}
+	brakeLeft, brakeRight, err := v.readBrakeStates()
+	if err != nil {
+		v.logger.Errorf("%v", err)
+		return
+	}
+	if brakeLeft || brakeRight {
+		v.playLedCue(4, "brake off to on after menu closed")
+	}
+}
+
 func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 	v.logger.Debugf("Input %s => %v", channel, value)
 
@@ -1243,26 +1273,27 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			v.resetAutoStandbyTimer()
 		}
 
-		// Suppress brake-light LED cues while the scootui-qt menu is open:
-		// it's navigated with the brake levers, and each tap would otherwise
-		// flash the brake light on a parked scooter.
-		if !v.menuOpen.Load() {
-			if value {
-				// A brake was just pressed — only play on-cue if the other wasn't already held
-				otherHeld := brakeLeft
-				if channel == "brake_left" {
-					otherHeld = brakeRight
-				}
-				if !otherHeld {
-					if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
-						return err
-					}
-				}
-			} else if !eitherBrakePressed {
-				// Last brake released
-				if err := v.io.PlayPwmCue(5); err != nil { // LED_BRAKE_ON_TO_BRAKE_OFF
+		// Menu navigation taps skip the on-cue on a parked scooter. The off-cue
+		// always runs, so a lever held when the menu opened cannot leave the
+		// light on, and the skip is limited to Parked so a stale menu-open flag
+		// cannot mute the brake light in drive mode.
+		suppressOnCue := v.menuOpen.Load() && currentState == types.StateParked
+
+		if value {
+			// A brake was just pressed — only play on-cue if the other wasn't already held
+			otherHeld := brakeLeft
+			if channel == "brake_left" {
+				otherHeld = brakeRight
+			}
+			if !otherHeld && !suppressOnCue {
+				if err := v.io.PlayPwmCue(4); err != nil { // LED_BRAKE_OFF_TO_BRAKE_ON
 					return err
 				}
+			}
+		} else if !eitherBrakePressed {
+			// Last brake released
+			if err := v.io.PlayPwmCue(5); err != nil { // LED_BRAKE_ON_TO_BRAKE_OFF
+				return err
 			}
 		}
 
