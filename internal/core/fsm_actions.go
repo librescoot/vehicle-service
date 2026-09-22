@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/librescoot/librefsm"
@@ -425,20 +426,6 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: EnterParked")
 
-	v.unlockHandlebarIfNeeded()
-
-	// Ensure backlight is enabled for user interaction
-	if err := v.redis.SetBacklightEnabled(true); err != nil {
-		v.logger.Warnf("Failed to enable backlight: %v", err)
-	}
-
-	// Always turn on dashboard power when entering parked state. A dark
-	// dashboard is not a reason to skip the engine brake and the ECU power-up
-	// below, which is the much larger hole the old early return left.
-	if err := v.setPower("dashboard_power", true); err != nil {
-		v.logger.Errorf("%v", err)
-	}
-
 	// Engage the engine brake before powering the ECU so the motor cannot turn
 	// while the controller comes up. Without a confirmed brake there is no such
 	// guarantee, so the ECU is driven dark instead: a powered controller with
@@ -472,6 +459,28 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 			v.logger.Errorf("%v", err)
 		}
 	}
+
+	v.unlockHandlebarIfNeeded()
+
+	// The rail bring-up's tail (Redis persist, ppp-link start, usb0 request)
+	// runs beside the cues but joins before returning: the FSM publishes
+	// state when this action returns, and a detached tail could be overtaken
+	// by the next transition's power cut: a ppp-link started late talks to the
+	// DBC the stop-before-cut order just unpowered.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := v.setPower("dashboard_power", true); err != nil {
+			v.logger.Errorf("%v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := v.redis.SetBacklightEnabled(true); err != nil {
+			v.logger.Warnf("Failed to enable backlight: %v", err)
+		}
+	}()
 
 	prevState := stateIDToSystemState(c.FromState)
 	if prevState == types.StateReadyToDrive {
@@ -527,6 +536,7 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 	// the timer keeps running through every hop-on detour without any
 	// manual deadline handoff.
 
+	wg.Wait()
 	return nil
 }
 
