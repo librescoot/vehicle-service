@@ -462,8 +462,15 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 		if raiseErr := v.redis.RaiseFault(FaultEcuHeldUnpowered, desc); raiseErr != nil {
 			v.logger.Errorf("Failed to raise fault %d: %v", FaultEcuHeldUnpowered, raiseErr)
 		}
-	} else if err := v.setPower("engine_power", true); err != nil {
-		v.logger.Errorf("%v", err)
+	} else {
+		// The engage is the moment the throttle stops being accepted, so it
+		// belongs at Info: at the default level every step around it (FSM
+		// dispatch, state publish) is Debug-only, and a ride journal cannot
+		// place the cut between the kickstand event and the published state.
+		v.logger.Infof("Engine brake engaged")
+		if err := v.setPower("engine_power", true); err != nil {
+			v.logger.Errorf("%v", err)
+		}
 	}
 
 	prevState := stateIDToSystemState(c.FromState)
