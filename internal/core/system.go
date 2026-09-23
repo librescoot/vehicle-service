@@ -1736,24 +1736,30 @@ func (v *VehicleSystem) handleDashboardPowerChange(enabled bool) error {
 // process memory is the drift this reporting exists to avoid. Revisit only with
 // a measurement.
 func (v *VehicleSystem) writeOutput(channel string, value bool) error {
-	err := v.io.WriteDigitalOutput(channel, value)
+	err, report := v.writeOutputDeferredFault(channel, value)
+	report()
+	return err
+}
 
+// writeOutputDeferredFault separates the GPIO result from fault publication.
+// The caller must run report before its transition is published.
+func (v *VehicleSystem) writeOutputDeferredFault(channel string, value bool) (error, func()) {
+	err := v.io.WriteDigitalOutput(channel, value)
 	code, tracked := outputFaultCodes[channel]
 	if !tracked {
-		return err
+		return err, func() {}
 	}
-
-	if err != nil {
-		if reportErr := v.redis.RaiseFault(code, fmt.Sprintf("%s output write failed: %v", channel, err)); reportErr != nil {
-			v.logger.Errorf("Failed to raise fault %d: %v", code, reportErr)
+	return err, func() {
+		if err != nil {
+			if reportErr := v.redis.RaiseFault(code, fmt.Sprintf("%s output write failed: %v", channel, err)); reportErr != nil {
+				v.logger.Errorf("Failed to raise fault %d: %v", code, reportErr)
+			}
+			return
 		}
-		return err
+		if reportErr := v.redis.ClearFault(code); reportErr != nil {
+			v.logger.Errorf("Failed to clear fault %d: %v", code, reportErr)
+		}
 	}
-
-	if reportErr := v.redis.ClearFault(code); reportErr != nil {
-		v.logger.Errorf("Failed to clear fault %d: %v", code, reportErr)
-	}
-	return nil
 }
 
 // clearOwnedFaults drops every fault this service owns. Called once at startup,
@@ -1772,6 +1778,15 @@ func (v *VehicleSystem) clearOwnedFaults() {
 
 // setPower controls a power output (dashboard_power or engine_power) with consistent logging
 func (v *VehicleSystem) setPower(component string, enabled bool) error {
+	report, finish, err := v.setPowerOutput(component, enabled)
+	report()
+	finish()
+	return err
+}
+
+// setPowerOutput performs the ordered GPIO write. Its returned effects must run
+// before the transition is published; the power-off preconditions stay inline.
+func (v *VehicleSystem) setPowerOutput(component string, enabled bool) (func(), func(), error) {
 	// Handle dashboard ready clearing BEFORE changing power state
 	if component == "dashboard_power" {
 		if err := v.handleDashboardPowerChange(enabled); err != nil {
@@ -1806,14 +1821,18 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 		}
 	}
 
-	if err := v.writeOutput(component, enabled); err != nil {
+	err, report := v.writeOutputDeferredFault(component, enabled)
+	if err != nil {
 		action := "enable"
 		if !enabled {
 			action = "disable"
 		}
-		return fmt.Errorf("failed to %s %s: %w", action, component, err)
+		return report, func() {}, fmt.Errorf("failed to %s %s: %w", action, component, err)
 	}
+	return report, func() { v.finishPowerOutput(component, enabled) }, nil
+}
 
+func (v *VehicleSystem) finishPowerOutput(component string, enabled bool) {
 	// Persist dashboard_power state to Redis and mirror the usb0 link to DBC,
 	// unless a persistent override is pinning usb0 to a specific state.
 	if component == "dashboard_power" {
@@ -1875,7 +1894,6 @@ func (v *VehicleSystem) setPower(component string, enabled bool) error {
 		state = "disabled"
 	}
 	v.logger.Debugf("%s %s", component, state)
-	return nil
 }
 
 // pulseOutput activates an output for a duration then deactivates it

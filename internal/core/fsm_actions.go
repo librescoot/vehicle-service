@@ -342,62 +342,73 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 		v.cancelHandlebarUnlock()
 	}
 
-	// Ensure backlight is enabled for user interaction
-	if err := v.redis.SetBacklightEnabled(true); err != nil {
-		v.logger.Warnf("Failed to enable backlight: %v", err)
+	// Complete Redis and link work before the FSM publishes ready-to-drive,
+	// but never put it ahead of the power and brake GPIO writes.
+	var effects sync.WaitGroup
+	startEffects := func(powerEffects ...func()) {
+		effects.Add(2)
+		go func() {
+			defer effects.Done()
+			for _, effect := range powerEffects {
+				effect()
+			}
+		}()
+		go func() {
+			defer effects.Done()
+			if err := v.redis.SetBacklightEnabled(true); err != nil {
+				v.logger.Warnf("Failed to enable backlight: %v", err)
+			}
+		}()
 	}
+	defer effects.Wait()
 
 	// The ECU got no power, which continuing does not make worse. The machine is
 	// in ready-to-drive either way, and the engine brake, the LED cue and the
-	// brake resync below all still need to run. writeOutput has raised the fault.
-	if err := v.setPower("engine_power", true); err != nil {
-		v.logger.Errorf("%v", err)
+	// brake resync below all still need to run. The fault is reported at the join.
+	engineReport, engineFinish, engineErr := v.setPowerOutput("engine_power", true)
+	if engineErr != nil {
+		v.logger.Errorf("%v", engineErr)
 	}
 
-	if err := v.setPower("dashboard_power", true); err != nil {
-		v.logger.Errorf("%v", err)
+	dashboardReport, dashboardFinish, dashboardErr := v.setPowerOutput("dashboard_power", true)
+	if dashboardErr != nil {
+		v.logger.Errorf("%v", dashboardErr)
 
-		// Cutting engine power here is not a rollback of the transition, it is
-		// compensation for the side effect this same function performed four
-		// lines up. It buys the interval between now and the engine brake being
-		// engaged in Parked. Do not delete it: continuing without it leaves a
-		// powered ECU, no dashboard, and the engine brake written from the
-		// levers below, meaning released whenever the rider is not squeezing.
-		if err := v.setPower("engine_power", false); err != nil {
-			v.logger.Errorf("%v", err)
+		// A failed dashboard GPIO must not leave the controller powered with
+		// the brake following the levers. Cut the rail before any Redis work.
+		offReport, offFinish, offErr := v.setPowerOutput("engine_power", false)
+		if offErr != nil {
+			v.logger.Errorf("%v", offErr)
+			// The power cut failed: report the on command, not a false off.
+			startEffects(engineReport, engineFinish, dashboardReport, offReport)
+		} else {
+			// The controller is already dark. Do not publish a transient on
+			// command after the cut; ecu-service could transmit to a dead ECU.
+			startEffects(engineReport, dashboardReport, offReport, offFinish)
 		}
 
 		// Leave ready-to-drive honestly rather than sitting in it with no
-		// dashboard. The transition exists for exactly this and is unguarded.
-		// Delivered after the machine has already left ready-to-drive it finds
-		// no transition and is dropped, which is harmless.
+		// dashboard. The queued event runs after these effects join; the brake
+		// remains engaged until the Parked entry action takes over.
 		c.Send(librefsm.Event{ID: fsm.EvDashboardNotReady})
-
-		// Returning skips the rest on purpose. Everything below describes a
-		// vehicle that is about to leave ready-to-drive, and the engine brake
-		// write in particular is the one that would release the brake. Not
-		// writing it leaves the brake where it was, which outside drive mode is
-		// engaged.
-		//
-		// dashboardReady stays as it is: this was a GPIO write failure on the
-		// power line, and the dashboard may well still be up. Clearing the flag
-		// would fabricate sensor state.
 		return nil
 	}
 
-	// Check current brake state and set engine brake pin accordingly. A failed
-	// read can only mean an unknown channel name, so carry on with the false,
-	// false it returns rather than skipping the write and the LED cue.
+	// Write the brake GPIO before publishing power, clearing output faults or
+	// reasserting dashboard links. The direct sensor read is required to keep
+	// the brake engaged if either lever is held.
 	brakeLeft, brakeRight, err := v.readBrakeStates()
 	if err != nil {
 		v.logger.Errorf("%v during transition", err)
 	}
-	if err := v.writeOutput("engine_brake", brakeLeft || brakeRight); err != nil {
-		v.logger.Errorf("Failed to set engine brake during transition: %v", err)
+	brakeErr, brakeReport := v.writeOutputDeferredFault("engine_brake", brakeLeft || brakeRight)
+	if brakeErr != nil {
+		v.logger.Errorf("Failed to set engine brake during transition: %v", brakeErr)
 	}
 	v.logger.Debugf("Engine brake set to %v during transition (left: %v, right: %v)", brakeLeft || brakeRight, brakeLeft, brakeRight)
 
-	// Always play parked-to-drive cue when entering ready-to-drive
+	startEffects(engineReport, engineFinish, dashboardReport, dashboardFinish, brakeReport)
+	// Always play parked-to-drive cue when entering ready-to-drive.
 	v.playLedCue(3, "parked to drive")
 
 	// When coming from standby, synchronize brake states
