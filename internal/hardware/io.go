@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -640,6 +641,68 @@ func (io *LinuxHardwareIO) SetUsb0Enabled(enabled bool) error {
 	}
 	io.logger.Debugf("usb0 link set %s", action)
 	return nil
+}
+
+// dbcServiceDestination is the DBC's stable service address (192.168.7.2) as
+// /proc/net/route writes it: its host-order value in little-endian hex. The DBC
+// keeps the address on loopback and the routing table decides which transport
+// carries it: the link monitor prefers usb0 while the USB peer answers, and the
+// PPP hooks provide ppp0 as the fallback.
+const dbcServiceDestination = "0207A8C0"
+
+// DbcLinks is what the routing table says about the two physically independent
+// links to the DBC.
+type DbcLinks struct {
+	// Active is the transport the kernel selects: "usb0", "ppp0", or "" when
+	// neither route is present.
+	Active string
+	// USB and PPP report whether a service route over that transport exists at
+	// all, so a caller can tell a link that carries traffic from one that is
+	// only standing by as a fallback, and a fallback that never came up.
+	USB bool
+	PPP bool
+}
+
+// DbcLinks reads both service routes to the DBC from /proc/net/route.
+//
+// It deliberately does not shell out to ip: vehicle-service samples this on the
+// dashboard power-off path, where the GPIO write must not wait on a fork/exec of
+// a dynamically linked binary. /proc/net/route is the main routing table, which
+// is where the link monitor and the PPP hooks install their entries.
+func (io *LinuxHardwareIO) DbcLinks() (DbcLinks, error) {
+	data, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		return DbcLinks{}, fmt.Errorf("read /proc/net/route: %w", err)
+	}
+	return parseDbcLinks(string(data)), nil
+}
+
+// parseDbcLinks finds the /32 service routes to the DBC in /proc/net/route.
+func parseDbcLinks(data string) DbcLinks {
+	var links DbcLinks
+	for _, line := range strings.Split(data, "\n") {
+		fields := strings.Fields(line)
+		// Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+		if len(fields) < 8 || fields[1] != dbcServiceDestination || fields[7] != "FFFFFFFF" {
+			continue
+		}
+		switch fields[0] {
+		case "usb0":
+			links.USB = true
+		case "ppp0":
+			links.PPP = true
+		}
+	}
+
+	// Both routes can be present at once; USB carries the lower metric and is
+	// the one the kernel selects.
+	switch {
+	case links.USB:
+		links.Active = "usb0"
+	case links.PPP:
+		links.Active = "ppp0"
+	}
+	return links
 }
 
 func (io *LinuxHardwareIO) SetPppLinkEnabled(enabled bool) error {

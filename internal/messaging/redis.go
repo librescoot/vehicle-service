@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -787,6 +788,37 @@ func (r *RedisClient) SetUsb0Gate(open bool) error {
 	if err := r.systemPub.Set("usb0-gate", state); err != nil {
 		r.logger.Warnf("Failed to set usb0-gate: %v", err)
 		return err
+	}
+	return nil
+}
+
+// RecordDbcLink records the link state observed when the DBC was last powered
+// off, in the system hash. transport is an interface name, or "none" when there
+// was no route; usbUp and pppUp say whether each link had a route at all.
+//
+// The record answers a question the live routing table cannot during support:
+// once the installer has taken the DBC's place on the USB port, traffic to the
+// DBC no longer describes normal operation, but the last powered session still
+// does. Recording the two links separately, not just the one that carried
+// traffic, is what lets a reader judge whether the PPP fallback was ever usable.
+func (r *RedisClient) RecordDbcLink(transport string, usbUp, pppUp bool, at time.Time) error {
+	bit := func(up bool) string {
+		if up {
+			return "up"
+		}
+		return "down"
+	}
+	fields := map[string]string{
+		"dbc-link":    transport,
+		"dbc-usb":     bit(usbUp),
+		"dbc-ppp":     bit(pppUp),
+		"dbc-link-at": strconv.FormatInt(at.Unix(), 10),
+	}
+	for field, value := range fields {
+		if err := r.systemPub.Set(field, value); err != nil {
+			r.logger.Warnf("Failed to set %s: %v", field, err)
+			return err
+		}
 	}
 	return nil
 }

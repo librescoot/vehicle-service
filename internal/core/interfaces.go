@@ -44,6 +44,11 @@ type MessagingClient interface {
 	// usb0 gate decision (system hash), read by the boot failsafe timer
 	SetUsb0Gate(open bool) error
 
+	// RecordDbcLink stores the link state observed when the DBC was last
+	// powered off, in the system hash: the transport that carried the route
+	// (an interface name, or "none"), and whether each link had a route at all.
+	RecordDbcLink(transport string, usbUp, pppUp bool, at time.Time) error
+
 	// Auto-standby
 	PublishAutoStandbyDeadline(deadline time.Time) error
 	ClearAutoStandbyDeadline() error
@@ -99,6 +104,10 @@ type HardwareIO interface {
 
 	// Network link (usb0 to DBC)
 	SetUsb0Enabled(enabled bool) error
+
+	// DbcLinks reports both service routes to the DBC and which transport the
+	// kernel selects, from the routing table.
+	DbcLinks() (hardware.DbcLinks, error)
 
 	// PPP link over UART to DBC (ppp-link.service); slaved to dashboard
 	// power so pppd never holds the UART open against an unpowered DBC

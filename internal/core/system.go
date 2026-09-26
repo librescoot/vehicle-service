@@ -136,6 +136,10 @@ type VehicleSystem struct {
 	usb0GateDone               chan struct{}     // Closed to release a usb0 gate resolver still waiting on keycard counts
 	machine                    *librefsm.Machine // librefsm state machine
 	gestures                   *gestureDetector
+	// background runs work that must not sit on a state-transition critical
+	// path, such as the dashboard power GPIO write. Tests replace it to run
+	// synchronously.
+	background func(func())
 
 	// Hop-on bookkeeping: only the steering-lock latch survives across
 	// the EnterHopOn / ExitHopOn pair so we know whether to release on exit.
@@ -163,6 +167,7 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		openSeatboxOnUnlock:     false,  // Default: leave the seatbox alone on unlock
 		seatboxClosed:           true,   // Safe default until first sensor read (closed = no suppression)
 		usb0Policy:              "auto", // Default: bring usb0 down in standby; setPower tracks dashboard_power
+		background:              func(f func()) { go f() },
 	}
 	vs.blinkerCueIndex.Store(-1)
 	vs.gestures = newGestureDetector(func(event string) {
@@ -1799,6 +1804,11 @@ func (v *VehicleSystem) setPowerOutput(component string, enabled bool) (func(), 
 	// ttymxc2 open against a dead line (the unpowered DBC pulls RX into a
 	// permanent break, triggering imx-uart RX flood soft resets).
 	if component == "dashboard_power" && !enabled {
+		// Sample the link before that stop: it removes the backup route, and the
+		// DBC is about to lose power, so this is the last moment the routing
+		// table still describes the session that just ended.
+		v.recordDbcLink()
+
 		if err := v.io.SetPppLinkEnabled(false); err != nil {
 			v.logger.Warnf("Failed to stop ppp-link: %v", err)
 			// Continue anyway - power change must not be blocked
@@ -1830,6 +1840,48 @@ func (v *VehicleSystem) setPowerOutput(component string, enabled bool) (func(), 
 		return report, func() {}, fmt.Errorf("failed to %s %s: %w", action, component, err)
 	}
 	return report, func() { v.finishPowerOutput(component, enabled) }, nil
+}
+
+// recordDbcLink stores the link state observed at the moment the DBC's power was
+// cut.
+//
+// It exists for support: once the installer has taken the DBC's place on the USB
+// port, the live routing table no longer describes normal operation, so the last
+// powered session is the only remaining answer. The sample must be taken before
+// ppp-link is stopped, because that teardown removes the backup route.
+//
+// The critical path here is the dashboard power GPIO write, so only the cheap
+// parts run inline: the on-to-off guard and a /proc/net/route read (tens of
+// microseconds, no fork). The Redis write is handed to the background. A repeated
+// power-off on an already unpowered DBC samples a torn-down link, so it is
+// skipped rather than allowed to overwrite the record with "none".
+func (v *VehicleSystem) recordDbcLink() {
+	on, err := v.redis.GetDashboardPower()
+	if err != nil {
+		v.logger.Warnf("Failed to read dashboard power before recording the DBC link: %v", err)
+		return
+	}
+	if !on {
+		return
+	}
+	links, err := v.io.DbcLinks()
+	if err != nil {
+		v.logger.Warnf("Failed to read the DBC link state: %v", err)
+		return
+	}
+
+	transport := links.Active
+	if transport == "" {
+		transport = "none"
+	}
+	at := time.Now()
+	v.background(func() {
+		if err := v.redis.RecordDbcLink(transport, links.USB, links.PPP, at); err != nil {
+			v.logger.Warnf("Failed to record the DBC link state: %v", err)
+			return
+		}
+		v.logger.Infof("DBC link at power-off: %s (usb=%v ppp=%v)", transport, links.USB, links.PPP)
+	})
 }
 
 func (v *VehicleSystem) finishPowerOutput(component string, enabled bool) {

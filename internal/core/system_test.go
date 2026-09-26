@@ -62,8 +62,11 @@ type mockMessagingClient struct {
 	hashFieldValue    string
 	// hashFields overrides hashFieldValue for a specific "hash/field"; tests that
 	// need more than one field at a time set entries here.
-	hashFields    map[string]string
-	usb0GateSets  []bool
+	hashFields   map[string]string
+	usb0GateSets []bool
+	dbcLinkSets  []string
+	dbcUSBSets   []bool
+	dbcPPPSets   []bool
 }
 
 func newMockMessagingClient() *mockMessagingClient {
@@ -134,6 +137,14 @@ func (m *mockMessagingClient) SetUsb0Gate(open bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.usb0GateSets = append(m.usb0GateSets, open)
+	return nil
+}
+func (m *mockMessagingClient) RecordDbcLink(transport string, usbUp, pppUp bool, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dbcLinkSets = append(m.dbcLinkSets, transport)
+	m.dbcUSBSets = append(m.dbcUSBSets, usbUp)
+	m.dbcPPPSets = append(m.dbcPPPSets, pppUp)
 	return nil
 }
 func (m *mockMessagingClient) PublishAutoStandbyDeadline(deadline time.Time) error { return nil }
@@ -280,6 +291,8 @@ type mockHardwareIO struct {
 	pwmFades       []struct{ ch, idx int }
 	resyncCount    int
 	usb0Enabled    []bool
+	dbcLinks       hardware.DbcLinks
+	dbcLinkErr     error
 }
 
 func newMockHardwareIO() *mockHardwareIO {
@@ -433,7 +446,12 @@ func (m *mockHardwareIO) SetUsb0Enabled(enabled bool) error {
 	m.usb0Enabled = append(m.usb0Enabled, enabled)
 	return nil
 }
-func (m *mockHardwareIO) SetPppLinkEnabled(enabled bool) error           { return nil }
+func (m *mockHardwareIO) SetPppLinkEnabled(enabled bool) error { return nil }
+func (m *mockHardwareIO) DbcLinks() (hardware.DbcLinks, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.dbcLinks, m.dbcLinkErr
+}
 
 // SimulateInput triggers an input callback
 func (m *mockHardwareIO) SimulateInput(channel string, value bool) error {
@@ -451,6 +469,8 @@ func newTestVehicleSystem() (*VehicleSystem, *mockHardwareIO, *mockMessagingClie
 	mockIO := newMockHardwareIO()
 	mockRedis := newMockMessagingClient()
 	system := NewVehicleSystem(mockIO, mockRedis, l)
+	// Run background work inline so a test observes the record deterministically.
+	system.background = func(f func()) { f() }
 	return system, mockIO, mockRedis
 }
 
@@ -2154,6 +2174,93 @@ func TestSetPower_DashboardOn_DoesNotRemoveDbcDownloadInhibitor(t *testing.T) {
 		if id == "download-transfer:dbc" {
 			t.Errorf("did not expect download-transfer:dbc inhibitor removal on power-on, got %v", mockRedis.removedInhibitors)
 		}
+	}
+}
+
+// The link transport recorded at DBC power-off is what lsc doctor reports when
+// the installer has taken the DBC's place on the USB port and the live routing
+// table no longer describes normal operation.
+func TestSetPower_DashboardOff_RecordsDbcLink(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.dbcLinks = hardware.DbcLinks{Active: "usb0", USB: true, PPP: true}
+	mockRedis.dashboardPower = true
+
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	if len(mockRedis.dbcLinkSets) != 1 || mockRedis.dbcLinkSets[0] != "usb0" {
+		t.Fatalf("recorded links = %v, want [usb0]", mockRedis.dbcLinkSets)
+	}
+	if len(mockRedis.dbcUSBSets) != 1 || !mockRedis.dbcUSBSets[0] || !mockRedis.dbcPPPSets[0] {
+		t.Fatalf("recorded link health = usb %v ppp %v, want both up", mockRedis.dbcUSBSets, mockRedis.dbcPPPSets)
+	}
+}
+
+// No route at power-off is recorded as "none", which is distinct from no record
+// at all: doctor must tell "the DBC was unreachable" from "never sampled".
+func TestSetPower_DashboardOff_RecordsNoRouteAsNone(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.dashboardPower = true
+
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	if len(mockRedis.dbcLinkSets) != 1 || mockRedis.dbcLinkSets[0] != "none" {
+		t.Fatalf("recorded links = %v, want [none]", mockRedis.dbcLinkSets)
+	}
+	if mockRedis.dbcUSBSets[0] || mockRedis.dbcPPPSets[0] {
+		t.Fatalf("recorded link health = usb %v ppp %v, want both down", mockRedis.dbcUSBSets, mockRedis.dbcPPPSets)
+	}
+}
+
+func TestSetPower_DashboardOn_DoesNotRecordDbcLink(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.dbcLinks = hardware.DbcLinks{Active: "usb0", USB: true}
+
+	if err := system.setPower("dashboard_power", true); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	if len(mockRedis.dbcLinkSets) != 0 {
+		t.Fatalf("recorded links = %v, want none on power-on", mockRedis.dbcLinkSets)
+	}
+}
+
+// A second power-off on an already unpowered DBC samples a torn-down link, so it
+// must not overwrite the record from the session that actually ended.
+func TestSetPower_DashboardOffTwice_KeepsFirstRecord(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.dbcLinks = hardware.DbcLinks{Active: "usb0", USB: true, PPP: true}
+	mockRedis.dashboardPower = true
+
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+	// The real client persists dashboard:power in finishPowerOutput; the mock's
+	// GetDashboardPower reflects whatever was last set.
+	mockIO.dbcLinks = hardware.DbcLinks{}
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	if len(mockRedis.dbcLinkSets) != 1 || mockRedis.dbcLinkSets[0] != "usb0" {
+		t.Fatalf("recorded links = %v, want only the first [usb0]", mockRedis.dbcLinkSets)
+	}
+}
+
+func TestSetPower_DashboardOff_LinkReadFailureRecordsNothing(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.dbcLinkErr = fmt.Errorf("read /proc/net/route: no such file")
+	mockRedis.dashboardPower = true
+
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	if len(mockRedis.dbcLinkSets) != 0 {
+		t.Fatalf("recorded links = %v, want nothing when the route is unreadable", mockRedis.dbcLinkSets)
 	}
 }
 
