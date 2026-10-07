@@ -35,11 +35,12 @@ type Actions interface {
 	IsHandlebarUnlocked(c *librefsm.Context) bool
 	CanAbortShutdown(c *librefsm.Context) bool // Only before the DBC has been told to halt.
 	IsBrakeHibernationEnabled(c *librefsm.Context) bool
+	IsHibernatePreparationCurrent(c *librefsm.Context) bool
 
 	OnShutdownTimeout(c *librefsm.Context) error
 	OnAutoStandbyTimeout(c *librefsm.Context) error
 	OnHibernationComplete(c *librefsm.Context) error
-	OnLockHibernate(c *librefsm.Context) error // Requests hibernation before shutdown.
+	OnLockHibernate(c *librefsm.Context) error // Prepares an accepted PM request.
 	OnForceLock(c *librefsm.Context) error     // Forces standby.
 	OnSeatboxButton(c *librefsm.Context) error
 	OnUnlock(c *librefsm.Context) error // Opens the seatbox on unlock when the advanced setting is on.

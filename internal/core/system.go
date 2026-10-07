@@ -112,6 +112,7 @@ type VehicleSystem struct {
 	// setting (service mode). While true, auto re-lock on standby/shutdown is
 	// suppressed and the latch is held released. Guarded by mu.
 	handlebarUnlockedOverride  bool
+	physicalHibernationRequest bool
 	hibernationRequest         bool              // Track if hibernation was requested during shutdown
 	shutdownFromParked         bool              // Track if shutdown was initiated from parked state
 	dbcUpdating                bool              // Track if DBC update is in progress

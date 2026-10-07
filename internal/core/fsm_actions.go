@@ -116,6 +116,8 @@ func (v *VehicleSystem) initFSM(ctx context.Context) error {
 		// which would cause a deadlock with the FSM mutex)
 		if err := v.redis.PublishVehicleState(newState); err != nil {
 			v.logger.Errorf("Failed to publish state: %v", err)
+		} else if newState == types.StateStandby && oldState == types.StateShuttingDown {
+			v.completeHibernationShutdown()
 		}
 	})
 
@@ -300,13 +302,23 @@ func (v *VehicleSystem) lockSteeringAfterDeclinedRestore() {
 
 // === State Entry Actions ===
 
-// OnUnlock opens the seatbox when an unlock transition is taken and the
-// advanced scooter.open-seatbox-on-unlock setting is on. It is a transition
-// action, not a state entry action, because librefsm can invoke a target
-// state's OnEnter twice when that target is also its parent's default child —
-// opening the latch twice on one unlock. There is no close command, so the
-// lid stays open until it is pushed shut.
+func (v *VehicleSystem) cancelHibernationRequest() {
+	v.mu.Lock()
+	hibernating := v.hibernationRequest
+	v.hibernationRequest = false
+	v.physicalHibernationRequest = false
+	v.mu.Unlock()
+	if hibernating {
+		if err := v.redis.SendCommand("scooter:power", "hibernate-cancel"); err != nil {
+			v.logger.Errorf("Failed to cancel hibernation: %v", err)
+		}
+	}
+}
+
+// Seatbox opening belongs to the transition action: hierarchical entry may
+// invoke Parked more than once, but an unlock must open the latch only once.
 func (v *VehicleSystem) OnUnlock(c *librefsm.Context) error {
+	v.cancelHibernationRequest()
 	v.mu.RLock()
 	enabled := v.openSeatboxOnUnlock
 	v.mu.RUnlock()
@@ -704,10 +716,8 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 	// dbc-dispatcher on the DBC executes the poweroff.
 	// GPIO cut in EnterStandby (5s later) is the hard backstop.
 	//
-	// If a DBC update is in progress, skip the poweroff so the DBC can keep
-	// updating during standby. But if hibernation was requested, the MDB is
-	// about to power off and the DBC will lose power anyway, so shut it down
-	// cleanly instead of deferring.
+	// Hibernation may interrupt dashboard downloads, but an install-time block
+	// must retain dashboard power until its owner releases it.
 	//
 	// Once the publish succeeds, dbcPoweroffSent is set and the abort path
 	// (ShuttingDown -> Parked on EvUnlock) is gated off in the unlock
@@ -728,20 +738,20 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 	if mapHolding {
 		v.logger.Infof("Deferring DBC poweroff, map download in progress (up to %v)", dbcMapDownloadHoldMax)
 	}
-	if (!updating && !mapHolding) || hibernating {
-		if updating && hibernating {
-			v.logger.Infof("Hibernate requested, forcing DBC shutdown despite active update")
+	if updating && hibernating {
+		install, err := v.redis.GetHashField("power:inhibits", "install:dbc")
+		if err == nil && install == "" {
 			v.mu.Lock()
 			v.dbcUpdating = false
 			v.deferredDashboardPower = nil
 			v.mu.Unlock()
+			updating = false
 			if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
-				v.logger.Warnf("Failed to remove DBC update inhibitor: %v", err)
-			}
-			if err := v.redis.RemoveInhibitor("install:dbc"); err != nil {
-				v.logger.Warnf("Failed to remove DBC install inhibitor: %v", err)
+				v.logger.Warnf("Failed to remove DBC update hold: %v", err)
 			}
 		}
+	}
+	if !updating && !mapHolding {
 		if err := v.redis.PublishMessage("dbc:command", "poweroff"); err != nil {
 			v.logger.Warnf("Failed to send DBC poweroff: %v", err)
 		} else {
@@ -1047,21 +1057,22 @@ func (v *VehicleSystem) AreBrakesPressed(c *librefsm.Context) bool {
 
 func (v *VehicleSystem) OnShutdownTimeout(c *librefsm.Context) error {
 	v.logger.Infof("FSM: Shutdown timeout - transitioning to standby")
+	return nil
+}
 
-	// Check if hibernation was requested
+func (v *VehicleSystem) completeHibernationShutdown() {
 	v.mu.Lock()
-	hibernationRequest := v.hibernationRequest
+	physical := v.physicalHibernationRequest
+	v.physicalHibernationRequest = false
 	v.hibernationRequest = false
 	v.mu.Unlock()
-
-	if hibernationRequest {
-		v.logger.Infof("Hibernation requested, sending hibernate command")
+	// Physical confirmation submits its sole power request after standby is
+	// published. PM-originated preparation must not replace PM's timed intent.
+	if physical {
 		if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-			v.logger.Errorf("Failed to send hibernate command: %v", err)
+			v.logger.Errorf("Failed to send physical hibernation request: %v", err)
 		}
 	}
-
-	return nil
 }
 
 func (v *VehicleSystem) OnAutoStandbyTimeout(c *librefsm.Context) error {
@@ -1072,21 +1083,27 @@ func (v *VehicleSystem) OnAutoStandbyTimeout(c *librefsm.Context) error {
 func (v *VehicleSystem) OnHibernationComplete(c *librefsm.Context) error {
 	v.logger.Infof("FSM: Hibernation complete - triggering hibernation")
 	v.mu.Lock()
+	v.physicalHibernationRequest = true
 	v.hibernationRequest = true
 	v.mu.Unlock()
 	return nil
 }
 
+func (v *VehicleSystem) IsHibernatePreparationCurrent(c *librefsm.Context) bool {
+	id, ok := c.Event.Payload.(string)
+	if !ok || id == "" {
+		return false
+	}
+	current, err := v.redis.GetHashField("power-manager", "hibernate-request-id")
+	return err == nil && current == id
+}
+
 func (v *VehicleSystem) OnLockHibernate(c *librefsm.Context) error {
-	v.logger.Infof("FSM: Lock-hibernate - setting hibernation request")
+	v.logger.Infof("FSM: Preparing vehicle for hibernation")
 	v.mu.Lock()
 	v.hibernationRequest = true
+	v.physicalHibernationRequest = false
 	v.mu.Unlock()
-
-	// Send hibernate command immediately (will execute after shutdown completes)
-	if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-		v.logger.Errorf("Failed to send hibernate command: %v", err)
-	}
 	return nil
 }
 

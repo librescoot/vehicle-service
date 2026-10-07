@@ -289,6 +289,9 @@ func (r *RedisClient) handleStateCommand(value string) error {
 	if r.callbacks.StateCallback == nil && r.callbacks.ForceLockCallback == nil {
 		return nil
 	}
+	if strings.HasPrefix(value, "prepare-hibernate:") && r.callbacks.StateCallback != nil {
+		return r.callbacks.StateCallback(value)
+	}
 	switch value {
 	case "unlock", "lock", "lock-hibernate":
 		if r.callbacks.StateCallback != nil {
@@ -391,7 +394,7 @@ func (r *RedisClient) PublishVehicleState(state types.SystemState) error {
 	stateStr := string(state)
 
 	// Set both state and timestamp fields using SetWithTimestamp
-	if err := r.vehiclePub.SetWithTimestamp("state", stateStr); err != nil {
+	if err := r.vehiclePub.SetWithTimestamp("state", stateStr, ipc.Sync()); err != nil {
 		r.logger.Warnf("Failed to publish vehicle state: %v", err)
 		return err
 	}

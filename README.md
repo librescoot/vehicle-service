@@ -27,6 +27,10 @@ Commands are consumed from these Redis lists:
 - `scooter:led:cue` and `scooter:led:fade`
 - `scooter:update`, `scooter:dbc-hold`, `scooter:hardware`, and `scooter:hop-on`
 
+`scooter:state lock-hibernate` submits one manual request to PM. PM admits explicit sleep from `parked` or `stand-by`; from `parked` it sends internal `prepare-hibernate:<request-id>`. Vehicle-service validates that ID against `power-manager[hibernate-request-id]` inside the parked-state FSM transition, then performs graceful dashboard and vehicle shutdown without submitting a second power request. Obsolete preparation cannot initiate locking. Rejection reports `hibernate-preparation-failed:<request-id>` on `scooter:power`.
+
+Confirmed physical brake hibernation submits its manual power request only after publishing `stand-by`. Unlocking during hibernation preparation cancels the pending power intent. Dashboard installation inhibitors belong to their installer and are not removed by hibernation.
+
 The service also watches `dashboard`, `keycard`, `settings`, `ota`,
 `power-manager`, and `ble` hashes. It uses the hash-and-notification convention:
 a channel message identifies the changed field, while the current value remains

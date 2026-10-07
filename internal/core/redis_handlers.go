@@ -106,8 +106,24 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 	v.logger.Debugf("Handling state request: %s", state)
 	currentState := v.getCurrentState()
 
+	if id, ok := strings.CutPrefix(state, "prepare-hibernate:"); ok {
+		if id == "" {
+			return fmt.Errorf("missing hibernation request id")
+		}
+		if err := v.machine.SendSync(librefsm.Event{ID: fsm.EvLockHibernate, Payload: id}); err != nil {
+			return err
+		}
+		if v.machine.CurrentState() != fsm.StateShuttingDown {
+			return v.redis.SendCommand("scooter:power", "hibernate-preparation-failed:"+id)
+		}
+		return nil
+	}
+
 	switch state {
 	case "unlock":
+		if currentState == types.StateShuttingDown && v.dbcPoweroffSent.Load() {
+			v.cancelHibernationRequest()
+		}
 		// Queue the unlock for replay once EnterStandby has cycled the GPIO.
 		// The veto itself lives on the ShuttingDown to Parked transition, which
 		// is where it applies to every dispatch path rather than only this one;
@@ -131,12 +147,7 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 		return v.machine.SendSync(librefsm.Event{ID: fsm.EvLock})
 
 	case "lock-hibernate":
-		if currentState != types.StateParked {
-			return fmt.Errorf("vehicle must be parked to lock-hibernate")
-		}
-		v.logger.Infof("Sending EvLockHibernate")
-		// The OnLockHibernate action handles setting the hibernation flag and sending the command
-		return v.machine.SendSync(librefsm.Event{ID: fsm.EvLockHibernate})
+		return v.redis.SendCommand("scooter:power", "hibernate-manual")
 
 	default:
 		return fmt.Errorf("invalid state request: %s", state)

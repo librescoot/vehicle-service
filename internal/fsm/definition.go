@@ -160,6 +160,7 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 			librefsm.WithGuards(actions.IsKickstandUp, actions.IsHandlebarUnlocked),
 		).
 		Transition(StateParked, EvLockHibernate, StateShuttingDown,
+			librefsm.WithGuard(actions.IsHibernatePreparationCurrent),
 			librefsm.WithAction(actions.OnLockHibernate),
 		).
 		// Manual ready-to-drive: seatbox button with kickstand up and both brakes pressed
