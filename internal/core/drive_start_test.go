@@ -319,6 +319,25 @@ func TestRideStartManualOverrideKeepsPowerGate(t *testing.T) {
 	}
 }
 
+func TestRideStartUnpoweredRestoreRequiresNewIntent(t *testing.T) {
+	v, io, _ := rideStartSystem(t)
+	v.restoreFSMState(types.StateReadyToDrive)
+	supplyDriveStart(t, v)
+	if got := driveStartTick(v); got != "timeout" {
+		t.Fatalf("restored start status = %q", got)
+	}
+	if v.machine.CurrentState() != fsm.StateParked || !io.getDigitalOutput("engine_brake") {
+		t.Fatal("power returning after restart automatically enabled driving")
+	}
+	io.setDigitalInput("kickstand", true)
+	driveStartTick(v)
+	io.setDigitalInput("kickstand", false)
+	driveStartTick(v)
+	if v.machine.CurrentState() != fsm.StateReadyToDrive {
+		t.Fatal("fresh rider request did not enable driving")
+	}
+}
+
 func TestRideStartRestoreWithoutSupplyReturnsToParked(t *testing.T) {
 	for _, active := range []bool{false, true} {
 		t.Run(map[bool]string{false: "inactive", true: "active"}[active], func(t *testing.T) {

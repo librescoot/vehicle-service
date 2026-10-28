@@ -59,8 +59,9 @@ A pending start retries automatically. After 30 seconds it remains blocked until
 a new kickstand cycle or a vehicle lock/unlock cycle. Lowering the kickstand,
 or locking cancels the pending request. Only parked retries automatically.
 Supply loss during a ride does not trigger automatic battery reactivation. Restoring a saved driving
-state without an active supply returns to parked; an already powered ride can
-retain its state across a vehicle-service restart.
+state without an active supply returns to parked and requires a new kickstand
+cycle before starting. An already powered ride can retain its state across a
+vehicle-service restart.
 
 `vehicle[drive-start-status]` uses the normal `vehicle` field notification:
 

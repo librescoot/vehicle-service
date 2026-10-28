@@ -208,6 +208,10 @@ func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) {
 		// driving state without a supply must instead go through normal admission.
 		if mainErr != nil || !main || inputErr != nil || !inputs.ActiveBattery {
 			restoreState = types.StateParked
+			// A restart must not turn lost drive power into a new ride request.
+			v.driveStart.mu.Lock()
+			v.driveStart.entryRejected = true
+			v.driveStart.mu.Unlock()
 		}
 	}
 	v.logger.Infof("Restoring FSM to saved state: %s", restoreState)
