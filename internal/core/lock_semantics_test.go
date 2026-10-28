@@ -260,7 +260,9 @@ func (g *lockRequestLogGate) Write(p []byte) (int, error) {
 }
 
 func TestHandleStateRequest_LockDriveRace(t *testing.T) {
-	v, _, _ := lockSemanticsSystem(t, fsm.StateParked, true)
+	v, io, _ := lockSemanticsSystem(t, fsm.StateParked, true)
+	io.setDigitalInput("kickstand", false)
+	supplyDriveStart(t, v)
 	gate := &lockRequestLogGate{make(chan struct{}), make(chan struct{})}
 	v.logger = logger.NewLogger(log.New(gate, "", 0), logger.LogLevelInfo)
 	result := make(chan error, 1)

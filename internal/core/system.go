@@ -80,6 +80,7 @@ const (
 const minLockOnDisconnectSeconds = 5
 
 type VehicleSystem struct {
+	driveStart               driveStartGate
 	state                    types.SystemState
 	dashboardReady           bool
 	dashboardReadyEventKnown bool // Whether the current ready value has reached the FSM; guarded by mu.
@@ -180,6 +181,7 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 	// Set up Redis callbacks so they are available as soon as the system object
 	// exists, even before Start() is called (enables unit tests to verify wiring).
 	vs.redis.SetCallbacks(messaging.Callbacks{
+		DriveMotionCallback:    vs.receiveDriveMotion,
 		DashboardCallback:      vs.handleDashboardReady,
 		KeycardCallback:        vs.keycardAuthPassed,
 		SeatboxCallback:        vs.handleSeatboxRequest,
@@ -744,6 +746,7 @@ func (v *VehicleSystem) Start() error {
 		return fmt.Errorf("failed to start Redis listeners: %w", err)
 	}
 
+	v.startDriveStartMonitor()
 	v.logger.Infof("System started successfully")
 	return nil
 }
@@ -1137,6 +1140,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			v.mu.Unlock()
 			return v.redis.SetHandlebarLockState(isLocked)
 		case "48v_detect":
+			v.noteDriveMainPower(value)
 			return v.redis.SetMainPower(value)
 		}
 		return nil
@@ -1207,6 +1211,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 
 		// Send FSM event - FSM handles all transitions based on current state
 		if value {
+			v.resetDriveStartRequest()
 			// Debounce protection for kickstand down from ready-to-drive:
 			// defer the event instead of dropping it, so quick flips are never lost
 			v.mu.RLock()
@@ -1349,6 +1354,7 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		v.mu.Unlock()
 
 	case "48v_detect":
+		v.noteDriveMainPower(value)
 		if err := v.redis.SetMainPower(value); err != nil {
 			return fmt.Errorf("failed to set main-power in Redis: %w", err)
 		}
@@ -1833,6 +1839,9 @@ func (v *VehicleSystem) setPowerOutput(component string, enabled bool) (func(), 
 	}
 
 	err, report := v.writeOutputDeferredFault(component, enabled)
+	if component == "engine_power" {
+		v.noteDriveEnginePower(enabled && err == nil)
+	}
 	if err != nil {
 		action := "enable"
 		if !enabled {
@@ -2157,6 +2166,7 @@ func (v *VehicleSystem) stopDbcWatchdog() {
 }
 
 func (v *VehicleSystem) Shutdown() {
+	v.stopDriveStartMonitor()
 	// Stop blinker if running
 	v.stopBlinker()
 

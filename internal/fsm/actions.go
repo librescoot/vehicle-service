@@ -27,6 +27,7 @@ type Actions interface {
 	ExitHopOnLearning(c *librefsm.Context) error
 
 	CanEnterReadyToDrive(c *librefsm.Context) bool // Requires both dashboard readiness and raised kickstand.
+	HasDriveSupply(c *librefsm.Context) bool
 	IsDashboardReady(c *librefsm.Context) bool
 	IsKickstandUp(c *librefsm.Context) bool
 	IsKickstandDown(c *librefsm.Context) bool

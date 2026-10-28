@@ -39,6 +39,45 @@ in the corresponding hash.
 Active faults are recorded in `vehicle:fault`, changes are published on the
 `vehicle` channel as `fault`, and fault events are appended to `events:faults`.
 
+## Starting a ride
+
+Raising the kickstand requests driving. The vehicle stays `parked`, with the
+motor interlock engaged, while battery-service completes normal activation.
+Entry to `ready-to-drive` requires a present, active pack, the hardware 48V
+signal, a closed seatbox, and fresh ECU evidence of a stopped wheel and released
+throttle. Normal entry also requires dashboard readiness and an unlocked
+handlebar latch. The three-button override retains the supply and throttle gate.
+
+Battery/ECU hash reads and `engine-ecu:motion` samples expire after 500 ms.
+The motion sample must follow 1.5 seconds of uninterrupted main and engine
+power. Cached speed or throttle fields cannot authorize a start. ECU-service
+requests a full status snapshot while parked and waiting for ECU evidence,
+throttle release, or wheel standstill. Unchanged values are valid evidence
+when reported in a fresh motion frame.
+
+A pending start retries automatically. After 30 seconds it remains blocked until
+a new kickstand cycle or a vehicle lock/unlock cycle. Lowering the kickstand,
+or locking cancels the pending request. Only parked retries automatically.
+Supply loss during a ride does not trigger automatic battery reactivation. Restoring a saved driving
+state without an active supply returns to parked; an already powered ride can
+retain its state across a vehicle-service restart.
+
+`vehicle[drive-start-status]` uses the normal `vehicle` field notification:
+
+| Value | Meaning |
+| --- | --- |
+| empty | No pending start warning |
+| `waiting-battery` | No present, active battery confirmed |
+| `waiting-power` | Main or engine power unavailable |
+| `waiting-ecu` | Healthy, fresh ECU evidence not yet available |
+| `release-throttle` | ECU reported throttle applied; a fresh released sample is required |
+| `stop-vehicle` | ECU reported wheel movement; a fresh stopped sample is required |
+| `close-seatbox` | Seatbox is open or its sensor cannot be read |
+| `timeout` | Start timed out or its evidence changed before motor release; retry required |
+
+Battery voltage matching and admission protections remain owned by
+battery-service. No second-pack voltage limit is relaxed by this gate.
+
 ## Configuration
 
 Configuration is intentionally limited. The only command-line controls are

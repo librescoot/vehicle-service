@@ -91,6 +91,7 @@ func TestOpenSeatboxOnUnlock_KeycardLockDoesNotOpen(t *testing.T) {
 // Raising the kickstand also enters ready-to-drive, but it is not an unlock.
 func TestOpenSeatboxOnUnlock_KickstandUpDoesNotOpen(t *testing.T) {
 	v, io, redis := seatboxUnlockSystem(t, fsm.StateParked, true, true)
+	supplyDriveStart(t, v)
 	v.mu.Lock()
 	v.dashboardReady = true
 	v.handlebarUnlocked = true
@@ -110,6 +111,7 @@ func TestOpenSeatboxOnUnlock_KickstandUpDoesNotOpen(t *testing.T) {
 // still an unlock and should open.
 func TestOpenSeatboxOnUnlock_EnabledOpensIntoReadyToDrive(t *testing.T) {
 	v, io, redis := seatboxUnlockSystem(t, fsm.StateParked, true, true)
+	supplyDriveStart(t, v)
 	v.mu.Lock()
 	v.dashboardReady = true
 	v.handlebarUnlocked = true

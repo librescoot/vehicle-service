@@ -200,8 +200,18 @@ func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) {
 		v.logger.Warnf("Failed to record the restore attempt marker: %v", err)
 	}
 
-	v.logger.Infof("Restoring FSM to saved state: %s", savedState)
-	if err := v.machine.SetState(systemStateToStateID(savedState)); err != nil {
+	restoreState := savedState
+	if savedState == types.StateReadyToDrive {
+		main, mainErr := v.io.ReadDigitalInput("48v_detect")
+		inputs, inputErr := v.redis.ReadDriveStartInputs(context.Background())
+		// Preserve an already powered ride across a process restart. A saved
+		// driving state without a supply must instead go through normal admission.
+		if mainErr != nil || !main || inputErr != nil || !inputs.ActiveBattery {
+			restoreState = types.StateParked
+		}
+	}
+	v.logger.Infof("Restoring FSM to saved state: %s", restoreState)
+	if err := v.machine.SetState(systemStateToStateID(restoreState)); err != nil {
 		v.logger.Errorf("Failed to restore FSM state: %v", err)
 		v.assertMotorSafeOutputs()
 	}
@@ -402,6 +412,30 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 		// Leave ready-to-drive honestly rather than sitting in it with no
 		// dashboard. The queued event runs after these effects join; the brake
 		// remains engaged until the Parked entry action takes over.
+		c.Send(librefsm.Event{ID: fsm.EvDashboardNotReady})
+		return nil
+	}
+
+	// Recheck after power/handlebar work: a lost supply or newer throttle
+	// report must not release the interlock after the transition guard passed.
+	if c.Event != nil && (!v.IsKickstandUp(c) || !v.HasDriveSupply(c)) {
+		v.driveStart.mu.Lock()
+		v.driveStart.entryRejected = true
+		v.driveStart.mu.Unlock()
+		brakeErr, brakeReport := v.writeOutputDeferredFault("engine_brake", true)
+		powerEffects := []func(){engineReport, engineFinish, dashboardReport, dashboardFinish, brakeReport}
+		if brakeErr != nil {
+			v.logger.Errorf("Failed to retain drive start interlock: %v", brakeErr)
+			offReport, offFinish, offErr := v.setPowerOutput("engine_power", false)
+			powerEffects = append(powerEffects, offReport)
+			if offErr != nil {
+				v.logger.Errorf("Failed to cut power after rejected drive start: %v", offErr)
+			} else {
+				powerEffects[1] = offFinish
+			}
+		}
+		startEffects(powerEffects...)
+		v.logger.Warnf("Drive start evidence changed before motor release; returning to parked")
 		c.Send(librefsm.Event{ID: fsm.EvDashboardNotReady})
 		return nil
 	}
@@ -997,8 +1031,7 @@ func (v *VehicleSystem) CanEnterReadyToDrive(c *librefsm.Context) bool {
 		v.logger.Errorf("Failed to read kickstand in guard: %v", err)
 		return false
 	}
-	// Kickstand must be UP (value false) AND dashboard ready AND handlebar unlocked
-	return !kickstandDown && v.IsDashboardReady(c) && v.IsHandlebarUnlocked(c)
+	return !kickstandDown && v.IsDashboardReady(c) && v.IsHandlebarUnlocked(c) && v.HasDriveSupply(c)
 }
 
 func (v *VehicleSystem) IsKickstandDown(c *librefsm.Context) bool {

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"time"
 
 	"vehicle-service/internal/hardware"
@@ -40,6 +41,8 @@ type MessagingClient interface {
 
 	// Settings
 	GetHashField(hash, field string) (string, error)
+	ReadDriveStartInputs(context.Context) (types.DriveStartInputs, error)
+	SetDriveStartStatus(string) error
 
 	// usb0 gate decision (system hash), read by the boot failsafe timer
 	SetUsb0Gate(open bool) error

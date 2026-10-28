@@ -44,6 +44,7 @@ const (
 	EvLock              librefsm.EventID = "lock"
 	EvLockHibernate     librefsm.EventID = "lock-hibernate"
 	EvForceLock         librefsm.EventID = "force-lock"
+	EvDriveSupplyReady  librefsm.EventID = "drive-supply-ready"
 	EvDashboardReady    librefsm.EventID = "dashboard-ready"
 	EvDashboardNotReady librefsm.EventID = "dashboard-not-ready"
 	EvKeycardAuth       librefsm.EventID = "keycard-auth"

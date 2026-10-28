@@ -51,6 +51,9 @@ type mockMessagingClient struct {
 	removedInhibitors      []string
 
 	// Return values
+	driveInputs       types.DriveStartInputs
+	driveInputsErr    error
+	driveStatuses     []string
 	vehicleState      types.SystemState
 	vehicleStateErr   error
 	restoreAttempt    string
@@ -132,6 +135,17 @@ func (m *mockMessagingClient) GetHashField(hash, field string) (string, error) {
 		return v, nil
 	}
 	return m.hashFieldValue, nil
+}
+func (m *mockMessagingClient) ReadDriveStartInputs(context.Context) (types.DriveStartInputs, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.driveInputs, m.driveInputsErr
+}
+func (m *mockMessagingClient) SetDriveStartStatus(status string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.driveStatuses = append(m.driveStatuses, status)
+	return nil
 }
 func (m *mockMessagingClient) SetUsb0Gate(open bool) error {
 	m.mu.Lock()
@@ -976,6 +990,7 @@ func TestEnterReadyToDrive_EngineBrakeDisabled(t *testing.T) {
 	mockIO.clearDigitalOutputs()
 
 	// Trigger transition to ReadyToDrive via kickstand up event
+	supplyDriveStart(t, system)
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
 
 	// Allow state transition to complete
@@ -1017,6 +1032,7 @@ func TestEnterReadyToDrive_EngineBrakeFollowsBrakes(t *testing.T) {
 	mockIO.clearDigitalOutputs()
 
 	// Trigger transition to ReadyToDrive
+	supplyDriveStart(t, system)
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
 	time.Sleep(50 * time.Millisecond)
 
@@ -1110,6 +1126,7 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	mockIO.setDigitalInput("kickstand", false) // up
 	mockIO.clearDigitalOutputs()
 	system.dashboardReady = true // Ensure dashboard ready for guard
+	supplyDriveStart(t, system)
 
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
 	time.Sleep(50 * time.Millisecond)
@@ -1194,6 +1211,7 @@ func TestKickstandDown_DeferredDuringDebounce(t *testing.T) {
 	system.dashboardReady = true
 
 	// Transition to ReadyToDrive via kickstand up
+	supplyDriveStart(t, system)
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
 	time.Sleep(50 * time.Millisecond)
 
@@ -1244,6 +1262,7 @@ func TestKickstandDown_DeferredCancelledByKickstandUp(t *testing.T) {
 	system.dashboardReady = true
 
 	// Transition to ReadyToDrive
+	supplyDriveStart(t, system)
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
 	time.Sleep(50 * time.Millisecond)
 
