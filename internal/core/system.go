@@ -1145,12 +1145,19 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 	// First check if we should handle this input in current state
 	currentState := v.getCurrentState()
 
-	// Handle inputs that should only work when not in standby
+	// Preserve button snapshots while keeping standby actions gated. Button
+	// events are already published above, independently of these hash values.
 	if currentState == types.StateStandby {
 		switch channel {
-		case "horn_button", "seatbox_button", "brake_right", "brake_left",
-			"blinker_right", "blinker_left":
-			v.logger.Infof("Ignoring %s in standby state", channel)
+		case "horn_button":
+			return v.redis.SetHornButton(value)
+		case "seatbox_button":
+			return v.redis.SetSeatboxButton(value)
+		case "brake_left":
+			return v.redis.SetBrakeState("left", value)
+		case "brake_right":
+			return v.redis.SetBrakeState("right", value)
+		case "blinker_left", "blinker_right":
 			return nil
 		}
 	}
