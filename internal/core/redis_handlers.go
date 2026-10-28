@@ -16,10 +16,7 @@ import (
 func (v *VehicleSystem) handleSeatboxRequest(on bool) error {
 	v.logger.Debugf("Handling seatbox request: %v", on)
 	if on {
-		if err := v.redis.PublishSeatboxOpened(); err != nil {
-			v.logger.Warnf("Failed to publish seatbox opened event: %v", err)
-		}
-		v.openSeatboxLock()
+		v.openSeatbox()
 	}
 	return nil
 }
@@ -37,7 +34,7 @@ func (v *VehicleSystem) handleHornRequest(on bool) error {
 		return nil // Silent failure - don't activate horn but don't error
 	}
 
-	return v.io.WriteDigitalOutput("horn", on)
+	return v.writeOutput("horn", on)
 }
 
 // handleBlinkerRequest handles blinker state requests from Redis
@@ -71,16 +68,16 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 	switch state {
 	case "off":
 		cue = 9 // LED_BLINK_NONE
-		v.blinkerState = BlinkerOff
+		v.setBlinkerState(BlinkerOff)
 	case "left":
 		cue = 10 // LED_BLINK_LEFT
-		v.blinkerState = BlinkerLeft
+		v.setBlinkerState(BlinkerLeft)
 	case "right":
 		cue = 11 // LED_BLINK_RIGHT
-		v.blinkerState = BlinkerRight
+		v.setBlinkerState(BlinkerRight)
 	case "both":
 		cue = 12 // LED_BLINK_BOTH
-		v.blinkerState = BlinkerBoth
+		v.setBlinkerState(BlinkerBoth)
 	default:
 		return fmt.Errorf("invalid blinker state: %s", state)
 	}
@@ -89,10 +86,12 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 		v.blinkerCueIndex.Store(int32(cue))
 		v.blinkerStartNanos.Store(time.Now().UnixNano())
 		stopChan := make(chan struct{})
+		exited := make(chan struct{})
 		v.mu.Lock()
 		v.blinkerStopChan = stopChan
+		v.blinkerExited = exited
 		v.mu.Unlock()
-		go v.runBlinker(cue, state, stopChan)
+		go v.runBlinker(cue, state, stopChan, exited)
 	} else {
 		if err := v.io.PlayPwmCue(cue); err != nil {
 			return err
@@ -107,13 +106,28 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 	v.logger.Debugf("Handling state request: %s", state)
 	currentState := v.getCurrentState()
 
+	if id, ok := strings.CutPrefix(state, "prepare-hibernate:"); ok {
+		if id == "" {
+			return fmt.Errorf("missing hibernation request id")
+		}
+		if err := v.machine.SendSync(librefsm.Event{ID: fsm.EvLockHibernate, Payload: id}); err != nil {
+			return err
+		}
+		if v.machine.CurrentState() != fsm.StateShuttingDown {
+			return v.redis.SendCommand("scooter:power", "hibernate-preparation-failed:"+id)
+		}
+		return nil
+	}
+
 	switch state {
 	case "unlock":
-		// If we're in shutting-down and have already told the DBC to halt,
-		// the abort path is no longer safe: the DBC kernel is dying and
-		// setPower("dashboard_power", true) in EnterParked would be a no-op
-		// on a GPIO that was never cut. Queue the unlock; EnterStandby
-		// will replay it once the GPIO has been cycled.
+		if currentState == types.StateShuttingDown && v.dbcPoweroffSent.Load() {
+			v.cancelHibernationRequest()
+		}
+		// Queue the unlock for replay once EnterStandby has cycled the GPIO.
+		// The veto itself lives on the ShuttingDown to Parked transition, which
+		// is where it applies to every dispatch path rather than only this one;
+		// what stays here is the side effect the guard cannot express.
 		if currentState == types.StateShuttingDown && v.dbcPoweroffSent.Load() {
 			v.pendingUnlock.Store(true)
 			v.logger.Infof("Unlock deferred: DBC shutdown in progress, will replay from standby")
@@ -126,19 +140,14 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 		return v.machine.SendSync(librefsm.Event{ID: fsm.EvUnlock})
 
 	case "lock":
-		if currentState != types.StateParked && currentState != types.StateReadyToDrive {
-			return fmt.Errorf("vehicle must be parked or ready-to-drive to lock")
+		if currentState != types.StateParked && currentState != types.StateWaitingSeatbox {
+			return fmt.Errorf("vehicle must be parked or waiting for seatbox to lock (use force-lock from drive)")
 		}
 		v.logger.Infof("Sending EvLock")
 		return v.machine.SendSync(librefsm.Event{ID: fsm.EvLock})
 
 	case "lock-hibernate":
-		if currentState != types.StateParked {
-			return fmt.Errorf("vehicle must be parked to lock-hibernate")
-		}
-		v.logger.Infof("Sending EvLockHibernate")
-		// The OnLockHibernate action handles setting the hibernation flag and sending the command
-		return v.machine.SendSync(librefsm.Event{ID: fsm.EvLockHibernate})
+		return v.redis.SendCommand("scooter:power", "hibernate-manual")
 
 	default:
 		return fmt.Errorf("invalid state request: %s", state)
@@ -158,10 +167,9 @@ func (v *VehicleSystem) handleLedFadeRequest(ledChannel int, fadeIndex int) erro
 }
 
 // handleForceLockRequest handles force-lock requests from Redis
-// It initiates a forced transition to standby state, skipping the handlebar lock
+// It initiates graceful shutdown, skipping the handlebar lock
 func (v *VehicleSystem) handleForceLockRequest() error {
-	// Send EvForceLock - the OnForceLock action sets the forceStandbyNoLock flag
-	v.logger.Infof("Sending EvForceLock: transitioning to STANDBY (no lock)")
+	v.logger.Infof("Sending EvForceLock: requesting graceful shutdown (no handlebar lock)")
 	return v.machine.SendSync(librefsm.Event{ID: fsm.EvForceLock})
 }
 
@@ -178,9 +186,11 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 		v.logger.Infof("Starting DBC update process")
 		v.mu.Lock()
 		v.dbcUpdating = true
+		v.dbcHeartbeatSeen = false
 		v.startDbcWatchdog()
+		watchdogTimeout := v.dbcWatchdogDuration()
 		v.mu.Unlock()
-		v.logger.Infof("DBC update watchdog started (timeout: %v)", dbcUpdateWatchdogTimeout)
+		v.logger.Infof("DBC update watchdog started (timeout: %v)", watchdogTimeout)
 
 		// Persist to Redis
 		if err := v.redis.SetDbcUpdating(true); err != nil {
@@ -214,9 +224,12 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 			v.logger.Warnf("Failed to persist DBC updating state to Redis: %v", err)
 		}
 
-		// Remove suspend-only inhibitor now that DBC update is done
+		// Remove both the lifecycle hold and the install-time reboot block.
 		if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
 			v.logger.Warnf("Failed to remove DBC update inhibitor: %v", err)
+		}
+		if err := v.redis.RemoveInhibitor("install:dbc"); err != nil {
+			v.logger.Warnf("Failed to remove DBC install inhibitor: %v", err)
 		}
 
 		// Handle deferred power-on request
@@ -385,6 +398,7 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 				if sensorVal {
 					v.logger.Warnf("Handlebar lock command sent but sensor still shows unlocked")
 				} else {
+					v.setHandlebarLatch(true)
 					v.logger.Infof("Handlebar locked via hardware command")
 				}
 			}
@@ -405,6 +419,7 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 				if !sensorVal {
 					v.logger.Warnf("Handlebar unlock command sent but sensor still shows locked")
 				} else {
+					v.setHandlebarLatch(false)
 					v.logger.Infof("Handlebar unlocked via hardware command")
 				}
 			}
@@ -419,45 +434,46 @@ func (v *VehicleSystem) handleHardwareRequest(command string) error {
 }
 
 // handleHopOnRequest engages or releases hop-on / hop-off mode by
-// dispatching the corresponding FSM event. The actual side-effects (LED
-// cues, steering lock, vehicle:hop-on-active publishing, auto-standby
-// timer resume) live in EnterHopOn / ExitHopOn — this handler just
-// captures the live auto-standby deadline before the transition fires
-// (because ExitParked will clear it before EnterHopOn runs) and then
-// dispatches the event.
+// dispatching the corresponding FSM event. The state machine handles
+// every side-effect (LED cues, steering lock, input gating, etc.) — see
+// fsm/definition.go and core/fsm_actions.go.
 //
-// "engage-silent" is the same transition as "engage" with a silent flag
-// passed via the event payload, used by the dashboard's combo learning
-// flow so input side-effects (horn, blinker, brake LED, seatbox open,
-// hibernation hold) are suppressed without the user-facing "powering
-// down" cue, opportunistic steering lock, or hop-on-active publish.
+//   - engage           -> locked hop-on (lock screen, LED cue, steering lock)
+//   - engage-learning  -> combo capture (no user-facing side-effects)
+//   - release          -> back to parked (works from either sub-state)
 func (v *VehicleSystem) handleHopOnRequest(action string) error {
 	if v.machine == nil {
 		return fmt.Errorf("hop-on: FSM not initialised")
 	}
 	switch action {
-	case "engage", "engage-silent":
+	case "engage":
 		current := v.machine.CurrentState()
 		if current == fsm.StateHopOn {
-			v.logger.Debugf("hop-on %s requested but already in StateHopOn — no-op", action)
+			v.logger.Debugf("hop-on engage requested but already in StateHopOn — no-op")
 			return nil
 		}
 		if current != fsm.StateParked {
-			v.logger.Warnf("hop-on %s refused: scooter is in %s, not parked", action, current)
+			v.logger.Warnf("hop-on engage refused: scooter is in %s, not parked", current)
 			return nil
 		}
-		// Capture the live auto-standby deadline so EnterHopOn (and later
-		// EnterParked from HopOn) can resume it. Without this the timer
-		// would restart from full duration on every hop-on cycle.
-		v.mu.Lock()
-		v.hopOnSavedAutoStandbyDl = v.autoStandbyDeadline
-		v.mu.Unlock()
-		silent := action == "engage-silent"
-		return v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnEngage, Payload: silent})
+		return v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnEngage})
+
+	case "engage-learning":
+		current := v.machine.CurrentState()
+		if current == fsm.StateHopOnLearning {
+			v.logger.Debugf("hop-on engage-learning requested but already in StateHopOnLearning — no-op")
+			return nil
+		}
+		if current != fsm.StateParked {
+			v.logger.Warnf("hop-on engage-learning refused: scooter is in %s, not parked", current)
+			return nil
+		}
+		return v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnLearningEngage})
 
 	case "release":
-		if v.machine.CurrentState() != fsm.StateHopOn {
-			v.logger.Debugf("hop-on release requested but not in StateHopOn — no-op")
+		current := v.machine.CurrentState()
+		if current != fsm.StateHopOn && current != fsm.StateHopOnLearning {
+			v.logger.Debugf("hop-on release requested but not in a hop-on sub-state — no-op")
 			return nil
 		}
 		return v.machine.SendSync(librefsm.Event{ID: fsm.EvHopOnRelease})
@@ -469,7 +485,7 @@ func (v *VehicleSystem) handleHopOnRequest(action string) error {
 
 // handleSettingsUpdate processes settings changes from Redis
 func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
-	v.logger.Infof("Handling settings update: %s", settingKey)
+	v.logger.Debugf("Handling settings update: %s", settingKey)
 
 	switch settingKey {
 	case "scooter.brake-hibernation":
@@ -531,6 +547,27 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 			}
 		}
 
+	case "scooter.lock-on-bluetooth-disconnect-seconds":
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+		seconds, parseErr := strconv.Atoi(value)
+		if parseErr != nil {
+			v.logger.Warnf("Invalid lock-on-bluetooth-disconnect value: '%s'", value)
+			return fmt.Errorf("invalid lock-on-bluetooth-disconnect value: %s", value)
+		}
+		clamped := v.clampLockOnDisconnect(seconds)
+		v.mu.Lock()
+		v.lockOnBleDisconnectSeconds = clamped
+		v.mu.Unlock()
+		if clamped > 0 {
+			v.logger.Infof("Lock-on-Bluetooth-disconnect enabled: %d seconds", clamped)
+		} else {
+			v.logger.Infof("Lock-on-Bluetooth-disconnect disabled")
+		}
+
 	case "scooter.enable-horn":
 		// Read the new value from Redis
 		value, err := v.redis.GetHashField("settings", settingKey)
@@ -550,6 +587,28 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 		v.mu.Unlock()
 		v.logger.Infof("Horn enable mode updated to: %s", value)
 
+	case "scooter.horn-when-seatbox-open":
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+		v.mu.Lock()
+		v.hornWhenSeatboxOpen = value == "true"
+		v.mu.Unlock()
+		v.logger.Infof("Horn-when-seatbox-open updated to: %v", value == "true")
+
+	case "scooter.open-seatbox-on-unlock":
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+		v.mu.Lock()
+		v.openSeatboxOnUnlock = value == "true"
+		v.mu.Unlock()
+		v.logger.Infof("Open-seatbox-on-unlock updated to: %v", value == "true")
+
 	case "scooter.dbc-blinker-led":
 		value, err := v.redis.GetHashField("settings", settingKey)
 		if err != nil {
@@ -567,28 +626,66 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
 			return err
 		}
-		policy := "always-on"
-		if value == "auto" {
-			policy = "auto"
-		} else if value != "" && value != "always-on" {
-			v.logger.Warnf("Unknown usb0 policy %q, falling back to always-on", value)
+		policy := "auto"
+		if value == "always-on" {
+			policy = "always-on"
+		} else if value != "" && value != "auto" {
+			v.logger.Warnf("Unknown usb0 policy %q, falling back to auto", value)
 		}
 		v.mu.Lock()
 		v.usb0Policy = policy
 		v.mu.Unlock()
-		v.logger.Infof("usb0 policy updated to: %s", policy)
+		gate := v.usb0GateState()
+		v.logger.Infof("usb0 policy updated to: %s (gate=%s)", policy, gate)
 		// Apply immediately so the link reflects the new policy without
-		// waiting for the next dashboard transition.
-		if policy == "auto" {
+		// waiting for the next dashboard transition. An unknown gate is left
+		// to the boot-time resolver, which is still waiting on the counts.
+		switch gate {
+		case usb0GateOpen:
+			if ioErr := v.io.SetUsb0Enabled(true); ioErr != nil {
+				v.logger.Warnf("Failed to bring usb0 up: %v", ioErr)
+			}
+		case usb0GateClosed:
 			dashboardPower, dpErr := v.redis.GetDashboardPower()
 			if dpErr != nil {
 				v.logger.Warnf("Failed to read dashboard power while applying usb0=auto: %v", dpErr)
 			} else if ioErr := v.io.SetUsb0Enabled(dashboardPower); ioErr != nil {
 				v.logger.Warnf("Failed to sync usb0 to dashboard_power=%v: %v", dashboardPower, ioErr)
 			}
+		}
+		v.recordUsb0Gate(gate)
+
+	case "scooter.handlebar-unlocked":
+		value, err := v.redis.GetHashField("settings", settingKey)
+		if err != nil {
+			v.logger.Infof("Failed to read setting %s: %v", settingKey, err)
+			return err
+		}
+		unlock := value == "true"
+		v.mu.Lock()
+		v.handlebarUnlockedOverride = unlock
+		v.mu.Unlock()
+		if unlock {
+			v.logger.Infof("Service mode: releasing handlebar latch and suppressing auto re-lock")
+			v.cancelHandlebarLock()
+			if perr := v.pulseHandlebarLock(false); perr != nil {
+				v.logger.Warnf("Failed to release handlebar latch: %v", perr)
+			} else {
+				v.setHandlebarLatch(false)
+			}
 		} else {
-			if ioErr := v.io.SetUsb0Enabled(true); ioErr != nil {
-				v.logger.Warnf("Failed to bring usb0 up: %v", ioErr)
+			// Override already cleared above. Re-lock only when the handlebar
+			// is meant to be locked, i.e. in stand-by; in parked/ready-to-drive
+			// it stays free and a later stand-by transition locks it via the
+			// now-cleared override. Use the verified, retrying lock path
+			// (positioning window + sensor confirmation) so the latch is
+			// reported locked only once the sensor confirms, rather than
+			// optimistically after a single unverified pulse.
+			if state := v.getCurrentState(); state == types.StateStandby {
+				v.logger.Infof("Service mode off: re-locking handlebar (sensor-verified, with retries)")
+				v.lockHandlebar(nil)
+			} else {
+				v.logger.Infof("Service mode off: vehicle in %s state, leaving handlebar unlocked", state)
 			}
 		}
 
@@ -606,6 +703,109 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 // handleDbcWatchdogTimeout is called when the DBC update watchdog expires —
 // no OTA status writes from the DBC for the watchdog timeout duration.
 // Clears the stuck dbcUpdating state and applies deferred power changes.
+// handleDbcHoldRequest lets the dashboard ask for DBC power to survive a
+// shutdown request while it is mid map or tile download. Unlike a DBC OTA the
+// hold is capped (see dbcMapDownloadHoldMax): an interrupted download resumes
+// from its .part file next session, so this buys time to finish rather than
+// blocking shutdown outright.
+func (v *VehicleSystem) handleDbcHoldRequest(action string) error {
+	switch action {
+	case "map-download":
+		v.mu.Lock()
+		already := v.mapDownloading
+		v.mapDownloading = true
+		v.mu.Unlock()
+		if !already {
+			v.logger.Infof("Dashboard is downloading maps, DBC power off deferred up to %v", dbcMapDownloadHoldMax)
+			// Deferring the DBC power cut alone buys nothing: pm-service starts
+			// suspending the MDB 60s into standby, which takes the modem the
+			// download runs over with it. Keep the MDB awake for the same
+			// window, the way a DBC update does.
+			if err := v.redis.SetInhibitor("map-download", "suspend-only", "map download in progress"); err != nil {
+				v.logger.Warnf("Failed to set map download inhibitor: %v", err)
+			}
+		}
+		return nil
+
+	case "release":
+		v.releaseMapDownloadHold("dashboard finished downloading")
+		return nil
+
+	default:
+		return fmt.Errorf("unknown DBC hold action: %s", action)
+	}
+}
+
+// releaseMapDownloadHold clears the hold and applies whatever dashboard power
+// change the shutdown path deferred while it was set.
+func (v *VehicleSystem) releaseMapDownloadHold(reason string) {
+	v.mu.Lock()
+	if !v.mapDownloading {
+		v.mu.Unlock()
+		return
+	}
+	v.mapDownloading = false
+	v.stopMapHoldTimer()
+	updating := v.dbcUpdating
+	deferredPower := v.deferredDashboardPower
+	currentState := v.state
+	// A DBC OTA outranks a map download: leave its deferral in place and let
+	// complete-dbc or the OTA watchdog resolve it.
+	if !updating {
+		v.deferredDashboardPower = nil
+	}
+	v.mu.Unlock()
+
+	v.logger.Infof("Map download hold released: %s", reason)
+
+	if err := v.redis.RemoveInhibitor("map-download"); err != nil {
+		v.logger.Warnf("Failed to remove map download inhibitor: %v", err)
+	}
+
+	if updating {
+		return
+	}
+
+	// Nothing deferred means nothing asked for the display to change: it is up
+	// because an operator turned it on, or because something else still wants
+	// it. Ending our own hold is not a reason to switch off someone else's
+	// display, so leave the power alone and let the state machine decide if it
+	// ever needs to.
+	// Nothing deferred means nothing asked for the display to change: it is up
+	// because an operator turned it on, or because something else still wants
+	// it. Ending our own hold is not a reason to switch off someone else's
+	// display, so leave the power alone and let the state machine decide if it
+	// ever needs to.
+	if deferredPower == nil {
+		v.logger.Debugf("No deferred dashboard power after map download hold, leaving the DBC powered")
+		return
+	}
+
+	if *deferredPower {
+		v.logger.Debugf("Applying deferred dashboard power ON after map download hold")
+		if err := v.setPower("dashboard_power", true); err != nil {
+			v.logger.Errorf("Failed to apply deferred dashboard power ON: %v", err)
+		}
+		return
+	}
+
+	if currentState != types.StateStandby {
+		return
+	}
+
+	// A power OFF was deferred by the shutdown path while the hold was set, so
+	// this is that decision being carried out rather than a new one. Give the
+	// DBC the clean shutdown EnterShuttingDown skipped, then cut the GPIO.
+	if err := v.redis.PublishMessage("dbc:command", "poweroff"); err != nil {
+		v.logger.Warnf("Failed to send DBC poweroff after map download hold: %v", err)
+	}
+	time.AfterFunc(5*time.Second, func() {
+		if err := v.setPower("dashboard_power", false); err != nil {
+			v.logger.Errorf("Failed to turn off dashboard power after map download hold: %v", err)
+		}
+	})
+}
+
 func (v *VehicleSystem) handleDbcWatchdogTimeout() {
 	v.mu.Lock()
 	if !v.dbcUpdating {
@@ -618,9 +818,15 @@ func (v *VehicleSystem) handleDbcWatchdogTimeout() {
 	deferredPower := v.deferredDashboardPower
 	v.deferredDashboardPower = nil
 	currentState := v.state
+	mapDownloading := v.mapDownloading
+	// Snapshot the timeout that actually elapsed (heartbeat vs. no-heartbeat)
+	// while still holding the mutex, in the same read as the other state
+	// above: dbcWatchdogDuration reads dbcHeartbeatSeen, which is only safe
+	// to read under v.mu.
+	elapsedTimeout := v.dbcWatchdogDuration()
 	v.mu.Unlock()
 
-	v.logger.Warnf("DBC update watchdog expired — no OTA activity for %v, clearing stuck state", dbcUpdateWatchdogTimeout)
+	v.logger.Warnf("DBC update watchdog expired, no OTA activity for %v, clearing stuck state", elapsedTimeout)
 
 	if err := v.redis.SetDbcUpdating(false); err != nil {
 		v.logger.Warnf("Failed to persist DBC updating state after watchdog timeout: %v", err)
@@ -629,19 +835,20 @@ func (v *VehicleSystem) handleDbcWatchdogTimeout() {
 	if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
 		v.logger.Warnf("Failed to remove DBC update inhibitor after watchdog timeout: %v", err)
 	}
+	if err := v.redis.RemoveInhibitor("install:dbc"); err != nil {
+		v.logger.Warnf("Failed to remove DBC install inhibitor after watchdog timeout: %v", err)
+	}
 
-	var powerOff bool
-	if deferredPower != nil {
-		if *deferredPower {
-			v.logger.Debugf("Applying deferred dashboard power ON after watchdog timeout")
-			if err := v.setPower("dashboard_power", true); err != nil {
-				v.logger.Errorf("Failed to apply deferred dashboard power ON: %v", err)
-			}
-		} else if currentState == types.StateStandby {
-			powerOff = true
+	if deferredPower != nil && *deferredPower {
+		v.logger.Debugf("Applying deferred dashboard power ON after watchdog timeout")
+		if err := v.setPower("dashboard_power", true); err != nil {
+			v.logger.Errorf("Failed to apply deferred dashboard power ON: %v", err)
 		}
-	} else if currentState == types.StateStandby {
-		powerOff = true
+	}
+
+	powerOff := shouldPowerOffAfterWatchdog(currentState, deferredPower, mapDownloading)
+	if !powerOff && mapDownloading && shouldPowerOffAfterWatchdog(currentState, deferredPower, false) {
+		v.logger.Infof("DBC update watchdog expired but a map download still holds power, leaving the dashboard on")
 	}
 
 	if powerOff {
@@ -652,4 +859,27 @@ func (v *VehicleSystem) handleDbcWatchdogTimeout() {
 			}
 		})
 	}
+}
+
+// shouldPowerOffAfterWatchdog decides whether a wedged DBC update should
+// power the dashboard off, given the deferred power request from a shutdown
+// that arrived mid-update (if any), the FSM state when the watchdog fired,
+// and whether a map download still holds the same power rail.
+//
+// A map download is the other holder of this power rail and has its own cap.
+// A wedged OTA must not cut power out from under it.
+func shouldPowerOffAfterWatchdog(state types.SystemState, deferredPower *bool, mapDownloading bool) bool {
+	var powerOff bool
+	if deferredPower != nil {
+		if !*deferredPower && state == types.StateStandby {
+			powerOff = true
+		}
+	} else if state == types.StateStandby {
+		powerOff = true
+	}
+
+	if powerOff && mapDownloading {
+		powerOff = false
+	}
+	return powerOff
 }

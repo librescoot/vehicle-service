@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/librescoot/librefsm"
@@ -15,8 +17,6 @@ var _ fsm.Actions = (*VehicleSystem)(nil)
 // stateIDToSystemState converts librefsm StateID to types.SystemState
 func stateIDToSystemState(id librefsm.StateID) types.SystemState {
 	switch id {
-	case fsm.StateInit:
-		return types.StateInit
 	case fsm.StateStandby:
 		return types.StateStandby
 	case fsm.StateParked:
@@ -40,10 +40,12 @@ func stateIDToSystemState(id librefsm.StateID) types.SystemState {
 	case fsm.StateHibernationConfirm:
 		return types.StateWaitingHibernationConfirm
 	case fsm.StateHopOn:
-		// Externally hop-on looks like parked: the dashboard's `isParked()`
-		// check (used to allow opening the menu, learning, etc.) keeps
-		// working. Hop-on engagement is signalled separately via the
-		// `vehicle:hop-on-active` field.
+		return types.StateHopOn
+	case fsm.StateHopOnLearning:
+		return types.StateHopOnLearning
+	case fsm.StateAtRest:
+		// Parent grouping; never current as a leaf, but the converter
+		// is defensive against transient lookups.
 		return types.StateParked
 	default:
 		return types.SystemState(string(id))
@@ -53,8 +55,6 @@ func stateIDToSystemState(id librefsm.StateID) types.SystemState {
 // systemStateToStateID converts types.SystemState to librefsm StateID
 func systemStateToStateID(s types.SystemState) librefsm.StateID {
 	switch s {
-	case types.StateInit:
-		return fsm.StateInit
 	case types.StateStandby:
 		return fsm.StateStandby
 	case types.StateParked:
@@ -75,6 +75,10 @@ func systemStateToStateID(s types.SystemState) librefsm.StateID {
 		return fsm.StateHibernationSeatbox
 	case types.StateWaitingHibernationConfirm:
 		return fsm.StateHibernationConfirm
+	case types.StateHopOn:
+		return fsm.StateHopOn
+	case types.StateHopOnLearning:
+		return fsm.StateHopOnLearning
 	default:
 		return librefsm.StateID(string(s))
 	}
@@ -112,6 +116,8 @@ func (v *VehicleSystem) initFSM(ctx context.Context) error {
 		// which would cause a deadlock with the FSM mutex)
 		if err := v.redis.PublishVehicleState(newState); err != nil {
 			v.logger.Errorf("Failed to publish state: %v", err)
+		} else if newState == types.StateStandby && oldState == types.StateShuttingDown {
+			v.completeHibernationShutdown()
 		}
 	})
 
@@ -124,24 +130,209 @@ func (v *VehicleSystem) initFSM(ctx context.Context) error {
 	return nil
 }
 
-// restoreFSMState restores the FSM to a saved state (must be called after hardware init)
-func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) error {
-	if savedState != types.StateInit && savedState != types.StateShuttingDown {
-		v.logger.Infof("Restoring FSM to saved state: %s", savedState)
-		if err := v.machine.SetState(systemStateToStateID(savedState)); err != nil {
-			v.logger.Errorf("Failed to restore FSM state: %v", err)
-			return err
-		}
-	}
-	return nil
+// restorableStates lists the states a restart may resume into directly.
+// Anything outside the list is refused instead of being handed to SetState:
+// systemStateToStateID passes unrecognised strings straight through, so a
+// typo or a stale value from a future release would become a StateID the
+// machine has never heard of and fail identically on every restart, and
+// StateUpdating has no transition in or out, so resuming into it would
+// strand the machine for the rest of the power session.
+var restorableStates = map[types.SystemState]bool{
+	types.StateStandby:                    true,
+	types.StateParked:                     true,
+	types.StateReadyToDrive:               true,
+	types.StateHopOn:                      true,
+	types.StateHopOnLearning:              true,
+	types.StateWaitingSeatbox:             true,
+	types.StateWaitingHibernation:         true,
+	types.StateWaitingHibernationAdvanced: true,
+	types.StateWaitingHibernationSeatbox:  true,
+	types.StateWaitingHibernationConfirm:  true,
 }
 
-// sendEvent sends an event to the FSM
-func (v *VehicleSystem) sendEvent(event librefsm.EventID) error {
-	return v.machine.SendSync(librefsm.Event{ID: event})
+// restoreFSMState restores the FSM to a saved state (must be called after hardware init).
+//
+// It reports nothing to its caller on purpose. A restore failure used to abort
+// Start(), which main.go turns into a Fatalf: systemd would restart the service,
+// read the same state back out of Redis, hit the same failure and die again, on a
+// vehicle that is by definition unlocked and powered up. There is also nothing to
+// abort for, because SetState commits currentState before running the entry action,
+// so the machine is already in the restored state by the time an error comes back.
+func (v *VehicleSystem) restoreFSMState(savedState types.SystemState) {
+	// Nothing persisted: fresh boot or post-hibernation cold start. Stay in the
+	// initial Standby state.
+	if savedState == "" {
+		return
+	}
+
+	// ShuttingDown is not refused, it is handed over: Start() restores it further
+	// down, after the LED cue block, so the shutdown timeout finishes normally.
+	if savedState == types.StateShuttingDown {
+		return
+	}
+
+	if savedState == types.StateUpdating {
+		v.declineRestore(fmt.Sprintf("saved state %q cannot be left once entered, forced to stand-by", savedState))
+		return
+	}
+
+	if !restorableStates[savedState] {
+		v.declineRestore(fmt.Sprintf("saved state %q is not a state this vehicle can restore, forced to stand-by", savedState))
+		return
+	}
+
+	// A marker naming this exact state means the last attempt at it never ran
+	// to a conclusion. Losing the error return covers every way SetState can
+	// return; it does not cover a panic inside an entry action, an OOM kill, a
+	// hardware call that never returns, or a watchdog reset, where the process
+	// dies before any recovery code runs and Redis still names the state that
+	// killed it.
+	attempt, err := v.redis.GetRestoreAttempt()
+	if err != nil {
+		v.logger.Warnf("Failed to read the restore attempt marker: %v", err)
+	} else if attempt == string(savedState) {
+		v.clearRestoreAttempt()
+		v.declineRestore(fmt.Sprintf("restore of saved state %q was already interrupted once, forced to stand-by", savedState))
+		return
+	}
+
+	if err := v.redis.SetRestoreAttempt(string(savedState), restoreAttemptTTL); err != nil {
+		v.logger.Warnf("Failed to record the restore attempt marker: %v", err)
+	}
+
+	v.logger.Infof("Restoring FSM to saved state: %s", savedState)
+	if err := v.machine.SetState(systemStateToStateID(savedState)); err != nil {
+		v.logger.Errorf("Failed to restore FSM state: %v", err)
+		v.assertMotorSafeOutputs()
+	}
+
+	// Reached on success and on a handled failure alike: both mean the restore
+	// ran to a conclusion, which is exactly what the marker is asking about.
+	v.clearRestoreAttempt()
+}
+
+func (v *VehicleSystem) clearRestoreAttempt() {
+	if err := v.redis.ClearRestoreAttempt(); err != nil {
+		v.logger.Warnf("Failed to clear the restore attempt marker: %v", err)
+	}
+}
+
+// declineRestore refuses a saved state and leaves the machine in Standby.
+// description names the specific refusal; it is logged and it is what the rider
+// sees, so it has to read as a statement about the vehicle rather than about
+// this function.
+func (v *VehicleSystem) declineRestore(description string) {
+	v.logger.Errorf("Declining state restore: %s", description)
+	v.assertMotorSafeOutputs()
+	v.markSteeringLockPending()
+
+	// Raised last, once the machine has settled in Standby and the outputs have
+	// been asserted, so nothing on the way clears it.
+	//
+	// Nothing clears this within the power session either, and that is the
+	// honest lifetime: the vehicle is not in the state it was left in, and it
+	// will not be until the next boot, where the startup reconcile drops it.
+	// Clearing it on the next successful transition would be worse than
+	// useless: the dashboard polls vehicle:fault every 5s and needs roughly 8s
+	// from power-on, and the transition that would clear it is the same one
+	// that powers the dashboard, so the rider would never see it.
+	if err := v.redis.RaiseFault(FaultStateRestoreRefused, description); err != nil {
+		v.logger.Errorf("Failed to raise fault %d: %v", FaultStateRestoreRefused, err)
+	}
+}
+
+// assertMotorSafeOutputs puts the two outputs that can let the vehicle move into
+// the configuration every non-driving state agrees on. This is not a rollback of
+// anything: a declined restore means the machine sits in Standby while the GPIO
+// initial values were picked from a saved state that may well have been powered,
+// and Standby itself never cuts engine power.
+//
+// Brake before power cut, matching the ordering EnterParked documents.
+func (v *VehicleSystem) assertMotorSafeOutputs() {
+	if err := v.writeOutput("engine_brake", true); err != nil {
+		v.logger.Errorf("Failed to engage engine brake after declined restore: %v", err)
+	}
+	if err := v.setPower("engine_power", false); err != nil {
+		v.logger.Errorf("Failed to cut engine power after declined restore: %v", err)
+	}
+}
+
+// markSteeringLockPending notes that a declined restore may have left the
+// steering unlocked. The actuation itself is deferred to
+// lockSteeringAfterDeclinedRestore, which Start() calls once the rest of the
+// boot is out of the way.
+func (v *VehicleSystem) markSteeringLockPending() {
+	v.steeringLockPending = true
+}
+
+// lockSteeringAfterDeclinedRestore engages the steering lock when a declined
+// restore left the machine in Standby with the lock sensor reading unlocked.
+// Standby was entered from machine.Start() with an empty FromState, so
+// EnterStandby's from-parked arm never ran and nothing else will lock it.
+//
+// Start() calls this after it has registered the input callbacks and re-seeded
+// the lock latch, never from inside the restore. lockHandlebar's positioning
+// window works by installing its own temporary handlebar_position callback and
+// waiting a minute for the bars to reach the detent; arming it during the
+// restore means Start()'s own callback registration overwrites that callback a
+// few lines later, the window expires against nothing, and the steering is
+// never actuated on the one path that exists to lock it. Deferring also keeps
+// the lock goroutine, which writes handlebarUnlocked under mu, from running
+// against the unguarded writes to that field earlier in Start().
+func (v *VehicleSystem) lockSteeringAfterDeclinedRestore() {
+	if !v.steeringLockPending {
+		return
+	}
+	v.steeringLockPending = false
+
+	if v.machine.CurrentState() != fsm.StateStandby {
+		return
+	}
+	sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
+	if err != nil {
+		v.logger.Warnf("Failed to read handlebar lock sensor after declined restore: %v", err)
+		return
+	}
+	if !sensorVal {
+		return
+	}
+	v.logger.Infof("Declined restore left the steering unlocked, arming the lock")
+	v.lockHandlebar(nil)
 }
 
 // === State Entry Actions ===
+
+func (v *VehicleSystem) cancelHibernationRequest() {
+	v.mu.Lock()
+	hibernating := v.hibernationRequest
+	v.hibernationRequest = false
+	v.physicalHibernationRequest = false
+	v.mu.Unlock()
+	if hibernating {
+		if err := v.redis.SendCommand("scooter:power", "hibernate-cancel"); err != nil {
+			v.logger.Errorf("Failed to cancel hibernation: %v", err)
+		}
+	}
+}
+
+// Seatbox opening belongs to the transition action: hierarchical entry may
+// invoke Parked more than once, but an unlock must open the latch only once.
+func (v *VehicleSystem) OnUnlock(c *librefsm.Context) error {
+	v.cancelHibernationRequest()
+	v.mu.RLock()
+	enabled := v.openSeatboxOnUnlock
+	v.mu.RUnlock()
+	if !enabled {
+		return nil
+	}
+	event := "unlock"
+	if c != nil && c.Event != nil {
+		event = string(c.Event.ID)
+	}
+	v.logger.Infof("FSM: %s - opening seatbox (open-seatbox-on-unlock)", event)
+	v.openSeatbox()
+	return nil
+}
 
 func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: EnterReadyToDrive")
@@ -151,9 +342,7 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 	v.readyToDriveEntryTime = time.Now()
 	v.mu.Unlock()
 
-	if err := v.unlockHandlebarIfNeeded(); err != nil {
-		return err
-	}
+	v.unlockHandlebarIfNeeded()
 
 	// If handlebar is still locked after unlock attempt, the user forced RTD
 	// via the three-button override — cancel the unlock loop.
@@ -165,38 +354,73 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 		v.cancelHandlebarUnlock()
 	}
 
-	// Ensure backlight is enabled for user interaction
-	if err := v.redis.SetBacklightEnabled(true); err != nil {
-		v.logger.Warnf("Failed to enable backlight: %v", err)
+	// Complete Redis and link work before the FSM publishes ready-to-drive,
+	// but never put it ahead of the power and brake GPIO writes.
+	var effects sync.WaitGroup
+	startEffects := func(powerEffects ...func()) {
+		effects.Add(2)
+		go func() {
+			defer effects.Done()
+			for _, effect := range powerEffects {
+				effect()
+			}
+		}()
+		go func() {
+			defer effects.Done()
+			if err := v.redis.SetBacklightEnabled(true); err != nil {
+				v.logger.Warnf("Failed to enable backlight: %v", err)
+			}
+		}()
+	}
+	defer effects.Wait()
+
+	// The ECU got no power, which continuing does not make worse. The machine is
+	// in ready-to-drive either way, and the engine brake, the LED cue and the
+	// brake resync below all still need to run. The fault is reported at the join.
+	engineReport, engineFinish, engineErr := v.setPowerOutput("engine_power", true)
+	if engineErr != nil {
+		v.logger.Errorf("%v", engineErr)
 	}
 
-	if err := v.setPower("engine_power", true); err != nil {
-		v.logger.Errorf("%v", err)
-		return err
-	}
+	dashboardReport, dashboardFinish, dashboardErr := v.setPowerOutput("dashboard_power", true)
+	if dashboardErr != nil {
+		v.logger.Errorf("%v", dashboardErr)
 
-	if err := v.setPower("dashboard_power", true); err != nil {
-		v.logger.Errorf("%v", err)
-		// Roll back engine power to avoid inconsistent hardware state
-		if rbErr := v.setPower("engine_power", false); rbErr != nil {
-			v.logger.Errorf("Rollback failed: %v", rbErr)
+		// A failed dashboard GPIO must not leave the controller powered with
+		// the brake following the levers. Cut the rail before any Redis work.
+		offReport, offFinish, offErr := v.setPowerOutput("engine_power", false)
+		if offErr != nil {
+			v.logger.Errorf("%v", offErr)
+			// The power cut failed: report the on command, not a false off.
+			startEffects(engineReport, engineFinish, dashboardReport, offReport)
+		} else {
+			// The controller is already dark. Do not publish a transient on
+			// command after the cut; ecu-service could transmit to a dead ECU.
+			startEffects(engineReport, dashboardReport, offReport, offFinish)
 		}
-		return err
+
+		// Leave ready-to-drive honestly rather than sitting in it with no
+		// dashboard. The queued event runs after these effects join; the brake
+		// remains engaged until the Parked entry action takes over.
+		c.Send(librefsm.Event{ID: fsm.EvDashboardNotReady})
+		return nil
 	}
 
-	// Check current brake state and set engine brake pin accordingly
+	// Write the brake GPIO before publishing power, clearing output faults or
+	// reasserting dashboard links. The direct sensor read is required to keep
+	// the brake engaged if either lever is held.
 	brakeLeft, brakeRight, err := v.readBrakeStates()
 	if err != nil {
 		v.logger.Errorf("%v during transition", err)
-		return err
 	}
-	if err := v.io.WriteDigitalOutput("engine_brake", brakeLeft || brakeRight); err != nil {
-		v.logger.Errorf("Failed to set engine brake during transition: %v", err)
-		return err
+	brakeErr, brakeReport := v.writeOutputDeferredFault("engine_brake", brakeLeft || brakeRight)
+	if brakeErr != nil {
+		v.logger.Errorf("Failed to set engine brake during transition: %v", brakeErr)
 	}
 	v.logger.Debugf("Engine brake set to %v during transition (left: %v, right: %v)", brakeLeft || brakeRight, brakeLeft, brakeRight)
 
-	// Always play parked-to-drive cue when entering ready-to-drive
+	startEffects(engineReport, engineFinish, dashboardReport, dashboardFinish, brakeReport)
+	// Always play parked-to-drive cue when entering ready-to-drive.
 	v.playLedCue(3, "parked to drive")
 
 	// When coming from standby, synchronize brake states
@@ -225,38 +449,61 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: EnterParked")
 
-	if err := v.unlockHandlebarIfNeeded(); err != nil {
-		return err
-	}
-
-	// Ensure backlight is enabled for user interaction
-	if err := v.redis.SetBacklightEnabled(true); err != nil {
-		v.logger.Warnf("Failed to enable backlight: %v", err)
-	}
-
-	// Always turn on dashboard power when entering parked state
-	if err := v.setPower("dashboard_power", true); err != nil {
-		v.logger.Errorf("%v", err)
-		return err
-	}
-
-	// Engage engine brake BEFORE powering ECU to prevent movement
-	if err := v.io.WriteDigitalOutput("engine_brake", true); err != nil {
+	// Engage the engine brake before powering the ECU so the motor cannot turn
+	// while the controller comes up. Without a confirmed brake there is no such
+	// guarantee, so the ECU is driven dark instead: a powered controller with
+	// the brake in an unknown state is the movement this ordering exists to
+	// prevent. Parked is entered from ready-to-drive, where engine power is
+	// already on and the brake has been following the levers, so skipping the
+	// power-up would not be enough.
+	if err := v.writeOutput("engine_brake", true); err != nil {
 		v.logger.Errorf("Failed to engage engine brake: %v", err)
-		if rbErr := v.setPower("dashboard_power", false); rbErr != nil {
-			v.logger.Errorf("Rollback failed: %v", rbErr)
+		if err := v.setPower("engine_power", false); err != nil {
+			v.logger.Errorf("%v", err)
 		}
-		return err
+
+		// The controller stays dark from here until something enters a state
+		// that powers it, which can be days. The brake write failure raises its
+		// own code, but that one clears on the next lever edge that succeeds,
+		// so without this the vehicle sits parked with a dark ECU and an empty
+		// fault set. setPower clears this code once engine power is actually
+		// back on.
+		desc := fmt.Sprintf("engine controller held unpowered, the engine brake could not be engaged: %v", err)
+		if raiseErr := v.redis.RaiseFault(FaultEcuHeldUnpowered, desc); raiseErr != nil {
+			v.logger.Errorf("Failed to raise fault %d: %v", FaultEcuHeldUnpowered, raiseErr)
+		}
+	} else {
+		// The engage is the moment the throttle stops being accepted, so it
+		// belongs at Info: at the default level every step around it (FSM
+		// dispatch, state publish) is Debug-only, and a ride journal cannot
+		// place the cut between the kickstand event and the published state.
+		v.logger.Infof("Engine brake engaged")
+		if err := v.setPower("engine_power", true); err != nil {
+			v.logger.Errorf("%v", err)
+		}
 	}
 
-	// Keep ECU powered in parked state
-	if err := v.setPower("engine_power", true); err != nil {
-		v.logger.Errorf("%v", err)
-		if rbErr := v.setPower("dashboard_power", false); rbErr != nil {
-			v.logger.Errorf("Rollback failed: %v", rbErr)
+	v.unlockHandlebarIfNeeded()
+
+	// The rail bring-up's tail (Redis persist, ppp-link start, usb0 request)
+	// runs beside the cues but joins before returning: the FSM publishes
+	// state when this action returns, and a detached tail could be overtaken
+	// by the next transition's power cut: a ppp-link started late talks to the
+	// DBC the stop-before-cut order just unpowered.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := v.setPower("dashboard_power", true); err != nil {
+			v.logger.Errorf("%v", err)
 		}
-		return err
-	}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := v.redis.SetBacklightEnabled(true); err != nil {
+			v.logger.Warnf("Failed to enable backlight: %v", err)
+		}
+	}()
 
 	prevState := stateIDToSystemState(c.FromState)
 	if prevState == types.StateReadyToDrive {
@@ -264,10 +511,12 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 	}
 
 	if prevState == types.StateStandby {
+		// A failed read can only mean an unknown channel name. Carry on with the
+		// false, false it returns rather than skipping the blinker switch
+		// restore below for a condition that cannot occur.
 		brakeLeft, brakeRight, err := v.readBrakeStates()
 		if err != nil {
 			v.logger.Errorf("%v", err)
-			return err
 		}
 		brakesPressed := brakeLeft || brakeRight
 
@@ -279,9 +528,13 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 
 		// Restore blinker if the physical switch is still held
 		if left, err := v.io.ReadDigitalInput("blinker_left"); err == nil && left {
-			v.handleBlinkerChange("blinker_left", true)
+			if err := v.handleBlinkerChange("blinker_left", true); err != nil {
+				v.logger.Warnf("Failed to restore left blinker: %v", err)
+			}
 		} else if right, err := v.io.ReadDigitalInput("blinker_right"); err == nil && right {
-			v.handleBlinkerChange("blinker_right", true)
+			if err := v.handleBlinkerChange("blinker_right", true); err != nil {
+				v.logger.Warnf("Failed to restore right blinker: %v", err)
+			}
 		}
 	}
 
@@ -299,53 +552,14 @@ func (v *VehicleSystem) EnterParked(c *librefsm.Context) error {
 		}
 	}
 
-	// Start (or resume) the auto-standby timer.
-	//
-	// When transitioning back from hop-on we resume from the saved
-	// deadline so a forgotten hop-on still drops to standby on the
-	// original schedule. handleHopOnRequest captures the live deadline
-	// just before sending EvHopOnEngage; ExitParked then clears the
-	// live one but the saved copy persists across the StateHopOn detour.
-	v.mu.RLock()
-	seconds := v.autoStandbySeconds
-	saved := v.hopOnSavedAutoStandbyDl
-	v.mu.RUnlock()
+	// The auto-standby timer is owned by EnterAtRest / ExitAtRest now —
+	// see the StateAtRest parent in fsm.NewDefinition. EnterParked fires
+	// on every entry into the Parked leaf (including HopOn -> Parked),
+	// but the at-rest parent is unaffected by sibling transitions, so
+	// the timer keeps running through every hop-on detour without any
+	// manual deadline handoff.
 
-	cameFromHopOn := c.FromState == fsm.StateHopOn
-
-	if seconds > 0 && v.machine != nil {
-		var duration time.Duration
-		var deadline time.Time
-
-		if cameFromHopOn && !saved.IsZero() {
-			deadline = saved
-			duration = time.Until(deadline)
-			if duration < 1*time.Millisecond {
-				duration = 1 * time.Millisecond
-			}
-			v.logger.Infof("Resumed auto-standby timer with %v remaining (came from hop-on)", duration)
-		} else {
-			duration = time.Duration(seconds) * time.Second
-			deadline = time.Now().Add(duration)
-			v.logger.Infof("Started auto-standby timer: %d seconds", seconds)
-		}
-
-		v.mu.Lock()
-		v.autoStandbyDeadline = deadline
-		v.hopOnSavedAutoStandbyDl = time.Time{} // consumed (or stale — clear either way)
-		v.mu.Unlock()
-
-		v.machine.StartTimer(fsm.TimerAutoStandby, duration, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
-		if err := v.redis.PublishAutoStandbyDeadline(deadline); err != nil {
-			v.logger.Warnf("Failed to publish auto-standby deadline: %v", err)
-		}
-	} else {
-		// Even if no timer is armed, clear any stale saved deadline.
-		v.mu.Lock()
-		v.hopOnSavedAutoStandbyDl = time.Time{}
-		v.mu.Unlock()
-	}
-
+	wg.Wait()
 	return nil
 }
 
@@ -354,45 +568,52 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 
 	v.cancelHandlebarUnlock()
 
+	// Re-trust the lock sensor on standby entry. Covers OTA, vehicle-service
+	// crash/restart, or manual physical intervention while powered off.
+	// The async lockHandlebar() below will refine this once it completes.
+	v.resyncHandlebarLatchFromSensor()
+
 	// Turn off any active blinkers
 	if err := v.handleBlinkerRequest("off"); err != nil {
 		v.logger.Warnf("Failed to turn off blinkers on standby: %v", err)
 	}
 
-	v.mu.Lock()
-	forcedStandby := v.forceStandbyNoLock
-	if forcedStandby {
-		v.forceStandbyNoLock = false
-	}
-	v.mu.Unlock()
-
 	prevState := stateIDToSystemState(c.FromState)
 	isFromParked := (prevState == types.StateParked)
 
-	if forcedStandby {
-		v.logger.Debugf("Forced standby: skipping handlebar lock.")
-	} else if isFromParked {
-		v.logger.Infof("Locking handlebar (direct transition from parked)")
-		v.lockHandlebar()
-
-		// Play shutdown LED cue
-		brakeLeft, brakeRight, err := v.readBrakeStates()
-		if err != nil {
-			v.logger.Infof("%v for standby cue", err)
-		}
-		brakesPressed := brakeLeft || brakeRight
-
-		if brakesPressed {
-			v.playLedCue(8, "parked brake on to standby")
+	if isFromParked {
+		v.mu.RLock()
+		override := v.handlebarUnlockedOverride
+		v.mu.RUnlock()
+		if override {
+			v.logger.Debugf("Service mode: skipping handlebar re-lock on standby")
 		} else {
-			v.playLedCue(7, "parked brake off to standby")
+			v.logger.Infof("Locking handlebar (direct transition from parked)")
+			v.lockHandlebar(nil)
+
+			brakeLeft, brakeRight, err := v.readBrakeStates()
+			if err != nil {
+				v.logger.Infof("%v for standby cue", err)
+			}
+			brakesPressed := brakeLeft || brakeRight
+			if brakesPressed {
+				v.playLedCue(8, "parked brake on to standby")
+			} else {
+				v.playLedCue(7, "parked brake off to standby")
+			}
 		}
 	}
 
-	// Turn off dashboard power when entering standby, unless DBC update is in progress
+	// Turn off dashboard power when entering standby, unless a DBC update or a
+	// map download is still running. The map download hold is capped by
+	// startMapHoldTimer, which applies this deferral when it expires.
 	v.mu.Lock()
-	if v.dbcUpdating {
-		v.logger.Debugf("DBC update in progress, deferring dashboard power OFF until update completes")
+	if v.dbcUpdating || v.mapDownloading {
+		if v.dbcUpdating {
+			v.logger.Debugf("DBC update in progress, deferring dashboard power OFF until update completes")
+		} else {
+			v.logger.Debugf("Map download in progress, deferring dashboard power OFF for up to %v", dbcMapDownloadHoldMax)
+		}
 		powerOff := false
 		v.deferredDashboardPower = &powerOff
 		v.mu.Unlock()
@@ -469,9 +690,24 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 		v.playLedCue(7, "parked brake off to standby")
 	}
 
-	// Start handlebar locking immediately
-	v.logger.Debugf("Starting handlebar locking during shutdown")
-	v.lockHandlebar()
+	// The no-lock intent belongs only to this transition, not a persistent flag.
+	// An ignored event, failed exit, or later aborted shutdown cannot leak it
+	// into an ordinary lock. librefsm passes the triggering event to OnEnter.
+	forced := c.Event != nil && c.Event.ID == fsm.EvForceLock
+
+	// Start handlebar locking unless forced shutdown or service mode forbids it.
+	v.mu.RLock()
+	override := v.handlebarUnlockedOverride
+	v.mu.RUnlock()
+	if forced {
+		v.cancelHandlebarLock()
+		v.logger.Debugf("Force-lock: skipping handlebar lock during shutdown")
+	} else if override {
+		v.logger.Debugf("Service mode: skipping handlebar lock during shutdown")
+	} else {
+		v.logger.Debugf("Starting handlebar locking during shutdown")
+		v.lockHandlebar(nil)
+	}
 
 	// Note: The shutdown timer is handled by librefsm WithTimeout
 	v.logger.Infof("Shutdown timer started via librefsm (4.0s)")
@@ -480,29 +716,42 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 	// dbc-dispatcher on the DBC executes the poweroff.
 	// GPIO cut in EnterStandby (5s later) is the hard backstop.
 	//
-	// If a DBC update is in progress, skip the poweroff so the DBC can keep
-	// updating during standby. But if hibernation was requested, the MDB is
-	// about to power off and the DBC will lose power anyway, so shut it down
-	// cleanly instead of deferring.
+	// Hibernation may interrupt dashboard downloads, but an install-time block
+	// must retain dashboard power until its owner releases it.
 	//
 	// Once the publish succeeds, dbcPoweroffSent is set and the abort path
 	// (ShuttingDown -> Parked on EvUnlock) is gated off in the unlock
 	// handler: a late unlock gets queued and replayed from Standby.
-	v.mu.RLock()
+	v.mu.Lock()
 	updating := v.dbcUpdating
 	hibernating := v.hibernationRequest
-	v.mu.RUnlock()
-	if !updating || hibernating {
-		if updating && hibernating {
-			v.logger.Infof("Hibernate requested, forcing DBC shutdown despite active update")
+	// A map download also defers the shutdown, but only for a capped window,
+	// and never against hibernation: the MDB is about to cut power anyway.
+	mapHolding := v.mapDownloading && !hibernating
+	if mapHolding {
+		v.startMapHoldTimer()
+	} else if v.mapDownloading {
+		v.mapDownloading = false
+		v.stopMapHoldTimer()
+	}
+	v.mu.Unlock()
+	if mapHolding {
+		v.logger.Infof("Deferring DBC poweroff, map download in progress (up to %v)", dbcMapDownloadHoldMax)
+	}
+	if updating && hibernating {
+		install, err := v.redis.GetHashField("power:inhibits", "install:dbc")
+		if err == nil && install == "" {
 			v.mu.Lock()
 			v.dbcUpdating = false
 			v.deferredDashboardPower = nil
 			v.mu.Unlock()
+			updating = false
 			if err := v.redis.RemoveInhibitor("dbc-update"); err != nil {
-				v.logger.Warnf("Failed to remove DBC update inhibitor: %v", err)
+				v.logger.Warnf("Failed to remove DBC update hold: %v", err)
 			}
 		}
+	}
+	if !updating && !mapHolding {
 		if err := v.redis.PublishMessage("dbc:command", "poweroff"); err != nil {
 			v.logger.Warnf("Failed to send DBC poweroff: %v", err)
 		} else {
@@ -513,7 +762,7 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 			// whether to queue the request for post-standby replay.
 			v.dbcPoweroffSent.Store(true)
 		}
-	} else {
+	} else if updating {
 		v.logger.Infof("Skipping DBC poweroff, update in progress")
 	}
 
@@ -525,24 +774,61 @@ func (v *VehicleSystem) EnterWaitingSeatbox(c *librefsm.Context) error {
 	return nil
 }
 
-// === State Exit Actions ===
+// === StateAtRest parent (auto-standby owner) ===
 
-func (v *VehicleSystem) ExitParked(c *librefsm.Context) error {
-	v.logger.Debugf("FSM: ExitParked")
-	// Cancel auto-standby timer when leaving parked
+// EnterAtRest fires once on entry to the parked-family group from outside
+// (Standby/Init/ShuttingDown -> unlock). Sibling transitions inside the
+// group (Parked <-> HopOn <-> HopOnLearning) leave StateAtRest active and
+// do NOT re-fire this — see librefsm machine.go LCA semantics.
+func (v *VehicleSystem) EnterAtRest(c *librefsm.Context) error {
+	v.logger.Debugf("FSM: EnterAtRest (parent)")
+
+	v.mu.RLock()
+	seconds := v.autoStandbySeconds
+	v.mu.RUnlock()
+
+	if seconds <= 0 || v.machine == nil {
+		return nil
+	}
+
+	duration := time.Duration(seconds) * time.Second
+	deadline := time.Now().Add(duration)
+
+	v.mu.Lock()
+	v.autoStandbyDeadline = deadline
+	v.keylessCountdownActive = false
+	v.mu.Unlock()
+
+	v.machine.StartTimer(fsm.TimerAutoStandby, duration, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
+	v.logger.Infof("Started auto-standby timer: %d seconds", seconds)
+	if err := v.redis.PublishAutoStandbyDeadline(deadline); err != nil {
+		v.logger.Warnf("Failed to publish auto-standby deadline: %v", err)
+	}
+	return nil
+}
+
+// ExitAtRest fires once on exit to a non-parked-family state (Drive,
+// Shutdown, Hibernation, Standby). Cancels the auto-standby timer.
+//
+// Like every other exit action here it returns nil unconditionally, and that
+// has to stay true. executeTransition bails out on an exit error before
+// currentState is reassigned but after the state timers have been cancelled and
+// whatever OnExit bodies it already reached have run, and it never fires the
+// state change callback. Returning the ClearAutoStandbyDeadline error would
+// therefore leave the machine reporting the state it is leaving, with its timers
+// already torn down and no observer told. The error return exists for interface
+// conformance; treat it as required to be nil and log failures inline.
+func (v *VehicleSystem) ExitAtRest(c *librefsm.Context) error {
+	v.logger.Debugf("FSM: ExitAtRest (parent)")
 	if v.machine != nil {
 		v.machine.StopTimer(fsm.TimerAutoStandby)
-		v.logger.Debugf("Stopped auto-standby timer")
 	}
-	// Clear the deadline from Redis
 	if err := v.redis.ClearAutoStandbyDeadline(); err != nil {
 		v.logger.Warnf("Failed to clear auto-standby deadline: %v", err)
 	}
-	// Clear the live deadline. The saved-for-hop-on copy is intentionally
-	// NOT touched here — handleHopOnRequest captured it before triggering
-	// EvHopOnEngage so EnterHopOn / EnterParked-from-HopOn can resume.
 	v.mu.Lock()
 	v.autoStandbyDeadline = time.Time{}
+	v.keylessCountdownActive = false
 	v.mu.Unlock()
 	return nil
 }
@@ -556,13 +842,6 @@ func (v *VehicleSystem) EnterHibernation(c *librefsm.Context) error {
 
 func (v *VehicleSystem) ExitHibernation(c *librefsm.Context) error {
 	v.logger.Debugf("FSM: ExitHibernation (parent state)")
-	// Cancel any hibernation-related timers
-	v.mu.Lock()
-	if v.hibernationForceTimer != nil {
-		v.hibernationForceTimer.Stop()
-		v.hibernationForceTimer = nil
-	}
-	v.mu.Unlock()
 	return nil
 }
 
@@ -574,38 +853,15 @@ func (v *VehicleSystem) EnterHibernationInitialHold(c *librefsm.Context) error {
 func (v *VehicleSystem) EnterHibernationAwaitingConfirm(c *librefsm.Context) error {
 	v.logger.Infof("FSM: EnterHibernationAwaitingConfirm - initial hold complete, awaiting confirmation")
 
-	// Start 15s timer to force hibernation if brakes still held
-	v.mu.Lock()
-	if v.hibernationForceTimer != nil {
-		v.hibernationForceTimer.Stop()
-	}
-	v.hibernationForceTimer = time.AfterFunc(15*time.Second, func() {
-		// Verify we're still in the awaiting-confirm state before sending event
-		if v.machine.CurrentState() != fsm.StateHibernationAwaitingConfirm {
-			v.logger.Debugf("FSM: Force hibernation timer fired but no longer in awaiting-confirm state")
-			return
-		}
-
-		// Check if brakes are still pressed
-		brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-		if err != nil {
-			v.logger.Warnf("Failed to read brake_left for force hibernation: %v", err)
-			return
-		}
-		brakeRight, err := v.io.ReadDigitalInput("brake_right")
-		if err != nil {
-			v.logger.Warnf("Failed to read brake_right for force hibernation: %v", err)
-			return
-		}
-
-		if brakeLeft && brakeRight {
-			v.logger.Infof("FSM: Force hibernation - brakes held for 15s")
-			v.machine.Send(librefsm.Event{ID: fsm.EvHibernationForceTimeout})
-		} else {
-			v.logger.Debugf("FSM: Force hibernation cancelled - brakes released")
-		}
-	})
-	v.mu.Unlock()
+	// Force hibernation if both levers stay held. A state-scoped timer, so
+	// leaving the state cancels it and the "are we still here" recheck a
+	// hand-rolled timer needs disappears. The brake recheck lives on the
+	// transition guard.
+	//
+	// Not WithTimeout on the state: that is a single field, already spent on
+	// HibernationConfirmTimeout, and a second one would silently replace it.
+	c.StartTimer(fsm.TimerHibernationForce, fsm.HibernationForceTimeout,
+		librefsm.Event{ID: fsm.EvHibernationForceTimeout})
 
 	return nil
 }
@@ -620,70 +876,18 @@ func (v *VehicleSystem) EnterHibernationConfirm(c *librefsm.Context) error {
 	return nil
 }
 
-// EnterHopOn enters hop-on / hop-off mode. The scooter stays powered up
-// but handleInputChange will publish-only every input. The auto-standby
-// timer is resumed from the deadline that handleHopOnRequest captured
-// just before sending EvHopOnEngage (since ExitParked already cleared
-// the live deadline by the time this runs).
-//
-// If the EvHopOnEngage payload carries silent=true (combo learning
-// mode), the user-facing side-effects (LED cue, opportunistic steering
-// lock, hop-on-active flag publish) are skipped — only the input
-// suppression behaviour of StateHopOn is borrowed. The auto-standby
-// resume still happens regardless.
+// EnterHopOn enters the locked hop-on mode. The scooter stays powered up;
+// the dashboard renders a lock screen. Physical inputs are dropped at the
+// FSM level via the BlockedEvents declared on StateHopOn. The auto-standby
+// timer is owned by the StateAtRest parent and continues running across
+// the engage/release detour without manual handoff.
 func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
-	silent := false
-	if c != nil && c.Event != nil {
-		if s, ok := c.Event.Payload.(bool); ok {
-			silent = s
-		}
-	}
-	if silent {
-		v.logger.Infof("FSM: EnterHopOn (silent)")
-	} else {
-		v.logger.Infof("FSM: EnterHopOn")
-	}
-
-	v.mu.Lock()
-	v.hopOnSilent = silent
-	v.mu.Unlock()
-
-	// Resume the auto-standby timer using the saved deadline. If it has
-	// already passed, fire the timeout immediately so the FSM moves to
-	// shutdown without delay.
-	v.mu.RLock()
-	saved := v.hopOnSavedAutoStandbyDl
-	v.mu.RUnlock()
-
-	if !saved.IsZero() && v.machine != nil {
-		remaining := time.Until(saved)
-		if remaining < 1*time.Millisecond {
-			remaining = 1 * time.Millisecond
-		}
-		v.machine.StartTimer(fsm.TimerAutoStandby, remaining, librefsm.Event{ID: fsm.EvAutoStandbyTimeout})
-		v.mu.Lock()
-		v.autoStandbyDeadline = saved
-		v.mu.Unlock()
-		if err := v.redis.PublishAutoStandbyDeadline(saved); err != nil {
-			v.logger.Warnf("Failed to publish auto-standby deadline in hop-on: %v", err)
-		}
-		v.logger.Infof("hop-on: resumed auto-standby timer with %v remaining", remaining)
-	}
-
-	if silent {
-		// Learning mode: suppress every user-facing signal. The dashboard
-		// shows its own learn overlay; vehicle-service stays "invisible"
-		// while the user records their combo.
-		return nil
-	}
-
-	// Publish the hop-on flag so the dashboard renders the lock screen.
-	if err := v.redis.SetHopOnActive(true); err != nil {
-		v.logger.Warnf("Failed to publish hop-on-active=true: %v", err)
-	}
+	v.logger.Infof("FSM: EnterHopOn")
 
 	// Play the same LED cue we use for parked->standby (cue 7/8 picked
-	// by current brake state). Visually the scooter "powers down".
+	// by current brake state). Backlight handling lives entirely in the
+	// dashboard now (HopOnStore::activate keeps it on for 30s so the
+	// user sees the lock screen, then disables it via onBacklightDelayElapsed).
 	brakeLeft, brakeRight, _ := v.readBrakeStates()
 	if brakeLeft || brakeRight {
 		v.playLedCue(8, "hop-on engage (brakes on)")
@@ -691,89 +895,48 @@ func (v *VehicleSystem) EnterHopOn(c *librefsm.Context) error {
 		v.playLedCue(7, "hop-on engage (brakes off)")
 	}
 
-	// Opportunistic steering-lock engagement: only if the handlebar
-	// happens to be in lock-position right now. Synchronous pulse
-	// (~1.1s) so run on a goroutine to avoid blocking the FSM.
-	positioned, err := v.io.ReadDigitalInputDirect("handlebar_position")
-	if err != nil {
-		v.logger.Warnf("hop-on: failed to read handlebar position: %v", err)
-	} else if positioned {
-		v.logger.Infof("hop-on: handlebar in position, engaging steering lock")
-		go func() {
-			if err := v.pulseHandlebarLock(true); err != nil {
-				v.logger.Warnf("hop-on: failed to pulse handlebar lock: %v", err)
-				return
-			}
-			time.Sleep(handlebarLockRetryDelay)
-			sensorVal, err := v.io.ReadDigitalInputDirect("handlebar_lock_sensor")
-			if err != nil {
-				v.logger.Warnf("hop-on: failed to read handlebar lock sensor after pulse: %v", err)
-				return
-			}
-			v.mu.Lock()
-			v.handlebarUnlocked = sensorVal
-			if !sensorVal {
-				v.hopOnLockedHandlebar = true
-			}
-			v.mu.Unlock()
-			if sensorVal {
-				v.logger.Warnf("hop-on: lock pulse fired but sensor still reads unlocked")
-			} else {
-				v.logger.Infof("hop-on: steering lock engaged")
-			}
-		}()
-	} else {
-		v.logger.Debugf("hop-on: handlebar not in position, skipping steering lock")
-	}
+	// Steering-lock engagement with the same positioning grace window we use
+	// for parked->standby: if the handlebar is already in lock-position it
+	// locks immediately, otherwise the rider has handlebarLockWindow to move it
+	// all the way left to trigger the lock. The onLocked callback records that
+	// hop-on owns the lock so ExitHopOn releases the one it engaged.
+	v.logger.Infof("hop-on: arming steering lock (positioning window)")
+	v.lockHandlebar(func() {
+		v.mu.Lock()
+		v.hopOnLockedHandlebar = true
+		v.mu.Unlock()
+		v.logger.Infof("hop-on: steering lock engaged")
+	})
 
 	return nil
 }
 
-// ExitHopOn leaves hop-on / hop-off mode. Always cancels the auto-standby
-// timer (EnterParked or another state's onEnter will rearm it as needed)
-// and releases the steering lock if WE engaged it on entry. The
-// user-facing reverse LED cue and hop-on-active publish are skipped if
-// we entered silently (combo learning) — they were never set.
+// ExitHopOn leaves the locked hop-on mode. Releases the steering lock if
+// WE engaged it on entry. The auto-standby timer is parent-owned, so no
+// timer plumbing is needed here.
 func (v *VehicleSystem) ExitHopOn(c *librefsm.Context) error {
+	// Tear down any still-open positioning window so it can't lock the
+	// handlebar after we've left hop-on. The Parked exit path also cancels via
+	// EnterParked->unlockHandlebarIfNeeded, but WaitingSeatbox does not.
+	// Cancel here unconditionally, before releasing the lock we owned.
+	v.cancelHandlebarLock()
+
 	v.mu.Lock()
-	silent := v.hopOnSilent
-	v.hopOnSilent = false
 	releaseHandlebar := v.hopOnLockedHandlebar
 	v.hopOnLockedHandlebar = false
 	v.mu.Unlock()
 
-	if silent {
-		v.logger.Infof("FSM: ExitHopOn (silent)")
+	v.logger.Infof("FSM: ExitHopOn")
+
+	// Reverse LED cue: same one we play for standby->parked.
+	brakeLeft, brakeRight, _ := v.readBrakeStates()
+	if brakeLeft || brakeRight {
+		v.playLedCue(2, "hop-on release (brakes on)")
 	} else {
-		v.logger.Infof("FSM: ExitHopOn")
+		v.playLedCue(1, "hop-on release (brakes off)")
 	}
 
-	if v.machine != nil {
-		v.machine.StopTimer(fsm.TimerAutoStandby)
-	}
-	if err := v.redis.ClearAutoStandbyDeadline(); err != nil {
-		v.logger.Warnf("Failed to clear auto-standby deadline on hop-on exit: %v", err)
-	}
-	v.mu.Lock()
-	v.autoStandbyDeadline = time.Time{}
-	v.mu.Unlock()
-
-	if !silent {
-		if err := v.redis.SetHopOnActive(false); err != nil {
-			v.logger.Warnf("Failed to publish hop-on-active=false: %v", err)
-		}
-
-		// Reverse LED cue: same one we play for standby->parked.
-		brakeLeft, brakeRight, _ := v.readBrakeStates()
-		if brakeLeft || brakeRight {
-			v.playLedCue(2, "hop-on release (brakes on)")
-		} else {
-			v.playLedCue(1, "hop-on release (brakes off)")
-		}
-	}
-
-	// Release the steering lock only if we engaged it on entry. Silent
-	// mode never engages it, so this is naturally a no-op for learning.
+	// Release the steering lock only if we engaged it on entry.
 	if releaseHandlebar {
 		v.logger.Infof("hop-on: releasing steering lock that we engaged")
 		go func() {
@@ -793,11 +956,30 @@ func (v *VehicleSystem) ExitHopOn(c *librefsm.Context) error {
 			if !sensorVal {
 				v.logger.Warnf("hop-on: unlock pulse fired but sensor still reads locked")
 			} else {
+				v.setHandlebarLatch(false)
 				v.logger.Infof("hop-on: steering lock released")
 			}
 		}()
 	}
 
+	return nil
+}
+
+// EnterHopOnLearning enters combo-learning mode. Borrows hop-on's input
+// gating so the user can press buttons to record a combo without the
+// scooter honking, blinking, opening the seatbox, or transitioning out.
+// No user-facing side-effects: no LED cue, no steering-lock attempt, no
+// backlight kill — the dashboard renders its own learn overlay. The
+// auto-standby timer continues to run on the StateAtRest parent.
+func (v *VehicleSystem) EnterHopOnLearning(c *librefsm.Context) error {
+	v.logger.Infof("FSM: EnterHopOnLearning")
+	return nil
+}
+
+// ExitHopOnLearning leaves combo-learning mode. Mirror of EnterHopOnLearning
+// — nothing to undo, since nothing was set up.
+func (v *VehicleSystem) ExitHopOnLearning(c *librefsm.Context) error {
+	v.logger.Infof("FSM: ExitHopOnLearning")
 	return nil
 }
 
@@ -852,6 +1034,19 @@ func (v *VehicleSystem) IsHandlebarUnlocked(c *librefsm.Context) bool {
 	return v.handlebarUnlocked
 }
 
+// CanAbortShutdown reports whether a shutdown in progress can still be turned
+// around. False once the DBC has been told to halt.
+func (v *VehicleSystem) CanAbortShutdown(c *librefsm.Context) bool {
+	return !v.dbcPoweroffSent.Load()
+}
+
+// IsBrakeHibernationEnabled reports the brake-hold hibernation setting.
+func (v *VehicleSystem) IsBrakeHibernationEnabled(c *librefsm.Context) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.brakeHibernationEnabled
+}
+
 func (v *VehicleSystem) AreBrakesPressed(c *librefsm.Context) bool {
 	brakeLeft, _ := v.io.ReadDigitalInput("brake_left")
 	brakeRight, _ := v.io.ReadDigitalInput("brake_right")
@@ -862,21 +1057,22 @@ func (v *VehicleSystem) AreBrakesPressed(c *librefsm.Context) bool {
 
 func (v *VehicleSystem) OnShutdownTimeout(c *librefsm.Context) error {
 	v.logger.Infof("FSM: Shutdown timeout - transitioning to standby")
+	return nil
+}
 
-	// Check if hibernation was requested
+func (v *VehicleSystem) completeHibernationShutdown() {
 	v.mu.Lock()
-	hibernationRequest := v.hibernationRequest
+	physical := v.physicalHibernationRequest
+	v.physicalHibernationRequest = false
 	v.hibernationRequest = false
 	v.mu.Unlock()
-
-	if hibernationRequest {
-		v.logger.Infof("Hibernation requested, sending hibernate command")
+	// Physical confirmation submits its sole power request after standby is
+	// published. PM-originated preparation must not replace PM's timed intent.
+	if physical {
 		if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-			v.logger.Errorf("Failed to send hibernate command: %v", err)
+			v.logger.Errorf("Failed to send physical hibernation request: %v", err)
 		}
 	}
-
-	return nil
 }
 
 func (v *VehicleSystem) OnAutoStandbyTimeout(c *librefsm.Context) error {
@@ -887,42 +1083,37 @@ func (v *VehicleSystem) OnAutoStandbyTimeout(c *librefsm.Context) error {
 func (v *VehicleSystem) OnHibernationComplete(c *librefsm.Context) error {
 	v.logger.Infof("FSM: Hibernation complete - triggering hibernation")
 	v.mu.Lock()
+	v.physicalHibernationRequest = true
 	v.hibernationRequest = true
 	v.mu.Unlock()
 	return nil
 }
 
+func (v *VehicleSystem) IsHibernatePreparationCurrent(c *librefsm.Context) bool {
+	id, ok := c.Event.Payload.(string)
+	if !ok || id == "" {
+		return false
+	}
+	current, err := v.redis.GetHashField("power-manager", "hibernate-request-id")
+	return err == nil && current == id
+}
+
 func (v *VehicleSystem) OnLockHibernate(c *librefsm.Context) error {
-	v.logger.Infof("FSM: Lock-hibernate - setting hibernation request")
+	v.logger.Infof("FSM: Preparing vehicle for hibernation")
 	v.mu.Lock()
 	v.hibernationRequest = true
+	v.physicalHibernationRequest = false
 	v.mu.Unlock()
-
-	// Send hibernate command immediately (will execute after shutdown completes)
-	if err := v.redis.SendCommand("scooter:power", "hibernate-manual"); err != nil {
-		v.logger.Errorf("Failed to send hibernate command: %v", err)
-	}
 	return nil
 }
 
 func (v *VehicleSystem) OnForceLock(c *librefsm.Context) error {
-	v.logger.Infof("FSM: Force-lock - setting force-standby flag")
-	v.mu.Lock()
-	v.forceStandbyNoLock = true
-	v.mu.Unlock()
+	v.logger.Infof("FSM: Force-lock - graceful shutdown without handlebar locking")
 	return nil
 }
 
 func (v *VehicleSystem) OnSeatboxButton(c *librefsm.Context) error {
 	v.logger.Infof("FSM: Seatbox button pressed - opening seatbox")
-
-	// 1. Publish event first (for immediate UI response via PUBSUB)
-	if err := v.redis.PublishSeatboxOpened(); err != nil {
-		v.logger.Warnf("Failed to publish seatbox opened event: %v", err)
-	}
-
-	// 2. Open physical seatbox lock (async, fire-and-forget)
-	v.openSeatboxLock()
-
+	v.openSeatbox()
 	return nil
 }

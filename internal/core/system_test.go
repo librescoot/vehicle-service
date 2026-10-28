@@ -2,6 +2,10 @@ package core
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"log"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,9 +18,17 @@ import (
 	"vehicle-service/internal/types"
 )
 
+// faultCall records one RaiseFault/ClearFault call.
+type faultCall struct {
+	code        int
+	raised      bool
+	description string
+}
+
 // Mock MessagingClient
 type mockMessagingClient struct {
 	callbacks messaging.Callbacks
+	mu        sync.Mutex // guards the recorded-call slices; runBlinker records from its own goroutine
 
 	// Track method calls
 	publishedStates       []types.SystemState
@@ -33,17 +45,28 @@ type mockMessagingClient struct {
 	publishedMessages      []struct{ channel, message string }
 	mainPowerSets          []bool
 	enginePowerSets        []bool
-	kickstandStates        []bool
-	hornButtonStates       []bool
-	seatboxButtonStates    []bool
+	restoreAttemptSets     []string
+	restoreAttemptClears   int
+	faultCalls             []faultCall
+	removedInhibitors      []string
 
 	// Return values
-	vehicleState    types.SystemState
-	vehicleStateErr error
-	dashboardPower  bool
-	dbcUpdating     bool
-	otaStatus       string
-	hashFieldValue  string
+	vehicleState      types.SystemState
+	vehicleStateErr   error
+	restoreAttempt    string
+	restoreAttemptErr error
+	dashboardPower    bool
+	dbcUpdating       bool
+	otaStatus         string
+	otaHeartbeat      string
+	hashFieldValue    string
+	// hashFields overrides hashFieldValue for a specific "hash/field"; tests that
+	// need more than one field at a time set entries here.
+	hashFields   map[string]string
+	usb0GateSets []bool
+	dbcLinkSets  []string
+	dbcUSBSets   []bool
+	dbcPPPSets   []bool
 }
 
 func newMockMessagingClient() *mockMessagingClient {
@@ -59,6 +82,28 @@ func (m *mockMessagingClient) Close() error                               { retu
 func (m *mockMessagingClient) GetVehicleState() (types.SystemState, error) {
 	return m.vehicleState, m.vehicleStateErr
 }
+func (m *mockMessagingClient) SetRestoreAttempt(state string, ttl time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restoreAttempt = state
+	m.restoreAttemptSets = append(m.restoreAttemptSets, state)
+	return nil
+}
+
+func (m *mockMessagingClient) GetRestoreAttempt() (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.restoreAttempt, m.restoreAttemptErr
+}
+
+func (m *mockMessagingClient) ClearRestoreAttempt() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restoreAttempt = ""
+	m.restoreAttemptClears++
+	return nil
+}
+
 func (m *mockMessagingClient) GetDashboardPower() (bool, error) { return m.dashboardPower, nil }
 func (m *mockMessagingClient) SetDashboardPower(enabled bool) error {
 	m.dashboardPower = enabled
@@ -71,52 +116,80 @@ func (m *mockMessagingClient) SetDbcUpdating(updating bool) error {
 	m.dbcUpdating = updating
 	return nil
 }
-func (m *mockMessagingClient) GetOtaStatus(component string) (string, error)  { return m.otaStatus, nil }
+func (m *mockMessagingClient) GetOtaStatus(component string) (string, error) { return m.otaStatus, nil }
+func (m *mockMessagingClient) GetOtaHeartbeat(component string) (string, error) {
+	return m.otaHeartbeat, nil
+}
 func (m *mockMessagingClient) SetInhibitor(id, inhibitType, why string) error { return nil }
-func (m *mockMessagingClient) RemoveInhibitor(id string) error                { return nil }
+func (m *mockMessagingClient) RemoveInhibitor(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.removedInhibitors = append(m.removedInhibitors, id)
+	return nil
+}
 func (m *mockMessagingClient) GetHashField(hash, field string) (string, error) {
+	if v, ok := m.hashFields[hash+"/"+field]; ok {
+		return v, nil
+	}
 	return m.hashFieldValue, nil
+}
+func (m *mockMessagingClient) SetUsb0Gate(open bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.usb0GateSets = append(m.usb0GateSets, open)
+	return nil
+}
+func (m *mockMessagingClient) RecordDbcLink(transport string, usbUp, pppUp bool, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dbcLinkSets = append(m.dbcLinkSets, transport)
+	m.dbcUSBSets = append(m.dbcUSBSets, usbUp)
+	m.dbcPPPSets = append(m.dbcPPPSets, pppUp)
+	return nil
 }
 func (m *mockMessagingClient) PublishAutoStandbyDeadline(deadline time.Time) error { return nil }
 func (m *mockMessagingClient) ClearAutoStandbyDeadline() error                     { return nil }
-func (m *mockMessagingClient) SetHopOnActive(active bool) error                    { return nil }
-func (m *mockMessagingClient) SetKickstandState(deployed bool) error {
-	m.kickstandStates = append(m.kickstandStates, deployed)
-	return nil
-}
-func (m *mockMessagingClient) SetHandlebarLockState(locked bool) error { return nil }
-func (m *mockMessagingClient) SetSeatboxLockState(locked bool) error   { return nil }
-func (m *mockMessagingClient) SetHornButton(pressed bool) error {
-	m.hornButtonStates = append(m.hornButtonStates, pressed)
-	return nil
-}
-func (m *mockMessagingClient) SetSeatboxButton(pressed bool) error {
-	m.seatboxButtonStates = append(m.seatboxButtonStates, pressed)
-	return nil
-}
+func (m *mockMessagingClient) SetKickstandState(deployed bool) error               { return nil }
+func (m *mockMessagingClient) SetHandlebarLockState(locked bool) error             { return nil }
+func (m *mockMessagingClient) SetHandlebarLockLatched(locked bool) error           { return nil }
+func (m *mockMessagingClient) SetSeatboxLockState(locked bool) error               { return nil }
+func (m *mockMessagingClient) SetHornButton(pressed bool) error                    { return nil }
+func (m *mockMessagingClient) SetSeatboxButton(pressed bool) error                 { return nil }
 func (m *mockMessagingClient) SetMainPower(on bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.mainPowerSets = append(m.mainPowerSets, on)
 	return nil
 }
 func (m *mockMessagingClient) SetEnginePower(on bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.enginePowerSets = append(m.enginePowerSets, on)
 	return nil
 }
 func (m *mockMessagingClient) SendCommand(channel, command string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.sendCommands = append(m.sendCommands, struct{ channel, command string }{channel, command})
 	return nil
 }
 func (m *mockMessagingClient) PublishMessage(channel, message string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.publishedMessages = append(m.publishedMessages, struct{ channel, message string }{channel, message})
 	return nil
 }
 
 func (m *mockMessagingClient) PublishVehicleState(state types.SystemState) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.publishedStates = append(m.publishedStates, state)
 	return nil
 }
 
 func (m *mockMessagingClient) SetBrakeState(side string, pressed bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.setBrakeStates = append(m.setBrakeStates, struct {
 		side    string
 		pressed bool
@@ -125,21 +198,29 @@ func (m *mockMessagingClient) SetBrakeState(side string, pressed bool) error {
 }
 
 func (m *mockMessagingClient) SetHandlebarPosition(isOnPlace bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.setHandlebarPositions = append(m.setHandlebarPositions, isOnPlace)
 	return nil
 }
 
 func (m *mockMessagingClient) SetBlinkerSwitch(state string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.setBlinkerSwitches = append(m.setBlinkerSwitches, state)
 	return nil
 }
 
 func (m *mockMessagingClient) SetBlinkerState(state string, _ int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.setBlinkerStates = append(m.setBlinkerStates, state)
 	return nil
 }
 
 func (m *mockMessagingClient) PublishButtonEvent(event string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.publishedButtonEvents = append(m.publishedButtonEvents, event)
 	return nil
 }
@@ -153,15 +234,65 @@ func (m *mockMessagingClient) PublishSeatboxOpened() error {
 	return nil
 }
 
+func (m *mockMessagingClient) RaiseFault(code int, description string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.faultCalls = append(m.faultCalls, faultCall{code: code, raised: true, description: description})
+	return nil
+}
+
+func (m *mockMessagingClient) ClearFault(code int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.faultCalls = append(m.faultCalls, faultCall{code: code, raised: false})
+	return nil
+}
+
+// faultActive reports whether the last call touching code raised it.
+//
+// The trap this helper exists to close: the mock records every call, while
+// FaultReporter collapses repeats server side. So a test must assert on
+// last-write-wins state, never on how many calls were recorded.
+func faultActive(m *mockMessagingClient, code int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	active := false
+	for _, c := range m.faultCalls {
+		if c.code == code {
+			active = c.raised
+		}
+	}
+	return active
+}
+
+// faultDescription returns the description of the last raise of code.
+func faultDescription(m *mockMessagingClient, code int) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	desc := ""
+	for _, c := range m.faultCalls {
+		if c.code == code && c.raised {
+			desc = c.description
+		}
+	}
+	return desc
+}
+
 // Mock HardwareIO
 type mockHardwareIO struct {
+	mu             sync.Mutex // guards recorded calls; runBlinker plays cues from its own goroutine
 	digitalOutputs map[string]bool
 	digitalInputs  map[string]bool
+	inputErrs      map[string]error // per-channel ReadDigitalInput failures
+	outputErrs     map[string]error // per-channel WriteDigitalOutput failures
 	initialValues  map[string]bool
 	inputCallbacks map[string]hardware.InputCallback
 	pwmCues        []int
 	pwmFades       []struct{ ch, idx int }
 	resyncCount    int
+	usb0Enabled    []bool
+	dbcLinks       hardware.DbcLinks
+	dbcLinkErr     error
 }
 
 func newMockHardwareIO() *mockHardwareIO {
@@ -177,32 +308,117 @@ func (m *mockHardwareIO) Initialize() error { return nil }
 func (m *mockHardwareIO) Cleanup()          {}
 
 func (m *mockHardwareIO) ReadDigitalInput(channel string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.inputErrs[channel]; err != nil {
+		return false, err
+	}
 	return m.digitalInputs[channel], nil
 }
 
 func (m *mockHardwareIO) ReadDigitalInputDirect(channel string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.digitalInputs[channel], nil
 }
 
 func (m *mockHardwareIO) WriteDigitalOutput(channel string, value bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.outputErrs[channel]; err != nil {
+		return err
+	}
 	m.digitalOutputs[channel] = value
 	return nil
 }
 
+// failOutput makes subsequent writes to channel fail. Reads and writes of
+// outputErrs share the mutex WriteDigitalOutput already holds, so a test may
+// flip it while the FSM is running.
+func (m *mockHardwareIO) failOutput(channel string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.outputErrs == nil {
+		m.outputErrs = make(map[string]error)
+	}
+	if err == nil {
+		delete(m.outputErrs, channel)
+		return
+	}
+	m.outputErrs[channel] = err
+}
+
+func (m *mockHardwareIO) getDigitalOutput(channel string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.digitalOutputs[channel]
+}
+
+func (m *mockHardwareIO) setDigitalOutput(channel string, value bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.digitalOutputs[channel] = value
+}
+
+// setDigitalInput, clearDigitalOutputs and setInputErrs exist so tests reach
+// the mock's maps through the same mutex the service does. Assigning them
+// directly races with any goroutine the test left running: the handlebar
+// lock and unlock paths both write outputs from their own goroutines and
+// outlive the test body that started them.
+func (m *mockHardwareIO) setDigitalInput(channel string, value bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.digitalInputs[channel] = value
+}
+
+func (m *mockHardwareIO) clearDigitalOutputs() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.digitalOutputs = make(map[string]bool)
+}
+
+func (m *mockHardwareIO) setInputErrs(errs map[string]error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inputErrs = errs
+}
+
 func (m *mockHardwareIO) SetInitialValue(name string, value bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.initialValues[name] = value
 }
 
+// RegisterInputCallback shares the mutex because the service re-registers
+// callbacks from its own goroutines: lockHandlebar and cancelHandlebarLock
+// both do, and two of those overlapping is enough to race on the map.
 func (m *mockHardwareIO) RegisterInputCallback(channel string, callback hardware.InputCallback) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.inputCallbacks[channel] = callback
 }
 
 func (m *mockHardwareIO) SetDebounce(channel string, duration time.Duration) {}
 
+// ResyncInputs snapshots under the mutex and calls the callbacks without it.
+// They run service code that writes back through WriteDigitalOutput, which
+// takes the same mutex, so holding it across the calls would deadlock.
 func (m *mockHardwareIO) ResyncInputs() error {
+	m.mu.Lock()
 	m.resyncCount++
+	type resync struct {
+		channel string
+		cb      hardware.InputCallback
+		value   bool
+	}
+	pending := make([]resync, 0, len(m.inputCallbacks))
 	for channel, cb := range m.inputCallbacks {
-		if err := cb(channel, m.digitalInputs[channel]); err != nil {
+		pending = append(pending, resync{channel: channel, cb: cb, value: m.digitalInputs[channel]})
+	}
+	m.mu.Unlock()
+
+	for _, p := range pending {
+		if err := p.cb(p.channel, p.value); err != nil {
 			return err
 		}
 	}
@@ -210,17 +426,32 @@ func (m *mockHardwareIO) ResyncInputs() error {
 }
 
 func (m *mockHardwareIO) PlayPwmCue(idx int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.pwmCues = append(m.pwmCues, idx)
 	return nil
 }
 
 func (m *mockHardwareIO) PlayPwmFade(ch int, idx int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.pwmFades = append(m.pwmFades, struct{ ch, idx int }{ch, idx})
 	return nil
 }
 
-func (m *mockHardwareIO) SetDbcLed(color string) error      { return nil }
-func (m *mockHardwareIO) SetUsb0Enabled(enabled bool) error { return nil }
+func (m *mockHardwareIO) SetDbcLed(color string, brightness uint8) error { return nil }
+func (m *mockHardwareIO) SetUsb0Enabled(enabled bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.usb0Enabled = append(m.usb0Enabled, enabled)
+	return nil
+}
+func (m *mockHardwareIO) SetPppLinkEnabled(enabled bool) error { return nil }
+func (m *mockHardwareIO) DbcLinks() (hardware.DbcLinks, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.dbcLinks, m.dbcLinkErr
+}
 
 // SimulateInput triggers an input callback
 func (m *mockHardwareIO) SimulateInput(channel string, value bool) error {
@@ -232,10 +463,14 @@ func (m *mockHardwareIO) SimulateInput(channel string, value bool) error {
 
 // Test helper
 func newTestVehicleSystem() (*VehicleSystem, *mockHardwareIO, *mockMessagingClient) {
-	l := logger.NewLogger(nil, logger.LogLevelError)
+	// A real destination, not nil: at LogLevelError every Errorf call actually
+	// formats and prints, and a nil *log.Logger panics inside it.
+	l := logger.NewLogger(log.New(io.Discard, "", 0), logger.LogLevelError)
 	mockIO := newMockHardwareIO()
 	mockRedis := newMockMessagingClient()
 	system := NewVehicleSystem(mockIO, mockRedis, l)
+	// Run background work inline so a test observes the record deterministically.
+	system.background = func(f func()) { f() }
 	return system, mockIO, mockRedis
 }
 
@@ -253,8 +488,8 @@ func TestNewVehicleSystem(t *testing.T) {
 	if system.redis != mockRedis {
 		t.Error("redis not set correctly")
 	}
-	if system.state != types.StateInit {
-		t.Errorf("Expected initial state StateInit, got %v", system.state)
+	if system.state != types.StateStandby {
+		t.Errorf("Expected initial state StateStandby, got %v", system.state)
 	}
 }
 
@@ -267,20 +502,20 @@ func TestHandleHornRequestOn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleHornRequest failed: %v", err)
 	}
-	if !mockIO.digitalOutputs["horn"] {
+	if !mockIO.getDigitalOutput("horn") {
 		t.Error("Expected horn to be on")
 	}
 }
 
 func TestHandleHornRequestOff(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
-	mockIO.digitalOutputs["horn"] = true
+	mockIO.setDigitalOutput("horn", true)
 
 	err := system.handleHornRequest(false)
 	if err != nil {
 		t.Fatalf("handleHornRequest failed: %v", err)
 	}
-	if mockIO.digitalOutputs["horn"] {
+	if mockIO.getDigitalOutput("horn") {
 		t.Error("Expected horn to be off")
 	}
 }
@@ -294,8 +529,8 @@ func TestHandleBlinkerRequestOff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleBlinkerRequest failed: %v", err)
 	}
-	if system.blinkerState != BlinkerOff {
-		t.Errorf("Expected BlinkerOff, got %v", system.blinkerState)
+	if system.getBlinkerState() != BlinkerOff {
+		t.Errorf("Expected BlinkerOff, got %v", system.getBlinkerState())
 	}
 	if len(mockIO.pwmCues) != 1 || mockIO.pwmCues[0] != 9 {
 		t.Errorf("Expected PWM cue 9 (LED_BLINK_NONE), got %v", mockIO.pwmCues)
@@ -312,8 +547,8 @@ func TestHandleBlinkerRequestLeft(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleBlinkerRequest failed: %v", err)
 	}
-	if system.blinkerState != BlinkerLeft {
-		t.Errorf("Expected BlinkerLeft, got %v", system.blinkerState)
+	if system.getBlinkerState() != BlinkerLeft {
+		t.Errorf("Expected BlinkerLeft, got %v", system.getBlinkerState())
 	}
 	if system.blinkerStopChan == nil {
 		t.Error("Expected blinker goroutine to be started")
@@ -327,8 +562,8 @@ func TestHandleBlinkerRequestRight(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleBlinkerRequest failed: %v", err)
 	}
-	if system.blinkerState != BlinkerRight {
-		t.Errorf("Expected BlinkerRight, got %v", system.blinkerState)
+	if system.getBlinkerState() != BlinkerRight {
+		t.Errorf("Expected BlinkerRight, got %v", system.getBlinkerState())
 	}
 }
 
@@ -339,8 +574,8 @@ func TestHandleBlinkerRequestBoth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleBlinkerRequest failed: %v", err)
 	}
-	if system.blinkerState != BlinkerBoth {
-		t.Errorf("Expected BlinkerBoth, got %v", system.blinkerState)
+	if system.getBlinkerState() != BlinkerBoth {
+		t.Errorf("Expected BlinkerBoth, got %v", system.getBlinkerState())
 	}
 }
 
@@ -542,6 +777,9 @@ func TestHandleUpdateRequestCompleteDbc(t *testing.T) {
 	system, _, mockRedis := newTestVehicleSystem()
 	system.dbcUpdating = true
 	mockRedis.dbcUpdating = true
+	// Force a non-Standby state so the handler doesn't try to drive an
+	// FSM transition (the test fixture has no machine initialized).
+	system.state = types.StateParked
 
 	err := system.handleUpdateRequest("complete-dbc")
 	if err != nil {
@@ -575,6 +813,70 @@ func TestHandleUpdateRequestInvalid(t *testing.T) {
 	}
 }
 
+// ===== DBC Update Watchdog Tests =====
+
+func TestDbcWatchdogDuration_FallsBackWithoutHeartbeat(t *testing.T) {
+	v := &VehicleSystem{}
+	// An older DBC image publishes no heartbeat. Cutting its dashboard power
+	// at three minutes could interrupt an install, so it keeps the long
+	// timeout until it proves it speaks heartbeat.
+	if got := v.dbcWatchdogDuration(); got != dbcUpdateWatchdogTimeout {
+		t.Errorf("without a heartbeat: %v, want %v", got, dbcUpdateWatchdogTimeout)
+	}
+}
+
+func TestDbcWatchdogDuration_ShortensOnceHeartbeatSeen(t *testing.T) {
+	v := &VehicleSystem{dbcHeartbeatSeen: true}
+	if got := v.dbcWatchdogDuration(); got != dbcUpdateHeartbeatTimeout {
+		t.Errorf("with a heartbeat: %v, want %v", got, dbcUpdateHeartbeatTimeout)
+	}
+}
+
+func TestDbcWatchdogTimeouts_AreOrdered(t *testing.T) {
+	if dbcUpdateHeartbeatTimeout >= dbcUpdateWatchdogTimeout {
+		t.Fatalf("the heartbeat timeout (%v) must be shorter than the fallback (%v)",
+			dbcUpdateHeartbeatTimeout, dbcUpdateWatchdogTimeout)
+	}
+	// Must clear several heartbeat intervals (update-service writes one every
+	// 30s) so one lost write is survivable.
+	if dbcUpdateHeartbeatTimeout < 3*30*time.Second {
+		t.Errorf("heartbeat timeout %v leaves no slack for a missed tick", dbcUpdateHeartbeatTimeout)
+	}
+}
+
+func TestDbcWatchdogTimeout_YieldsToMapDownload(t *testing.T) {
+	// A wedged OTA must not cut the rail a map download is still using.
+	if shouldPowerOffAfterWatchdog(types.StateStandby, nil, true) {
+		t.Error("must not power off while a map download holds the rail")
+	}
+	if !shouldPowerOffAfterWatchdog(types.StateStandby, nil, false) {
+		t.Error("must power off in standby when nothing else holds the rail")
+	}
+}
+
+func TestShouldPowerOffAfterWatchdog_NotInStandby(t *testing.T) {
+	if shouldPowerOffAfterWatchdog(types.StateParked, nil, false) {
+		t.Error("must not power off outside standby")
+	}
+}
+
+func TestShouldPowerOffAfterWatchdog_DeferredPowerOnSuppressesOff(t *testing.T) {
+	on := true
+	if shouldPowerOffAfterWatchdog(types.StateStandby, &on, false) {
+		t.Error("a deferred power-ON request must not also power off")
+	}
+}
+
+func TestShouldPowerOffAfterWatchdog_DeferredPowerOffHonoured(t *testing.T) {
+	off := false
+	if !shouldPowerOffAfterWatchdog(types.StateStandby, &off, false) {
+		t.Error("a deferred power-OFF request in standby should power off")
+	}
+	if shouldPowerOffAfterWatchdog(types.StateStandby, &off, true) {
+		t.Error("a map download must still suppress a deferred power-OFF")
+	}
+}
+
 // ===== Hardware IO Mock Tests =====
 
 func TestHardwareIODigitalOutput(t *testing.T) {
@@ -584,7 +886,7 @@ func TestHardwareIODigitalOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteDigitalOutput failed: %v", err)
 	}
-	if !mockIO.digitalOutputs["test_pin"] {
+	if !mockIO.getDigitalOutput("test_pin") {
 		t.Error("Digital output not set")
 	}
 }
@@ -613,6 +915,29 @@ func TestHardwareIOInputCallback(t *testing.T) {
 	}
 }
 
+func TestRecordDashboardReadyEventDeduplicatesDeliveredState(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+
+	if !system.recordDashboardReadyEvent(true) {
+		t.Fatal("first ready event must be delivered")
+	}
+	if system.recordDashboardReadyEvent(true) {
+		t.Fatal("duplicate ready event must be ignored")
+	}
+	if !system.recordDashboardReadyEvent(false) {
+		t.Fatal("ready-to-not-ready transition must be delivered")
+	}
+	if system.recordDashboardReadyEvent(false) {
+		t.Fatal("duplicate not-ready event must be ignored")
+	}
+
+	system.mu.RLock()
+	defer system.mu.RUnlock()
+	if !system.dashboardReadyEventKnown || system.dashboardReady || system.lastDashboardReadyEvent {
+		t.Fatalf("unexpected final dashboard state: known=%v ready=%v last=%v", system.dashboardReadyEventKnown, system.dashboardReady, system.lastDashboardReadyEvent)
+	}
+}
+
 // ===== State Transition Tests =====
 // These tests verify the engine brake behavior during state transitions.
 // This was a regression where updateEngineBrake() was called at the end of
@@ -631,12 +956,12 @@ func TestEnterReadyToDrive_EngineBrakeDisabled(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
 	// Set up initial conditions: kickstand up, no brakes pressed
-	mockIO.digitalInputs["kickstand"] = false       // up
-	mockIO.digitalInputs["brake_left"] = false      // not pressed
-	mockIO.digitalInputs["brake_right"] = false     // not pressed
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked (pressed)
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true   // closed
+	mockIO.setDigitalInput("kickstand", false)   // up
+	mockIO.setDigitalInput("brake_left", false)  // not pressed
+	mockIO.setDigitalInput("brake_right", false) // not pressed
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked (pressed)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)   // closed
 
 	initTestFSM(t, system)
 
@@ -648,7 +973,7 @@ func TestEnterReadyToDrive_EngineBrakeDisabled(t *testing.T) {
 	system.dashboardReady = true
 
 	// Clear any previous outputs
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.clearDigitalOutputs()
 
 	// Trigger transition to ReadyToDrive via kickstand up event
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
@@ -662,9 +987,9 @@ func TestEnterReadyToDrive_EngineBrakeDisabled(t *testing.T) {
 	}
 
 	// CRITICAL: engine_brake should be FALSE in ready-to-drive (throttle enabled)
-	if mockIO.digitalOutputs["engine_brake"] != false {
+	if mockIO.getDigitalOutput("engine_brake") != false {
 		t.Errorf("Engine brake should be FALSE (disabled) in ReadyToDrive with no brakes pressed, got %v",
-			mockIO.digitalOutputs["engine_brake"])
+			mockIO.getDigitalOutput("engine_brake"))
 	}
 }
 
@@ -672,12 +997,12 @@ func TestEnterReadyToDrive_EngineBrakeFollowsBrakes(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
 	// Set up initial conditions: kickstand up, LEFT brake pressed
-	mockIO.digitalInputs["kickstand"] = false   // up
-	mockIO.digitalInputs["brake_left"] = true   // pressed
-	mockIO.digitalInputs["brake_right"] = false // not pressed
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", false)   // up
+	mockIO.setDigitalInput("brake_left", true)   // pressed
+	mockIO.setDigitalInput("brake_right", false) // not pressed
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -689,16 +1014,16 @@ func TestEnterReadyToDrive_EngineBrakeFollowsBrakes(t *testing.T) {
 	system.dashboardReady = true
 
 	// Clear outputs
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.clearDigitalOutputs()
 
 	// Trigger transition to ReadyToDrive
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
 	time.Sleep(50 * time.Millisecond)
 
 	// engine_brake should be TRUE when brake lever is pressed
-	if mockIO.digitalOutputs["engine_brake"] != true {
+	if mockIO.getDigitalOutput("engine_brake") != true {
 		t.Errorf("Engine brake should be TRUE when brake lever is pressed in ReadyToDrive, got %v",
-			mockIO.digitalOutputs["engine_brake"])
+			mockIO.getDigitalOutput("engine_brake"))
 	}
 }
 
@@ -706,11 +1031,11 @@ func TestEnterParked_EngineBrakeEnabled(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
 	// Set up initial conditions: start with kickstand up, then will put it down
-	mockIO.digitalInputs["kickstand"] = false   // up (will change to down)
-	mockIO.digitalInputs["brake_left"] = false  // not pressed
-	mockIO.digitalInputs["brake_right"] = false // not pressed
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", false)   // up (will change to down)
+	mockIO.setDigitalInput("brake_left", false)  // not pressed
+	mockIO.setDigitalInput("brake_right", false) // not pressed
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -723,10 +1048,10 @@ func TestEnterParked_EngineBrakeEnabled(t *testing.T) {
 	system.readyToDriveEntryTime = time.Now().Add(-2 * time.Second) // bypass debounce
 
 	// Clear outputs
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.clearDigitalOutputs()
 
 	// Simulate kickstand going down
-	mockIO.digitalInputs["kickstand"] = true // down
+	mockIO.setDigitalInput("kickstand", true) // down
 
 	// Trigger transition to Parked
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandDown})
@@ -738,9 +1063,9 @@ func TestEnterParked_EngineBrakeEnabled(t *testing.T) {
 	}
 
 	// CRITICAL: engine_brake should be TRUE in parked (throttle disabled)
-	if mockIO.digitalOutputs["engine_brake"] != true {
+	if mockIO.getDigitalOutput("engine_brake") != true {
 		t.Errorf("Engine brake should be TRUE (enabled) in Parked state, got %v",
-			mockIO.digitalOutputs["engine_brake"])
+			mockIO.getDigitalOutput("engine_brake"))
 	}
 }
 
@@ -749,12 +1074,12 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	// The bug caused engine_brake to be inverted after transitions.
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true // down (parked)
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true) // down (parked)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -766,20 +1091,24 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	system.dashboardReady = true
 
 	// Clear and verify engine_brake is TRUE in parked by re-entering
-	mockIO.digitalOutputs = make(map[string]bool)
-	system.machine.SetState(fsm.StateStandby)
+	mockIO.clearDigitalOutputs()
+	if err := system.machine.SetState(fsm.StateStandby); err != nil {
+		t.Fatalf("Failed to set state to Standby: %v", err)
+	}
 	time.Sleep(20 * time.Millisecond)
 	system.dashboardReady = true // Restore after standby clears it
-	system.machine.SetState(fsm.StateParked)
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("Failed to set state to Parked: %v", err)
+	}
 	time.Sleep(50 * time.Millisecond)
 
-	if mockIO.digitalOutputs["engine_brake"] != true {
-		t.Errorf("Step 1: Engine brake should be TRUE in Parked, got %v", mockIO.digitalOutputs["engine_brake"])
+	if mockIO.getDigitalOutput("engine_brake") != true {
+		t.Errorf("Step 1: Engine brake should be TRUE in Parked, got %v", mockIO.getDigitalOutput("engine_brake"))
 	}
 
 	// Now transition to ReadyToDrive
-	mockIO.digitalInputs["kickstand"] = false // up
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.setDigitalInput("kickstand", false) // up
+	mockIO.clearDigitalOutputs()
 	system.dashboardReady = true // Ensure dashboard ready for guard
 
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandUp})
@@ -790,15 +1119,15 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	}
 
 	// CRITICAL CHECK: This was the bug - engine_brake ended up TRUE instead of FALSE
-	if mockIO.digitalOutputs["engine_brake"] != false {
+	if mockIO.getDigitalOutput("engine_brake") != false {
 		t.Errorf("Step 2: Engine brake should be FALSE in ReadyToDrive (no brakes pressed), got %v",
-			mockIO.digitalOutputs["engine_brake"])
+			mockIO.getDigitalOutput("engine_brake"))
 	}
 
 	// Now go back to Parked
-	mockIO.digitalInputs["kickstand"] = true // down
+	mockIO.setDigitalInput("kickstand", true) // down
 	system.readyToDriveEntryTime = time.Now().Add(-2 * time.Second)
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.clearDigitalOutputs()
 
 	system.machine.Send(librefsm.Event{ID: fsm.EvKickstandDown})
 	time.Sleep(50 * time.Millisecond)
@@ -808,20 +1137,20 @@ func TestParkedToReadyToDrive_EngineBrakeTransition(t *testing.T) {
 	}
 
 	// CRITICAL CHECK: This was the bug - engine_brake ended up FALSE instead of TRUE
-	if mockIO.digitalOutputs["engine_brake"] != true {
+	if mockIO.getDigitalOutput("engine_brake") != true {
 		t.Errorf("Step 3: Engine brake should be TRUE in Parked, got %v",
-			mockIO.digitalOutputs["engine_brake"])
+			mockIO.getDigitalOutput("engine_brake"))
 	}
 }
 
 func TestEnterStandby_FromShuttingDown(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -831,7 +1160,7 @@ func TestEnterStandby_FromShuttingDown(t *testing.T) {
 	}
 	system.initialized = true
 
-	mockIO.digitalOutputs = make(map[string]bool)
+	mockIO.clearDigitalOutputs()
 
 	// Transition to Standby (via timeout event)
 	system.machine.Send(librefsm.Event{ID: fsm.EvShutdownTimeout})
@@ -849,12 +1178,12 @@ func TestKickstandDown_DeferredDuringDebounce(t *testing.T) {
 	// is still down the transition to Parked should fire.
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = false // up
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", false) // up
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -873,7 +1202,7 @@ func TestKickstandDown_DeferredDuringDebounce(t *testing.T) {
 	}
 
 	// Immediately put kickstand down (within debounce window)
-	mockIO.digitalInputs["kickstand"] = true // down
+	mockIO.setDigitalInput("kickstand", true) // down
 	if err := system.handleInputChange("kickstand", true); err != nil {
 		t.Fatalf("handleInputChange failed: %v", err)
 	}
@@ -899,12 +1228,12 @@ func TestKickstandDown_DeferredCancelledByKickstandUp(t *testing.T) {
 	// be cancelled (GPIO re-read shows kickstand is up).
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = false // up
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true // unlocked
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", false) // up
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -923,14 +1252,14 @@ func TestKickstandDown_DeferredCancelledByKickstandUp(t *testing.T) {
 	}
 
 	// Kickstand down within debounce window
-	mockIO.digitalInputs["kickstand"] = true
+	mockIO.setDigitalInput("kickstand", true)
 	if err := system.handleInputChange("kickstand", true); err != nil {
 		t.Fatalf("handleInputChange (down) failed: %v", err)
 	}
 
 	// Kickstand back up before debounce expires — this cancels the deferred timer
 	// and sends EvKickstandUp immediately (no-op since already in RTD)
-	mockIO.digitalInputs["kickstand"] = false
+	mockIO.setDigitalInput("kickstand", false)
 	if err := system.handleInputChange("kickstand", false); err != nil {
 		t.Fatalf("handleInputChange (up) failed: %v", err)
 	}
@@ -947,11 +1276,11 @@ func TestKickstandDown_DeferredCancelledByKickstandUp(t *testing.T) {
 func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -962,7 +1291,7 @@ func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
 	system.initialized = true
 
 	// Set engine power on initially
-	mockIO.digitalOutputs["engine_power"] = true
+	mockIO.setDigitalOutput("engine_power", true)
 
 	// Trigger shutdown via lock event
 	system.machine.Send(librefsm.Event{ID: fsm.EvLock})
@@ -973,9 +1302,9 @@ func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
 	}
 
 	// Engine power should be turned off during shutdown
-	if mockIO.digitalOutputs["engine_power"] != false {
+	if mockIO.getDigitalOutput("engine_power") != false {
 		t.Errorf("Engine power should be FALSE during shutdown, got %v",
-			mockIO.digitalOutputs["engine_power"])
+			mockIO.getDigitalOutput("engine_power"))
 	}
 }
 
@@ -984,9 +1313,9 @@ func TestEnterShuttingDown_EnginePowerOff(t *testing.T) {
 func TestHandleInputChange_48vDetect_PublishesMainPower(t *testing.T) {
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 	if err := system.machine.SetState(fsm.StateParked); err != nil {
@@ -1028,11 +1357,11 @@ func countPublishedMessages(mock *mockMessagingClient, channel, message string) 
 func TestUnlockDuringShutdown_PoweroffSent_Defers(t *testing.T) {
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1074,11 +1403,11 @@ func TestUnlockDuringShutdown_PoweroffSent_Defers(t *testing.T) {
 func TestUnlockDuringShutdown_DbcUpdating_AbortsCleanly(t *testing.T) {
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1125,11 +1454,11 @@ func TestUnlockDuringShutdown_DbcUpdating_AbortsCleanly(t *testing.T) {
 func TestShutdownToStandby_ClearsFlag_NoAutoUnlock(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1164,11 +1493,11 @@ func TestShutdownToStandby_ClearsFlag_NoAutoUnlock(t *testing.T) {
 func TestDeferredUnlock_ReplayedFromStandby(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1212,11 +1541,11 @@ func TestDeferredUnlock_ReplayedFromStandby(t *testing.T) {
 func TestReEnterShuttingDown_ClearsPendingUnlock(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1247,11 +1576,11 @@ func TestReEnterShuttingDown_ClearsPendingUnlock(t *testing.T) {
 func TestEnterParked_FromShuttingDown_ReplaysLightsCue(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1263,6 +1592,12 @@ func TestEnterParked_FromShuttingDown_ReplaysLightsCue(t *testing.T) {
 	// Clear recorded cues accumulated from EnterShuttingDown so we can
 	// assert cleanly on what EnterParked emits.
 	mockIO.pwmCues = nil
+
+	// The abort path only exists while the DBC has not been told to halt, which
+	// is what CanAbortShutdown guards. EnterShuttingDown published the poweroff
+	// above, so put the tracker back where an abortable shutdown leaves it: a
+	// DBC update in progress, or a publish that did not go out.
+	system.dbcPoweroffSent.Store(false)
 
 	// Abort path: EvUnlock during ShuttingDown goes back to Parked.
 	system.machine.Send(librefsm.Event{ID: fsm.EvUnlock})
@@ -1299,12 +1634,12 @@ func TestEnterParked_FromShuttingDown_ReplaysLightsCue(t *testing.T) {
 func TestRegression_LockThenUnlockDuringShutdown_EndsInParkedWithLights(t *testing.T) {
 	system, mockIO, mockRedis := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1385,9 +1720,9 @@ func TestRegression_LockThenUnlockDuringShutdown_EndsInParkedWithLights(t *testi
 func TestRegression_MultipleUnlocksDuringShutdown_QueueIdempotently(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1429,9 +1764,9 @@ func TestRegression_MultipleUnlocksDuringShutdown_QueueIdempotently(t *testing.T
 func TestRegression_SecondLockClearsQueuedUnlock(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1476,9 +1811,9 @@ func TestRegression_SecondLockClearsQueuedUnlock(t *testing.T) {
 func TestRegression_UnlockInParkedIsNotQueued(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1504,9 +1839,9 @@ func TestRegression_UnlockInParkedIsNotQueued(t *testing.T) {
 func TestRegression_UnlockInStandbyIsNotQueued(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["handlebar_lock_sensor"] = true
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
 
 	initTestFSM(t, system)
 
@@ -1533,209 +1868,1728 @@ func TestRegression_UnlockInStandbyIsNotQueued(t *testing.T) {
 	}
 }
 
-// ===== Input publish-in-Standby tests (bean librescoot-x189) =====
-//
-// In Standby, vehicle.kickstand, vehicle.brake:{left,right}, vehicle.horn-button,
-// vehicle.seatbox:button and the buttons PUBSUB channel must reflect ground
-// truth so alarm-service (and other observers) can see input edges without
-// having to wake the FSM. Actions (GPIO drives, motor pulses, LED cues, FSM
-// transitions out of Standby) must stay gated.
+// ===== Hop-on / hop-off mode tests =====
 
-func standbyInputSystem(t *testing.T) (*VehicleSystem, *mockHardwareIO, *mockMessagingClient) {
+// Parked -> HopOn -> Parked must NOT re-arm the auto-standby timer: the
+// timer is owned by StateAtRest, and sibling transitions inside the group
+// don't fire OnEnter on the parent. The captured deadline should survive
+// the detour intact.
+func TestHopOn_AutoStandbyDeadlinePreserved(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
+	system.autoStandbySeconds = 900 // mirror the production default
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState Parked: %v", err)
+	}
+	system.initialized = true
+
+	system.mu.RLock()
+	deadlineBefore := system.autoStandbyDeadline
+	system.mu.RUnlock()
+	if deadlineBefore.IsZero() {
+		t.Fatal("auto-standby deadline should be armed after entering Parked")
+	}
+
+	if err := system.handleHopOnRequest("engage"); err != nil {
+		t.Fatalf("hop-on engage: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if system.machine.CurrentState() != fsm.StateHopOn {
+		t.Fatalf("expected StateHopOn, got %v", system.machine.CurrentState())
+	}
+
+	if err := system.handleHopOnRequest("release"); err != nil {
+		t.Fatalf("hop-on release: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if system.machine.CurrentState() != fsm.StateParked {
+		t.Fatalf("expected StateParked after release, got %v", system.machine.CurrentState())
+	}
+
+	system.mu.RLock()
+	deadlineAfter := system.autoStandbyDeadline
+	system.mu.RUnlock()
+	if !deadlineAfter.Equal(deadlineBefore) {
+		t.Errorf("auto-standby deadline changed across hop-on detour: before=%v after=%v",
+			deadlineBefore, deadlineAfter)
+	}
+}
+
+// Sending kickstand events while in StateHopOn must not transition.
+// BlockedEvents on the state declaratively pre-empts the FSM event.
+func TestHopOn_KickstandEventsBlocked(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateHopOn); err != nil {
+		t.Fatalf("SetState HopOn: %v", err)
+	}
+	system.initialized = true
+	system.dashboardReady = true
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvKickstandUp}); err != nil {
+		t.Fatalf("send kickstand-up: %v", err)
+	}
+	if system.machine.CurrentState() != fsm.StateHopOn {
+		t.Errorf("kickstand-up must not transition out of HopOn; got %v", system.machine.CurrentState())
+	}
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvKickstandDown}); err != nil {
+		t.Fatalf("send kickstand-down: %v", err)
+	}
+	if system.machine.CurrentState() != fsm.StateHopOn {
+		t.Errorf("kickstand-down must not transition out of HopOn; got %v", system.machine.CurrentState())
+	}
+}
+
+// Lock command from HopOn fires the parent StateAtRest transition to
+// ShuttingDown (with seatbox-closed guard satisfied).
+func TestHopOn_LockTransitionsToShuttingDown(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true) // closed -> guard passes
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateHopOn); err != nil {
+		t.Fatalf("SetState HopOn: %v", err)
+	}
+	system.initialized = true
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvLock}); err != nil {
+		t.Fatalf("send lock: %v", err)
+	}
+	if system.machine.CurrentState() != fsm.StateShuttingDown {
+		t.Errorf("lock from HopOn should reach ShuttingDown; got %v", system.machine.CurrentState())
+	}
+}
+
+// Keycard tap in StateHopOn unlocks to Parked (child-state override) rather
+// than inheriting StateAtRest's "tap to lock" behavior. A rider returning to
+// a hop-on'd scooter expects the keycard to release it, mirroring the
+// mobile-app unlock path.
+func TestHopOn_KeycardAuthUnlocksToParked(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateHopOn); err != nil {
+		t.Fatalf("SetState HopOn: %v", err)
+	}
+	system.initialized = true
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvKeycardAuth}); err != nil {
+		t.Fatalf("send keycard-auth: %v", err)
+	}
+	if system.machine.CurrentState() != fsm.StateParked {
+		t.Errorf("keycard tap in HopOn should unlock to Parked; got %v", system.machine.CurrentState())
+	}
+}
+
+// Keycard tap in StateHopOnLearning is intentionally NOT overridden — it
+// still inherits the parent StateAtRest transition and locks to
+// ShuttingDown. Learning mode is a brief setup flow; only HopOn proper gets
+// the rider-friendly unlock-on-tap behavior.
+func TestHopOnLearning_KeycardAuthLocksToShuttingDown(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateHopOnLearning); err != nil {
+		t.Fatalf("SetState HopOnLearning: %v", err)
+	}
+	system.initialized = true
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvKeycardAuth}); err != nil {
+		t.Fatalf("send keycard-auth: %v", err)
+	}
+	if system.machine.CurrentState() != fsm.StateShuttingDown {
+		t.Errorf("keycard tap in HopOnLearning should lock to ShuttingDown; got %v", system.machine.CurrentState())
+	}
+}
+
+// HopOnLearning enters without user-facing side-effects: no LED cue, no
+// backlight toggle. The dashboard renders its own learn overlay.
+func TestHopOnLearning_NoSideEffects(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
+
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState Parked: %v", err)
+	}
+	system.initialized = true
+
+	mockIO.pwmCues = nil // clear cues from EnterParked
+
+	if err := system.handleHopOnRequest("engage-learning"); err != nil {
+		t.Fatalf("engage-learning: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if system.machine.CurrentState() != fsm.StateHopOnLearning {
+		t.Fatalf("expected StateHopOnLearning, got %v", system.machine.CurrentState())
+	}
+	if len(mockIO.pwmCues) != 0 {
+		t.Errorf("learning entry should be silent; got pwmCues=%v", mockIO.pwmCues)
+	}
+}
+
+// Saved state "hop-on" in Redis at startup must land the FSM directly in
+// StateHopOn. The previous flag-based heuristic is gone; the leaf state
+// itself is authoritative across crashes.
+func TestHopOn_RestoreFromSavedState(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.vehicleState = types.StateHopOn
+	system.autoStandbySeconds = 900 // mirror the production default
+
+	initTestFSM(t, system)
+
+	system.restoreFSMState(types.StateHopOn)
+
+	if system.machine.CurrentState() != fsm.StateHopOn {
+		t.Errorf("expected StateHopOn after restore, got %v", system.machine.CurrentState())
+	}
+	// Parent OnEnter must have armed the auto-standby timer too — the
+	// hierarchical SetState fix guarantees this.
+	system.mu.RLock()
+	deadline := system.autoStandbyDeadline
+	system.mu.RUnlock()
+	if deadline.IsZero() {
+		t.Errorf("auto-standby timer should be armed after restoring into the at-rest group")
+	}
+}
+
+// ===== Output Fault Tests =====
+
+// A tracked output that cannot be written raises its channel's code, and the
+// machine still ends up where the transition sent it. The entry action is a
+// side effect; only a guard can stop a transition.
+func TestWriteOutput_EnginePowerFailureRaisesFault(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.failOutput("engine_power", fmt.Errorf("gpio line busy"))
+
+	// The SetState error is deliberately ignored: whether the entry action
+	// reported one is not what callers act on, the fault is the record.
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked despite the failed write, got %v", got)
+	}
+	if !faultActive(mockRedis, FaultEnginePowerOutput) {
+		t.Error("expected the engine power output fault to be raised")
+	}
+	if desc := faultDescription(mockRedis, FaultEnginePowerOutput); desc != "engine_power output write failed: gpio line busy" {
+		t.Errorf("unexpected fault description: %q", desc)
+	}
+}
+
+// The fault clears on the next successful write to the same channel, which is
+// why the code is keyed on the channel and not on the call site.
+func TestWriteOutput_EnginePowerFaultClearsOnNextWrite(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.failOutput("engine_power", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+	if !faultActive(mockRedis, FaultEnginePowerOutput) {
+		t.Fatal("expected the engine power output fault to be raised")
+	}
+
+	mockIO.failOutput("engine_power", nil)
+	_ = system.machine.SetState(fsm.StateStandby)
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if faultActive(mockRedis, FaultEnginePowerOutput) {
+		t.Error("expected the engine power output fault to clear on the next successful write")
+	}
+}
+
+func TestWriteOutput_DashboardPowerFailureRaisesFault(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.setDigitalInput("kickstand", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	system.dashboardReady = true
+	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateReadyToDrive)
+
+	if !faultActive(mockRedis, FaultDashboardPowerOutput) {
+		t.Error("expected the dashboard power output fault to be raised")
+	}
+}
+
+// Cutting dashboard power kills update-service on the DBC mid-transfer before
+// its deferred cleanup runs, orphaning the "download-transfer:dbc" suspend
+// inhibitor in this board's Redis. setPower is the single choke point for
+// every dashboard power-off, so it must release that inhibitor itself.
+func TestSetPower_DashboardOff_RemovesOrphanedDbcDownloadInhibitor(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	found := false
+	for _, id := range mockRedis.removedInhibitors {
+		if id == "download-transfer:dbc" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected download-transfer:dbc inhibitor to be removed, got %v", mockRedis.removedInhibitors)
+	}
+}
+
+// Powering the dashboard on must not touch the inhibitor: only the power-off
+// path is where the orphan can occur.
+func TestSetPower_DashboardOn_DoesNotRemoveDbcDownloadInhibitor(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+
+	if err := system.setPower("dashboard_power", true); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	for _, id := range mockRedis.removedInhibitors {
+		if id == "download-transfer:dbc" {
+			t.Errorf("did not expect download-transfer:dbc inhibitor removal on power-on, got %v", mockRedis.removedInhibitors)
+		}
+	}
+}
+
+// The link transport recorded at DBC power-off is what lsc doctor reports when
+// the installer has taken the DBC's place on the USB port and the live routing
+// table no longer describes normal operation.
+func TestSetPower_DashboardOff_RecordsDbcLink(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.dbcLinks = hardware.DbcLinks{Active: "usb0", USB: true, PPP: true}
+	mockRedis.dashboardPower = true
+
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	if len(mockRedis.dbcLinkSets) != 1 || mockRedis.dbcLinkSets[0] != "usb0" {
+		t.Fatalf("recorded links = %v, want [usb0]", mockRedis.dbcLinkSets)
+	}
+	if len(mockRedis.dbcUSBSets) != 1 || !mockRedis.dbcUSBSets[0] || !mockRedis.dbcPPPSets[0] {
+		t.Fatalf("recorded link health = usb %v ppp %v, want both up", mockRedis.dbcUSBSets, mockRedis.dbcPPPSets)
+	}
+}
+
+// No route at power-off is recorded as "none", which is distinct from no record
+// at all: doctor must tell "the DBC was unreachable" from "never sampled".
+func TestSetPower_DashboardOff_RecordsNoRouteAsNone(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.dashboardPower = true
+
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	if len(mockRedis.dbcLinkSets) != 1 || mockRedis.dbcLinkSets[0] != "none" {
+		t.Fatalf("recorded links = %v, want [none]", mockRedis.dbcLinkSets)
+	}
+	if mockRedis.dbcUSBSets[0] || mockRedis.dbcPPPSets[0] {
+		t.Fatalf("recorded link health = usb %v ppp %v, want both down", mockRedis.dbcUSBSets, mockRedis.dbcPPPSets)
+	}
+}
+
+func TestSetPower_DashboardOn_DoesNotRecordDbcLink(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.dbcLinks = hardware.DbcLinks{Active: "usb0", USB: true}
+
+	if err := system.setPower("dashboard_power", true); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	if len(mockRedis.dbcLinkSets) != 0 {
+		t.Fatalf("recorded links = %v, want none on power-on", mockRedis.dbcLinkSets)
+	}
+}
+
+// A second power-off on an already unpowered DBC samples a torn-down link, so it
+// must not overwrite the record from the session that actually ended.
+func TestSetPower_DashboardOffTwice_KeepsFirstRecord(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.dbcLinks = hardware.DbcLinks{Active: "usb0", USB: true, PPP: true}
+	mockRedis.dashboardPower = true
+
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+	// The real client persists dashboard:power in finishPowerOutput; the mock's
+	// GetDashboardPower reflects whatever was last set.
+	mockIO.dbcLinks = hardware.DbcLinks{}
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	if len(mockRedis.dbcLinkSets) != 1 || mockRedis.dbcLinkSets[0] != "usb0" {
+		t.Fatalf("recorded links = %v, want only the first [usb0]", mockRedis.dbcLinkSets)
+	}
+}
+
+func TestSetPower_DashboardOff_LinkReadFailureRecordsNothing(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.dbcLinkErr = fmt.Errorf("read /proc/net/route: no such file")
+	mockRedis.dashboardPower = true
+
+	if err := system.setPower("dashboard_power", false); err != nil {
+		t.Fatalf("setPower: %v", err)
+	}
+
+	if len(mockRedis.dbcLinkSets) != 0 {
+		t.Fatalf("recorded links = %v, want nothing when the route is unreadable", mockRedis.dbcLinkSets)
+	}
+}
+
+func TestWriteOutput_EngineBrakeFailureRaisesFault(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if !faultActive(mockRedis, FaultEngineBrakeOutput) {
+		t.Error("expected the engine brake output fault to be raised")
+	}
+}
+
+// engine_brake is rewritten on every brake lever edge, so its fault is close to
+// self-clearing in practice.
+func TestWriteOutput_EngineBrakeFaultClearsOnBrakeEdge(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	system.initialized = true
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+	if !faultActive(mockRedis, FaultEngineBrakeOutput) {
+		t.Fatal("expected the engine brake output fault to be raised")
+	}
+
+	mockIO.failOutput("engine_brake", nil)
+	if err := system.handleInputChange("brake_left", true); err != nil {
+		t.Fatalf("brake edge: %v", err)
+	}
+
+	if faultActive(mockRedis, FaultEngineBrakeOutput) {
+		t.Error("expected the engine brake output fault to clear on the next lever edge")
+	}
+}
+
+// The failed brake write and the dark ECU it causes are separate faults with
+// separate lifetimes. The write is retried on every lever edge; the controller
+// stays unpowered until something enters a state that powers it, so the lever
+// edge that clears code 5 must not take the standing fault with it.
+func TestEnterParked_BrakeFailureRaisesEcuHeldUnpowered(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	system.initialized = true
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if !faultActive(mockRedis, FaultEcuHeldUnpowered) {
+		t.Fatal("expected the held-unpowered fault to be raised")
+	}
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Fatal("expected the interlock to leave engine power cut")
+	}
+
+	mockIO.failOutput("engine_brake", nil)
+	if err := system.handleInputChange("brake_left", true); err != nil {
+		t.Fatalf("brake edge: %v", err)
+	}
+
+	if faultActive(mockRedis, FaultEngineBrakeOutput) {
+		t.Error("expected the brake output fault to clear on the lever edge")
+	}
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Error("nothing on the lever edge path repowers the ECU")
+	}
+	if !faultActive(mockRedis, FaultEcuHeldUnpowered) {
+		t.Error("the held-unpowered fault must stand while the ECU is still dark")
+	}
+}
+
+// The one condition that resolves it: engine power actually back on.
+func TestEnterParked_EcuHeldUnpoweredClearsOnRepower(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	system.initialized = true
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+	if !faultActive(mockRedis, FaultEcuHeldUnpowered) {
+		t.Fatal("expected the held-unpowered fault to be raised")
+	}
+
+	mockIO.failOutput("engine_brake", nil)
+	_ = system.machine.SetState(fsm.StateStandby)
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if !mockIO.getDigitalOutput("engine_power") {
+		t.Fatal("expected the ECU to be powered once the brake write succeeds")
+	}
+	if faultActive(mockRedis, FaultEcuHeldUnpowered) {
+		t.Error("the held-unpowered fault must clear once the ECU is powered")
+	}
+}
+
+// Channels outside the map are not fault reported: a stuck horn is not
+// something a rider or a mechanic acts on through the fault view.
+func TestWriteOutput_UntrackedChannelReportsNothing(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.failOutput("horn", fmt.Errorf("gpio line busy"))
+
+	if err := system.writeOutput("horn", true); err == nil {
+		t.Error("expected the write error to be returned unchanged")
+	}
+
+	mockRedis.mu.Lock()
+	calls := len(mockRedis.faultCalls)
+	mockRedis.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("expected no fault traffic for an untracked channel, got %d calls", calls)
+	}
+}
+
+// The startup reconcile clears every code this service owns.
+func TestClearOwnedFaults(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+
+	system.clearOwnedFaults()
+
+	for _, code := range ownedFaultCodes {
+		if faultActive(mockRedis, code) {
+			t.Errorf("fault %d should not be active after the startup reconcile", code)
+		}
+	}
+	mockRedis.mu.Lock()
+	calls := len(mockRedis.faultCalls)
+	mockRedis.mu.Unlock()
+	if calls != len(ownedFaultCodes) {
+		t.Errorf("expected one clear per owned code, got %d calls for %d codes", calls, len(ownedFaultCodes))
+	}
+}
+
+// ===== Entry Action Semantics Tests =====
+
+// The interlock, and the single most important assertion in the suite: without
+// a confirmed engine brake, the ECU must not come up.
+func TestEnterParked_BrakeFailureLeavesEnginePowerLow(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.setDigitalOutput("engine_power", true)
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Error("a failed engine brake write must leave engine power low")
+	}
+	if !faultActive(mockRedis, FaultEngineBrakeOutput) {
+		t.Error("expected the engine brake output fault to be raised")
+	}
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked, got %v", got)
+	}
+}
+
+// A dark dashboard is not a reason to skip the interlock and the ECU power-up.
+func TestEnterParked_DashboardFailureStillRunsInterlock(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if !mockIO.getDigitalOutput("engine_brake") {
+		t.Error("the engine brake must still be engaged after a failed dashboard write")
+	}
+	if !mockIO.getDigitalOutput("engine_power") {
+		t.Error("the ECU must still be powered after a failed dashboard write")
+	}
+	if !faultActive(mockRedis, FaultDashboardPowerOutput) {
+		t.Error("expected the dashboard power output fault to be raised")
+	}
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked, got %v", got)
+	}
+}
+
+// The rollback that could not work is gone: entering Parked must never leave
+// the dashboard dark on a scooter that reports itself parked.
+func TestEnterParked_NoDashboardRollback(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.failOutput("engine_brake", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateParked)
+
+	if !mockIO.getDigitalOutput("dashboard_power") {
+		t.Error("a failed engine brake write must not tear the dashboard back down")
+	}
+}
+
+// A dashboard power failure entering ready-to-drive keeps the engine power cut
+// and leaves drive mode honestly, rather than sitting in it with a live motor
+// and no rider-visible state.
+func TestEnterReadyToDrive_DashboardFailureLeavesDriveMode(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.setDigitalInput("kickstand", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	system.dashboardReady = true
+	system.initialized = true
+	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateReadyToDrive)
+
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Error("the engine power cut must survive: it compensates this action's own side effect")
+	}
+	if !faultActive(mockRedis, FaultDashboardPowerOutput) {
+		t.Error("expected the dashboard power output fault to be raised")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if system.machine.CurrentState() == fsm.StateParked {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected the machine to fall back to StateParked, got %v", got)
+	}
+	if !mockIO.getDigitalOutput("engine_brake") {
+		t.Error("the engine brake must be engaged once the machine reaches Parked")
+	}
+}
+
+// A GPIO failure entering drive mode must not stop the transition. Guards
+// decide whether a transition happens; entry actions are side effects.
+func TestEnterReadyToDrive_EnginePowerFailureStillEntersDriveMode(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.setDigitalInput("kickstand", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("brake_left", true)
+	system.dashboardReady = true
+	mockIO.failOutput("engine_power", fmt.Errorf("gpio line busy"))
+
+	_ = system.machine.SetState(fsm.StateReadyToDrive)
+
+	if got := system.machine.CurrentState(); got != fsm.StateReadyToDrive {
+		t.Errorf("expected StateReadyToDrive, got %v", got)
+	}
+	if !faultActive(mockRedis, FaultEnginePowerOutput) {
+		t.Error("expected the engine power output fault to be raised")
+	}
+	// The work below the failed write still ran.
+	if !mockIO.getDigitalOutput("engine_brake") {
+		t.Error("the engine brake write must still follow the levers after a failed power write")
+	}
+}
+
+// ===== Smuggled Predicate Tests =====
+
+// The shutdown abort veto applies to every dispatch path now, not only to the
+// Redis unlock handler it used to live in.
+func TestCanAbortShutdown_GuardsTheAbortTransition(t *testing.T) {
+	system, _, _ := restoreTestSystem(t)
+	if err := system.machine.SetState(fsm.StateShuttingDown); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.dbcPoweroffSent.Store(true)
+
+	system.machine.Send(librefsm.Event{ID: fsm.EvUnlock})
+	time.Sleep(50 * time.Millisecond)
+
+	if got := system.machine.CurrentState(); got != fsm.StateShuttingDown {
+		t.Errorf("a halted DBC must block the abort, got %v", got)
+	}
+
+	system.dbcPoweroffSent.Store(false)
+	system.machine.Send(librefsm.Event{ID: fsm.EvUnlock})
+	time.Sleep(50 * time.Millisecond)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected the abort to run once the DBC is not halting, got %v", got)
+	}
+}
+
+// Turning brake hibernation off must still let the rider cancel by releasing
+// the levers: the setting gates entry, not the events.
+func TestBrakeHibernation_SettingGatesEntryNotCancel(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	system.brakeHibernationEnabled = true
+	system.initialized = true
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+
+	mockIO.setDigitalInput("brake_left", true)
+	mockIO.setDigitalInput("brake_right", true)
+	system.checkHibernationConditions()
+	time.Sleep(50 * time.Millisecond)
+	if got := system.machine.CurrentState(); got != fsm.StateHibernationInitialHold {
+		t.Fatalf("expected StateHibernationInitialHold, got %v", got)
+	}
+
+	// The rider turns the setting off mid-hold, then releases the levers.
+	system.mu.Lock()
+	system.brakeHibernationEnabled = false
+	system.mu.Unlock()
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	system.checkHibernationConditions()
+	time.Sleep(50 * time.Millisecond)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("releasing the levers must cancel the hold, got %v", got)
+	}
+}
+
+// With the setting off, holding both levers goes nowhere.
+func TestBrakeHibernation_DisabledBlocksEntry(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	system.brakeHibernationEnabled = false
+	system.initialized = true
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+
+	mockIO.setDigitalInput("brake_left", true)
+	mockIO.setDigitalInput("brake_right", true)
+	system.checkHibernationConditions()
+	time.Sleep(50 * time.Millisecond)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked with brake hibernation disabled, got %v", got)
+	}
+}
+
+// ===== Hibernation Force Window Tests =====
+
+// The guard on the force transition replaces the brake recheck the hand-rolled
+// timer callback used to do, so a force timeout with the levers released must
+// still go nowhere.
+func TestHibernationForce_GuardedOnBrakes(t *testing.T) {
+	cases := []struct {
+		name    string
+		pressed bool
+		want    librefsm.StateID
+	}{
+		{name: "both levers held", pressed: true, want: fsm.StateHibernationConfirm},
+		{name: "levers released", pressed: false, want: fsm.StateHibernationAwaitingConfirm},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			system, mockIO, _ := restoreTestSystem(t)
+			mockIO.setDigitalInput("brake_left", tc.pressed)
+			mockIO.setDigitalInput("brake_right", tc.pressed)
+
+			if err := system.machine.SetState(fsm.StateHibernationAwaitingConfirm); err != nil {
+				t.Fatalf("SetState: %v", err)
+			}
+			system.machine.Send(librefsm.Event{ID: fsm.EvHibernationForceTimeout})
+
+			deadline := time.Now().Add(time.Second)
+			for time.Now().Before(deadline) {
+				if system.machine.CurrentState() == tc.want {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if got := system.machine.CurrentState(); got != tc.want {
+				t.Errorf("expected %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
+// Entering awaiting-confirm arms the force timer, and leaving the state cancels
+// it without any manual teardown.
+func TestHibernationForce_TimerScopedToState(t *testing.T) {
+	system, _, _ := restoreTestSystem(t)
+
+	if err := system.machine.SetState(fsm.StateHibernationAwaitingConfirm); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if !system.machine.TimerActive(fsm.TimerHibernationForce) {
+		t.Fatal("expected the force timer to be armed on entry")
+	}
+
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if system.machine.TimerActive(fsm.TimerHibernationForce) {
+		t.Error("expected the force timer to be cancelled on state exit")
+	}
+}
+
+// ===== Boot State Restore Tests =====
+
+// restoreTestSystem brings up a system with the FSM started and the inputs a
+// boot restore reads, without touching the real Start() path.
+func restoreTestSystem(t *testing.T) (*VehicleSystem, *mockHardwareIO, *mockMessagingClient) {
 	t.Helper()
 	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", false) // locked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
+	initTestFSM(t, system)
+	return system, mockIO, mockRedis
+}
 
-	mockIO.digitalInputs["kickstand"] = true
-	mockIO.digitalInputs["brake_left"] = false
-	mockIO.digitalInputs["brake_right"] = false
-	mockIO.digitalInputs["handlebar_position"] = false
-	mockIO.digitalInputs["handlebar_lock_sensor"] = false
-	mockIO.digitalInputs["seatbox_lock_sensor"] = true
+// A saved state the machine has no state for must never reach SetState, which
+// would hand it a StateID that fails identically on every restart.
+func TestRestoreFSMState_UnknownStateDeclined(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
 
+	system.restoreFSMState(types.SystemState("wat"))
+
+	if got := system.machine.CurrentState(); got != fsm.StateStandby {
+		t.Errorf("expected StateStandby after declining an unknown state, got %v", got)
+	}
+	if !mockIO.getDigitalOutput("engine_brake") {
+		t.Error("declined restore must leave the engine brake engaged")
+	}
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Error("declined restore must leave engine power cut")
+	}
+}
+
+// StateUpdating has no transition in or out, so restoring into it would strand
+// the machine for the rest of the power session.
+func TestRestoreFSMState_UpdatingDeclined(t *testing.T) {
+	system, _, _ := restoreTestSystem(t)
+
+	system.restoreFSMState(types.StateUpdating)
+
+	if got := system.machine.CurrentState(); got != fsm.StateStandby {
+		t.Errorf("expected StateStandby after declining updating, got %v", got)
+	}
+}
+
+// A declined restore that finds the steering unlocked arms the lock, because
+// Standby was entered from machine.Start() and EnterStandby's from-parked arm
+// never ran. The restore only records the intent; Start() does the arming once
+// its own handlebar_position callback is registered, otherwise the positioning
+// window's temporary callback would be overwritten and expire against nothing.
+func TestRestoreFSMState_DeclineArmsSteeringLock(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
+	system.cancelHandlebarLock()
+
+	system.restoreFSMState(types.SystemState("wat"))
+
+	system.mu.RLock()
+	armedTooEarly := system.handlebarDone != nil
+	system.mu.RUnlock()
+	if armedTooEarly {
+		t.Error("the lock must not be armed from inside the restore")
+	}
+	if !system.steeringLockPending {
+		t.Fatal("declined restore with the steering unlocked should mark the lock pending")
+	}
+
+	system.lockSteeringAfterDeclinedRestore()
+
+	system.mu.RLock()
+	armed := system.handlebarDone != nil
+	system.mu.RUnlock()
+	if !armed {
+		t.Error("declined restore with the steering unlocked should arm the lock")
+	}
+	if system.steeringLockPending {
+		t.Error("the pending mark should be consumed by the arming")
+	}
+	system.cancelHandlebarLock()
+}
+
+// A locked steering after a declined restore needs no actuation, and the
+// pending mark must still be consumed so a later call cannot re-arm it.
+func TestRestoreFSMState_DeclineLeavesLockedSteeringAlone(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.setDigitalInput("handlebar_lock_sensor", false) // locked
+	system.cancelHandlebarLock()
+
+	system.restoreFSMState(types.SystemState("wat"))
+	system.lockSteeringAfterDeclinedRestore()
+
+	system.mu.RLock()
+	armed := system.handlebarDone != nil
+	system.mu.RUnlock()
+	if armed {
+		t.Error("a locked steering should not be actuated")
+	}
+	if system.steeringLockPending {
+		t.Error("the pending mark should be consumed even when nothing is actuated")
+	}
+}
+
+// A clean restore never marks the lock pending, so Start()'s call is a no-op.
+func TestRestoreFSMState_CleanRestoreDoesNotArmSteeringLock(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true) // unlocked
+	system.cancelHandlebarLock()
+
+	system.restoreFSMState(types.StateParked)
+	system.lockSteeringAfterDeclinedRestore()
+
+	system.mu.RLock()
+	armed := system.handlebarDone != nil
+	system.mu.RUnlock()
+	if armed {
+		t.Error("a clean restore should not arm the steering lock")
+	}
+}
+
+// A shutting-down save is handed to the second restore path in Start(), not
+// refused: nothing is asserted and the machine stays where it is.
+func TestRestoreFSMState_ShuttingDownHandedOver(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.setDigitalOutput("engine_power", true)
+
+	system.restoreFSMState(types.StateShuttingDown)
+
+	if got := system.machine.CurrentState(); got != fsm.StateStandby {
+		t.Errorf("expected StateStandby, got %v", got)
+	}
+	if !mockIO.getDigitalOutput("engine_power") {
+		t.Error("handing shutting-down over must not assert the motor-safe outputs")
+	}
+}
+
+// The crash-loop regression. A failing GPIO write inside the entry action used
+// to abort Start(), which main.go turns into a Fatalf, so systemd restarted the
+// service into the same saved state and the same failing write, forever.
+// restoreFSMState must now return normally and leave the machine where the
+// library already committed it.
+func TestRestoreFSMState_EntryActionFailureDoesNotAbort(t *testing.T) {
+	system, mockIO, _ := restoreTestSystem(t)
+	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
+
+	system.restoreFSMState(types.StateParked)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked after a failed entry action, got %v", got)
+	}
+}
+
+// v0.6.0 fires the state change callback before returning the entry error, so
+// Redis learns about the state the machine is actually in.
+func TestRestoreFSMState_EntryActionFailureStillPublishes(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockIO.failOutput("dashboard_power", fmt.Errorf("gpio line busy"))
+
+	system.restoreFSMState(types.StateParked)
+
+	mockRedis.mu.Lock()
+	published := append([]types.SystemState(nil), mockRedis.publishedStates...)
+	mockRedis.mu.Unlock()
+	found := false
+	for _, s := range published {
+		if s == types.StateParked {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected parked to be published despite the failed entry action, got %v", published)
+	}
+}
+
+// A marker naming the state we are about to restore means the last attempt at
+// it never ran to a conclusion. Decline rather than repeat it.
+func TestRestoreFSMState_InterruptedAttemptDeclined(t *testing.T) {
+	system, mockIO, mockRedis := restoreTestSystem(t)
+	mockRedis.restoreAttempt = string(types.StateParked)
+
+	system.restoreFSMState(types.StateParked)
+
+	if got := system.machine.CurrentState(); got != fsm.StateStandby {
+		t.Errorf("expected StateStandby after declining an interrupted restore, got %v", got)
+	}
+	if !mockIO.getDigitalOutput("engine_brake") {
+		t.Error("declined restore must leave the engine brake engaged")
+	}
+	if mockIO.getDigitalOutput("engine_power") {
+		t.Error("declined restore must leave engine power cut")
+	}
+	mockRedis.mu.Lock()
+	marker := mockRedis.restoreAttempt
+	mockRedis.mu.Unlock()
+	if marker != "" {
+		t.Errorf("the marker must be cleared after acting on it, got %q", marker)
+	}
+}
+
+// Each refusal raises the restore fault with its own reason, and nothing on the
+// way to Standby clears it again.
+func TestRestoreFSMState_RefusalsRaiseFault(t *testing.T) {
+	cases := []struct {
+		name  string
+		saved types.SystemState
+		want  string
+	}{
+		{
+			name:  "unknown state",
+			saved: types.SystemState("wat"),
+			want:  `saved state "wat" is not a state this vehicle can restore, forced to stand-by`,
+		},
+		{
+			name:  "updating",
+			saved: types.StateUpdating,
+			want:  `saved state "updating" cannot be left once entered, forced to stand-by`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			system, _, mockRedis := restoreTestSystem(t)
+
+			system.restoreFSMState(tc.saved)
+
+			if !faultActive(mockRedis, FaultStateRestoreRefused) {
+				t.Fatal("expected the state restore fault to be raised")
+			}
+			if got := faultDescription(mockRedis, FaultStateRestoreRefused); got != tc.want {
+				t.Errorf("description:\n got %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRestoreFSMState_InterruptedAttemptRaisesFault(t *testing.T) {
+	system, _, mockRedis := restoreTestSystem(t)
+	mockRedis.restoreAttempt = string(types.StateParked)
+
+	system.restoreFSMState(types.StateParked)
+
+	want := `restore of saved state "parked" was already interrupted once, forced to stand-by`
+	if got := faultDescription(mockRedis, FaultStateRestoreRefused); got != want {
+		t.Errorf("description:\n got %q\nwant %q", got, want)
+	}
+	if !faultActive(mockRedis, FaultStateRestoreRefused) {
+		t.Error("expected the state restore fault to be raised")
+	}
+}
+
+// A restore that runs raises nothing.
+func TestRestoreFSMState_CleanRestoreRaisesNoFault(t *testing.T) {
+	system, _, mockRedis := restoreTestSystem(t)
+
+	system.restoreFSMState(types.StateParked)
+
+	if faultActive(mockRedis, FaultStateRestoreRefused) {
+		t.Error("a clean restore must not raise the state restore fault")
+	}
+}
+
+// A marker for some other state is not about this restore.
+func TestRestoreFSMState_MarkerForAnotherStateIgnored(t *testing.T) {
+	system, _, mockRedis := restoreTestSystem(t)
+	mockRedis.restoreAttempt = string(types.StateReadyToDrive)
+
+	system.restoreFSMState(types.StateParked)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked, got %v", got)
+	}
+}
+
+// A clean restore leaves no marker behind.
+func TestRestoreFSMState_CleanRestoreClearsMarker(t *testing.T) {
+	system, _, mockRedis := restoreTestSystem(t)
+
+	system.restoreFSMState(types.StateParked)
+
+	if got := system.machine.CurrentState(); got != fsm.StateParked {
+		t.Errorf("expected StateParked, got %v", got)
+	}
+	mockRedis.mu.Lock()
+	sets := append([]string(nil), mockRedis.restoreAttemptSets...)
+	clears := mockRedis.restoreAttemptClears
+	marker := mockRedis.restoreAttempt
+	mockRedis.mu.Unlock()
+	if len(sets) != 1 || sets[0] != string(types.StateParked) {
+		t.Errorf("expected the marker to be set once to parked, got %v", sets)
+	}
+	if clears == 0 {
+		t.Error("expected the marker to be cleared after a clean restore")
+	}
+	if marker != "" {
+		t.Errorf("expected no marker left behind, got %q", marker)
+	}
+}
+
+// rtdLockTestSetup brings a fresh VehicleSystem up in ready-to-drive with the
+// hardware inputs that match: kickstand up, no brakes, dashboard ready,
+// seatbox closed.
+func rtdLockTestSetup(t *testing.T) (*VehicleSystem, *mockHardwareIO) {
+	t.Helper()
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("kickstand", false) // up
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", false) // unlocked
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
+
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateReadyToDrive); err != nil {
+		t.Fatalf("SetState ReadyToDrive: %v", err)
+	}
+	system.initialized = true
+	system.dashboardReady = true
+	system.handlebarUnlocked = true
+
+	return system, mockIO
+}
+
+// Lock command from ready-to-drive must not shut the vehicle down: drive
+// requires an explicit force-lock (Redis force-lock command, or the keycard
+// triple-tap-with-brake gesture).
+func TestHandleStateRequest_LockFromReadyToDrive_Rejected(t *testing.T) {
+	system, _ := rtdLockTestSetup(t)
+
+	err := system.handleStateRequest("lock")
+	if err == nil {
+		t.Fatalf("handleStateRequest(lock) from ReadyToDrive must return error, got nil")
+	}
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Errorf("State must remain ReadyToDrive after rejected lock, got %v", system.getCurrentState())
+	}
+}
+
+// EvLock dispatched directly to the FSM in ready-to-drive must be a no-op
+// (the transition has been removed from the definition).
+func TestFSM_EvLockFromReadyToDrive_NoTransition(t *testing.T) {
+	system, _ := rtdLockTestSetup(t)
+
+	system.machine.Send(librefsm.Event{ID: fsm.EvLock})
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Errorf("EvLock must not transition from ReadyToDrive, got %v", system.getCurrentState())
+	}
+}
+
+// A single keycard tap in ready-to-drive must not shut the vehicle down.
+func TestKeycardAuth_SingleTapFromReadyToDrive_NoShutdown(t *testing.T) {
+	system, _ := rtdLockTestSetup(t)
+
+	if err := system.keycardAuthPassed(); err != nil {
+		t.Fatalf("keycardAuthPassed: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateReadyToDrive {
+		t.Errorf("Single keycard tap must not transition from ReadyToDrive, got %v", system.getCurrentState())
+	}
+}
+
+// EvForceLock from ready-to-drive must transition through graceful shutdown.
+func TestFSM_EvForceLockFromReadyToDrive_GoesToShuttingDown(t *testing.T) {
+	system, _ := rtdLockTestSetup(t)
+
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvForceLock}); err != nil {
+		t.Fatalf("send force-lock: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateShuttingDown {
+		t.Errorf("EvForceLock from ReadyToDrive must reach ShuttingDown, got %v", system.getCurrentState())
+	}
+}
+
+// Keycard triple-tap with at least one brake pressed must force-lock from
+// ready-to-drive (the only keycard-driven path that can shut down from drive).
+func TestKeycardAuth_TripleTapWithBrakeFromReadyToDrive_ForceLocks(t *testing.T) {
+	system, mockIO := rtdLockTestSetup(t)
+
+	mockIO.setDigitalInput("brake_left", true)
+
+	for i := 0; i < 3; i++ {
+		if err := system.keycardAuthPassed(); err != nil {
+			t.Fatalf("tap %d: %v", i+1, err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	if system.getCurrentState() != types.StateShuttingDown {
+		t.Errorf("Three keycard taps with brake from RTD must reach ShuttingDown, got %v", system.getCurrentState())
+	}
+}
+
+func TestHandleSettingsUpdateLockOnDisconnect(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.hashFieldValue = "30"
+
+	if err := system.handleSettingsUpdate("scooter.lock-on-bluetooth-disconnect-seconds"); err != nil {
+		t.Fatalf("handleSettingsUpdate failed: %v", err)
+	}
+	system.mu.RLock()
+	got := system.lockOnBleDisconnectSeconds
+	system.mu.RUnlock()
+	if got != 30 {
+		t.Errorf("expected 30 seconds, got %d", got)
+	}
+}
+
+func TestHandleSettingsUpdateLockOnDisconnectFloor(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.hashFieldValue = "3" // below the 5s floor
+
+	if err := system.handleSettingsUpdate("scooter.lock-on-bluetooth-disconnect-seconds"); err != nil {
+		t.Fatalf("handleSettingsUpdate failed: %v", err)
+	}
+	system.mu.RLock()
+	got := system.lockOnBleDisconnectSeconds
+	system.mu.RUnlock()
+	if got != 5 {
+		t.Errorf("expected clamp to 5, got %d", got)
+	}
+}
+
+func TestHandleSettingsUpdateLockOnDisconnectDisabled(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.hashFieldValue = "0"
+
+	if err := system.handleSettingsUpdate("scooter.lock-on-bluetooth-disconnect-seconds"); err != nil {
+		t.Fatalf("handleSettingsUpdate failed: %v", err)
+	}
+	system.mu.RLock()
+	got := system.lockOnBleDisconnectSeconds
+	system.mu.RUnlock()
+	if got != 0 {
+		t.Errorf("expected 0 (disabled), got %d", got)
+	}
+}
+
+func TestHandleSettingsUpdateLockOnDisconnectInvalid(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	mockRedis.hashFieldValue = "not-a-number"
+	if err := system.handleSettingsUpdate("scooter.lock-on-bluetooth-disconnect-seconds"); err == nil {
+		t.Error("expected error for invalid value")
+	}
+}
+
+func TestClampLockOnDisconnectNegative(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+	if got := system.clampLockOnDisconnect(-3); got != 0 {
+		t.Errorf("expected negative input to clamp to 0, got %d", got)
+	}
+}
+
+// parkedTestSystem brings a fresh VehicleSystem up in StateParked with inputs
+// matching a parked scooter (kickstand down, no brakes, seatbox/handlebar locked).
+func parkedTestSystem(t *testing.T) (*VehicleSystem, *mockHardwareIO, *mockMessagingClient) {
+	t.Helper()
+	system, mockIO, mockRedis := newTestVehicleSystem()
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState Parked: %v", err)
+	}
+	system.initialized = true
+	return system, mockIO, mockRedis
+}
+
+func TestKeyless_ArmsOnDisconnectEdgeWhenParked(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	if err := system.handleBleStatusChange("disconnected"); err != nil {
+		t.Fatalf("handleBleStatusChange: %v", err)
+	}
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if !active {
+		t.Fatal("expected countdown active after connected->disconnected edge while parked")
+	}
+}
+
+func TestKeyless_NoArmWithoutConnectedEdge(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "" // never observed "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("must not arm without a connected->disconnected edge")
+	}
+}
+
+func TestKeyless_NoArmWhenDisabled(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 0 // feature off
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("must not arm when the setting is 0 (disabled)")
+	}
+}
+
+func TestKeyless_NoArmOutsideParked(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
 	initTestFSM(t, system)
 	if err := system.machine.SetState(fsm.StateStandby); err != nil {
 		t.Fatalf("SetState Standby: %v", err)
 	}
 	system.initialized = true
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
 
-	// Clear outputs/cues recorded during entry actions so the tests assert
-	// only on what handleInputChange does.
-	mockIO.digitalOutputs = make(map[string]bool)
-	mockIO.pwmCues = nil
-	mockRedis.publishedButtonEvents = nil
-	mockRedis.setBrakeStates = nil
-	mockRedis.setBlinkerSwitches = nil
-	mockRedis.setBlinkerStates = nil
-	mockRedis.hornButtonStates = nil
-	mockRedis.seatboxButtonStates = nil
-	mockRedis.kickstandStates = nil
-	return system, mockIO, mockRedis
-}
-
-func TestStandbyInput_HornButton_PublishesHashAndEventButDoesNotDriveGPIO(t *testing.T) {
-	system, mockIO, mockRedis := standbyInputSystem(t)
-
-	if err := system.handleInputChange("horn_button", true); err != nil {
-		t.Fatalf("handleInputChange horn_button on: %v", err)
-	}
-	if err := system.handleInputChange("horn_button", false); err != nil {
-		t.Fatalf("handleInputChange horn_button off: %v", err)
-	}
-
-	// PUBSUB event fired at the top of the function (pre-gate).
-	wantEvents := []string{"horn:on", "horn:off"}
-	if !equalStringSlice(mockRedis.publishedButtonEvents, wantEvents) {
-		t.Errorf("publishedButtonEvents = %v, want %v",
-			mockRedis.publishedButtonEvents, wantEvents)
-	}
-
-	// Hash reflects ground truth.
-	if !equalBoolSlice(mockRedis.hornButtonStates, []bool{true, false}) {
-		t.Errorf("hornButtonStates = %v, want [true false]",
-			mockRedis.hornButtonStates)
-	}
-
-	// Horn GPIO must NEVER have been written.
-	if _, ok := mockIO.digitalOutputs["horn"]; ok {
-		t.Errorf("horn GPIO must not be touched in Standby, got %v",
-			mockIO.digitalOutputs["horn"])
+	_ = system.handleBleStatusChange("disconnected")
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("must not arm outside parked")
 	}
 }
 
-func TestStandbyInput_SeatboxButton_PublishesHashButDoesNotSendFSMEvent(t *testing.T) {
-	system, _, mockRedis := standbyInputSystem(t)
+func TestKeyless_ReconnectCancelsCountdown(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
 
-	if err := system.handleInputChange("seatbox_button", true); err != nil {
-		t.Fatalf("handleInputChange seatbox_button on: %v", err)
+	_ = system.handleBleStatusChange("disconnected")
+	_ = system.handleBleStatusChange("connected")
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("reconnect must cancel the countdown")
+	}
+}
+
+func TestKeyless_ExpiryReachesShuttingDown(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	// The timer fires EvAutoStandbyTimeout; send it directly to avoid a 10s wait.
+	if err := system.machine.SendSync(librefsm.Event{ID: fsm.EvAutoStandbyTimeout}); err != nil {
+		t.Fatalf("send timeout: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if system.getCurrentState() != types.StateShuttingDown {
+		t.Errorf("expected shutting-down after countdown expiry, got %v", system.getCurrentState())
+	}
+}
+
+func TestKeyless_InteractionCancels_IdleDisabled(t *testing.T) {
+	system, _, _ := parkedTestSystem(t) // autoStandbySeconds defaults to 0
+	system.mu.Lock()
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	system.resetAutoStandbyTimer() // simulates brake/kickstand/seatbox interaction
+
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("interaction must cancel the countdown even when idle auto-standby is disabled")
+	}
+}
+
+func TestKeyless_InteractionCancels_IdleEnabled(t *testing.T) {
+	system, _, _ := parkedTestSystem(t)
+	system.mu.Lock()
+	system.autoStandbySeconds = 900
+	system.lockOnBleDisconnectSeconds = 10
+	system.lastBleStatus = "connected"
+	system.mu.Unlock()
+
+	_ = system.handleBleStatusChange("disconnected")
+	system.resetAutoStandbyTimer()
+
+	system.mu.RLock()
+	active := system.keylessCountdownActive
+	system.mu.RUnlock()
+	if active {
+		t.Fatal("interaction must cancel the countdown when idle auto-standby is enabled")
+	}
+}
+
+func TestBleCallbackWired(t *testing.T) {
+	_, _, mockRedis := newTestVehicleSystem()
+	if mockRedis.callbacks.BleCallback == nil {
+		t.Fatal("BleCallback was not wired in SetCallbacks")
+	}
+	// The wired callback must route into the BLE edge handler without error.
+	if err := mockRedis.callbacks.BleCallback("connected"); err != nil {
+		t.Fatalf("BleCallback returned error: %v", err)
+	}
+}
+
+// ===== Blinker Switch (GPIO) Tests =====
+
+func TestHandleBlinkerChangeLeftOn(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("blinker_left", true)
+	if err := system.handleBlinkerChange("blinker_left", true); err != nil {
+		t.Fatalf("handleBlinkerChange failed: %v", err)
+	}
+	defer system.stopBlinker()
+
+	if system.getBlinkerState() != BlinkerLeft {
+		t.Errorf("Expected BlinkerLeft, got %v", system.getBlinkerState())
+	}
+	if len(mockRedis.setBlinkerSwitches) != 1 || mockRedis.setBlinkerSwitches[0] != "left" {
+		t.Errorf("Expected switch 'left' published, got %v", mockRedis.setBlinkerSwitches)
+	}
+	if len(mockRedis.publishedButtonEvents) != 1 || mockRedis.publishedButtonEvents[0] != "blinker:left:on" {
+		t.Errorf("Expected blinker:left:on event, got %v", mockRedis.publishedButtonEvents)
+	}
+}
+
+func TestHandleBlinkerChangeHazardBothOn(t *testing.T) {
+	// Hazard button: both switch inputs go active. The second event's handler
+	// sees the first switch already active in the input cache.
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("blinker_left", true)
+	mockIO.setDigitalInput("blinker_right", true)
+	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
+		t.Fatalf("handleBlinkerChange failed: %v", err)
+	}
+	defer system.stopBlinker()
+
+	if system.getBlinkerState() != BlinkerBoth {
+		t.Errorf("Expected BlinkerBoth, got %v", system.getBlinkerState())
+	}
+	if len(mockRedis.setBlinkerSwitches) != 1 || mockRedis.setBlinkerSwitches[0] != "both" {
+		t.Errorf("Expected switch 'both' published, got %v", mockRedis.setBlinkerSwitches)
+	}
+	if len(mockRedis.publishedButtonEvents) != 1 || mockRedis.publishedButtonEvents[0] != "blinker:right:on" {
+		t.Errorf("Expected blinker:right:on event, got %v", mockRedis.publishedButtonEvents)
+	}
+}
+
+func TestHandleBlinkerChangeHazardReleaseOneSide(t *testing.T) {
+	// Releasing one side of a hazard pair transitions both -> right, and the
+	// PUBSUB event must carry the released edge, not the combined state.
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("blinker_left", true)
+	mockIO.setDigitalInput("blinker_right", true)
+	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
+		t.Fatalf("hazard setup failed: %v", err)
 	}
 
-	if !equalBoolSlice(mockRedis.seatboxButtonStates, []bool{true}) {
-		t.Errorf("seatboxButtonStates = %v, want [true]",
-			mockRedis.seatboxButtonStates)
+	mockIO.setDigitalInput("blinker_left", false)
+	if err := system.handleBlinkerChange("blinker_left", false); err != nil {
+		t.Fatalf("handleBlinkerChange failed: %v", err)
+	}
+	defer system.stopBlinker()
+
+	if system.getBlinkerState() != BlinkerRight {
+		t.Errorf("Expected BlinkerRight after releasing left, got %v", system.getBlinkerState())
+	}
+	if n := len(mockRedis.setBlinkerSwitches); n != 2 || mockRedis.setBlinkerSwitches[1] != "right" {
+		t.Errorf("Expected switch 'right' published, got %v", mockRedis.setBlinkerSwitches)
+	}
+	if n := len(mockRedis.publishedButtonEvents); n != 2 || mockRedis.publishedButtonEvents[1] != "blinker:left:off" {
+		t.Errorf("Expected blinker:left:off event, got %v", mockRedis.publishedButtonEvents)
+	}
+}
+
+func TestHandleBlinkerChangeAllOff(t *testing.T) {
+	system, mockIO, mockRedis := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("blinker_right", true)
+	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
+		t.Fatalf("setup failed: %v", err)
 	}
 
-	// Seatbox must not have been opened — no PublishSeatboxOpened, no seatbox:open
-	// send command, FSM still in Standby.
-	if mockRedis.publishedSeatboxOpened != 0 {
-		t.Errorf("PublishSeatboxOpened must not fire in Standby, got %d",
-			mockRedis.publishedSeatboxOpened)
+	mockIO.setDigitalInput("blinker_right", false)
+	if err := system.handleBlinkerChange("blinker_right", false); err != nil {
+		t.Fatalf("handleBlinkerChange failed: %v", err)
+	}
+
+	if system.getBlinkerState() != BlinkerOff {
+		t.Errorf("Expected BlinkerOff, got %v", system.getBlinkerState())
+	}
+	last := len(mockRedis.setBlinkerSwitches) - 1
+	if mockRedis.setBlinkerSwitches[last] != "off" {
+		t.Errorf("Expected switch 'off' published, got %v", mockRedis.setBlinkerSwitches)
+	}
+	if got := mockRedis.publishedButtonEvents[len(mockRedis.publishedButtonEvents)-1]; got != "blinker:right:off" {
+		t.Errorf("Expected blinker:right:off event, got %v", got)
+	}
+	foundOffCue := false
+	for _, cue := range mockIO.pwmCues {
+		if cue == 9 { // LED_BLINK_NONE
+			foundOffCue = true
+		}
+	}
+	if !foundOffCue {
+		t.Errorf("Expected PWM cue 9 (LED_BLINK_NONE) played, got %v", mockIO.pwmCues)
+	}
+}
+
+func TestHandleBlinkerChangePeerReadErrorFallsBackToLastState(t *testing.T) {
+	// If the peer switch can't be read, the handler must fall back to the
+	// last known blinker state instead of assuming the peer is inactive.
+	system, mockIO, _ := newTestVehicleSystem()
+
+	mockIO.setDigitalInput("blinker_left", true)
+	if err := system.handleBlinkerChange("blinker_left", true); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+
+	mockIO.setInputErrs(map[string]error{"blinker_left": fmt.Errorf("ioctl failed")})
+	mockIO.setDigitalInput("blinker_right", true)
+	if err := system.handleBlinkerChange("blinker_right", true); err != nil {
+		t.Fatalf("handleBlinkerChange failed: %v", err)
+	}
+	defer system.stopBlinker()
+
+	if system.getBlinkerState() != BlinkerBoth {
+		t.Errorf("Expected BlinkerBoth via fallback (left was last known active), got %v", system.getBlinkerState())
+	}
+}
+
+func TestHandleBlinkerChangeUnexpectedChannel(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+
+	if err := system.handleBlinkerChange("horn", true); err == nil {
+		t.Error("Expected error for unexpected channel")
+	}
+}
+
+// A map download that ends while the vehicle sits in standby must not switch
+// off a display nobody asked it to switch off. Only a power change the
+// shutdown path actually deferred may be applied on release.
+func TestReleaseMapDownloadHold_NoDeferral_LeavesDbcPowered(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateStandby); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.initialized = true
+
+	// Display is up for a reason of its own (an operator turned it on), so
+	// nothing was deferred.
+	system.mu.Lock()
+	system.mapDownloading = true
+	system.deferredDashboardPower = nil
+	system.mu.Unlock()
+
+	system.releaseMapDownloadHold("test: download finished")
+
+	if n := countPublishedMessages(mockRedis, "dbc:command", "poweroff"); n != 0 {
+		t.Fatalf("expected no dbc:command poweroff with nothing deferred, got %d", n)
+	}
+}
+
+// The same release must still carry out a power off the shutdown path deferred
+// while the hold was set, since that decision was the state machine's.
+func TestReleaseMapDownloadHold_DeferredOff_PowersDown(t *testing.T) {
+	system, _, mockRedis := newTestVehicleSystem()
+	initTestFSM(t, system)
+
+	if err := system.machine.SetState(fsm.StateStandby); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.initialized = true
+
+	powerOff := false
+	system.mu.Lock()
+	system.mapDownloading = true
+	system.deferredDashboardPower = &powerOff
+	system.mu.Unlock()
+
+	system.releaseMapDownloadHold("test: download finished")
+
+	if n := countPublishedMessages(mockRedis, "dbc:command", "poweroff"); n != 1 {
+		t.Fatalf("expected exactly one dbc:command poweroff for a deferred off, got %d", n)
+	}
+}
+
+// ===== Brake-light suppression while the scootui-qt menu is open =====
+//
+// Menu navigation taps skip the on-cue, but a lever held when the menu opened
+// must not leave the brake light stuck on.
+
+func brakeCuesContain(cues []int, want int) bool {
+	for _, c := range cues {
+		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
+// bringUpParked wires the inputs and state of a parked scooter with the
+// dashboard up, where the menu exists.
+func bringUpParked(t *testing.T, system *VehicleSystem, mockIO *mockHardwareIO) {
+	t.Helper()
+	mockIO.setDigitalInput("kickstand", true)
+	mockIO.setDigitalInput("brake_left", false)
+	mockIO.setDigitalInput("brake_right", false)
+	mockIO.setDigitalInput("handlebar_position", false)
+	mockIO.setDigitalInput("handlebar_lock_sensor", true)
+	mockIO.setDigitalInput("seatbox_lock_sensor", true)
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateParked); err != nil {
+		t.Fatalf("SetState Parked: %v", err)
 	}
 	time.Sleep(30 * time.Millisecond)
-	if system.getCurrentState() != types.StateStandby {
-		t.Errorf("FSM must stay in Standby after seatbox press, got %v",
-			system.getCurrentState())
-	}
+	system.initialized = true
+	mockIO.pwmCues = nil // drop EnterParked's lights-on cues
 }
 
-func TestStandbyInput_BrakeLeft_PublishesHashButDoesNotTouchEngineBrakeOrCues(t *testing.T) {
-	system, mockIO, mockRedis := standbyInputSystem(t)
+// A lever held when the menu opens has its release cue run anyway, so the
+// brake light returns to its parked level instead of staying at full.
+func TestBrakeCue_ReleasedWhileMenuOpen_TurnsLightOff(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+	bringUpParked(t, system, mockIO)
 
-	if err := system.handleInputChange("brake_left", true); err != nil {
-		t.Fatalf("handleInputChange brake_left on: %v", err)
-	}
-
-	want := []struct {
-		side    string
-		pressed bool
-	}{{"left", true}}
-	if len(mockRedis.setBrakeStates) != 1 ||
-		mockRedis.setBrakeStates[0] != want[0] {
-		t.Errorf("setBrakeStates = %v, want %v", mockRedis.setBrakeStates, want)
-	}
-
-	if _, ok := mockIO.digitalOutputs["engine_brake"]; ok {
-		t.Errorf("engine_brake GPIO must not be driven in Standby, got %v",
-			mockIO.digitalOutputs["engine_brake"])
-	}
-	if len(mockIO.pwmCues) != 0 {
-		t.Errorf("PWM cues must not play in Standby, got %v", mockIO.pwmCues)
-	}
-}
-
-func TestStandbyInput_BrakeRight_PublishesHash(t *testing.T) {
-	system, _, mockRedis := standbyInputSystem(t)
-
+	mockIO.setDigitalInput("brake_right", true)
 	if err := system.handleInputChange("brake_right", true); err != nil {
-		t.Fatalf("handleInputChange brake_right on: %v", err)
+		t.Fatalf("press: %v", err)
 	}
-	if len(mockRedis.setBrakeStates) != 1 ||
-		mockRedis.setBrakeStates[0].side != "right" ||
-		mockRedis.setBrakeStates[0].pressed != true {
-		t.Errorf("setBrakeStates = %v, want [{right true}]",
-			mockRedis.setBrakeStates)
+	if err := system.handleMenuOpen(true); err != nil {
+		t.Fatalf("handleMenuOpen: %v", err)
+	}
+
+	mockIO.pwmCues = nil
+	mockIO.setDigitalInput("brake_right", false)
+	if err := system.handleInputChange("brake_right", false); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	if !brakeCuesContain(mockIO.pwmCues, 5) {
+		t.Errorf("releasing the last brake while the menu is open must play the off-cue (5), got %v",
+			mockIO.pwmCues)
 	}
 }
 
-func TestStandbyInput_Blinker_PublishesEventAndSwitchHashButNoActuation(t *testing.T) {
-	system, mockIO, mockRedis := standbyInputSystem(t)
+// Navigation taps stay dark: pressing a lever while parked with the menu open
+// plays no on-cue, so tapping through the menu does not flash the brake light.
+func TestBrakeCue_MenuOpenWhileParked_SkipsOnCue(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+	bringUpParked(t, system, mockIO)
 
-	if err := system.handleInputChange("blinker_left", true); err != nil {
-		t.Fatalf("handleInputChange blinker_left on: %v", err)
-	}
-	if err := system.handleInputChange("blinker_left", false); err != nil {
-		t.Fatalf("handleInputChange blinker_left off: %v", err)
-	}
-
-	wantEvents := []string{"blinker:left:on", "blinker:left:off"}
-	if !equalStringSlice(mockRedis.publishedButtonEvents, wantEvents) {
-		t.Errorf("publishedButtonEvents = %v, want %v",
-			mockRedis.publishedButtonEvents, wantEvents)
-	}
-	if !equalStringSlice(mockRedis.setBlinkerSwitches, []string{"left", "off"}) {
-		t.Errorf("setBlinkerSwitches = %v, want [left off]",
-			mockRedis.setBlinkerSwitches)
+	if err := system.handleMenuOpen(true); err != nil {
+		t.Fatalf("handleMenuOpen: %v", err)
 	}
 
-	// No blinker actuation: no PWM cues, no blinker state published,
-	// no blinker goroutine started.
-	if len(mockIO.pwmCues) != 0 {
-		t.Errorf("no PWM cues expected, got %v", mockIO.pwmCues)
+	mockIO.pwmCues = nil
+	mockIO.setDigitalInput("brake_left", true)
+	if err := system.handleInputChange("brake_left", true); err != nil {
+		t.Fatalf("press: %v", err)
 	}
-	if len(mockRedis.setBlinkerStates) != 0 {
-		t.Errorf("no blinker state publish expected, got %v",
-			mockRedis.setBlinkerStates)
-	}
-	if system.blinkerStopChan != nil {
-		t.Errorf("blinker goroutine must not start in Standby")
+
+	if brakeCuesContain(mockIO.pwmCues, 4) {
+		t.Errorf("pressing a lever with the menu open while parked must not play the on-cue (4), got %v",
+			mockIO.pwmCues)
 	}
 }
 
-func TestStandbyInput_Kickstand_PublishesHash(t *testing.T) {
-	system, _, mockRedis := standbyInputSystem(t)
+// A brake-navigated screen can outlive the parked state. The stale menu-open
+// flag must not keep muting the brake light once the rider is in drive mode.
+func TestBrakeCue_MenuFlagInDrive_StillPlaysOnCue(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+	bringUpParked(t, system, mockIO)
 
-	if err := system.handleInputChange("kickstand", false); err != nil {
-		t.Fatalf("handleInputChange kickstand up: %v", err)
+	if err := system.handleMenuOpen(true); err != nil {
+		t.Fatalf("handleMenuOpen: %v", err)
 	}
-	if err := system.handleInputChange("kickstand", true); err != nil {
-		t.Fatalf("handleInputChange kickstand down: %v", err)
+	if err := system.machine.SetState(fsm.StateReadyToDrive); err != nil {
+		t.Fatalf("SetState ReadyToDrive: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	mockIO.setDigitalInput("brake_left", true)
+	if err := system.handleInputChange("brake_left", true); err != nil {
+		t.Fatalf("press: %v", err)
 	}
 
-	if !equalBoolSlice(mockRedis.kickstandStates, []bool{false, true}) {
-		t.Errorf("kickstandStates = %v, want [false true]",
-			mockRedis.kickstandStates)
+	if !brakeCuesContain(mockIO.pwmCues, 4) {
+		t.Errorf("braking in drive mode must play the on-cue (4) even with a stale menu-open flag, got %v",
+			mockIO.pwmCues)
 	}
 }
 
-func equalStringSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
+// Closing the menu with a lever still held replays the on-cue that the
+// suppression skipped when the lever went down.
+func TestBrakeCue_MenuCloseWithBrakeHeld_ReplaysOnCue(t *testing.T) {
+	system, mockIO, _ := newTestVehicleSystem()
+	bringUpParked(t, system, mockIO)
 
-func equalBoolSlice(a, b []bool) bool {
-	if len(a) != len(b) {
-		return false
+	if err := system.handleMenuOpen(true); err != nil {
+		t.Fatalf("handleMenuOpen: %v", err)
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
+
+	mockIO.setDigitalInput("brake_left", true)
+	if err := system.handleInputChange("brake_left", true); err != nil {
+		t.Fatalf("press: %v", err)
 	}
-	return true
+
+	mockIO.pwmCues = nil
+	if err := system.handleMenuOpen(false); err != nil {
+		t.Fatalf("handleMenuOpen: %v", err)
+	}
+
+	if !brakeCuesContain(mockIO.pwmCues, 4) {
+		t.Errorf("closing the menu with a brake held must replay the on-cue (4), got %v",
+			mockIO.pwmCues)
+	}
 }

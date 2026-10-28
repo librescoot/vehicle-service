@@ -18,6 +18,9 @@ type MessagingClient interface {
 	// State management
 	GetVehicleState() (types.SystemState, error)
 	PublishVehicleState(state types.SystemState) error
+	SetRestoreAttempt(state string, ttl time.Duration) error
+	GetRestoreAttempt() (string, error)
+	ClearRestoreAttempt() error
 
 	// Dashboard
 	GetDashboardPower() (bool, error)
@@ -29,6 +32,7 @@ type MessagingClient interface {
 	GetDbcUpdating() (bool, error)
 	SetDbcUpdating(updating bool) error
 	GetOtaStatus(component string) (string, error)
+	GetOtaHeartbeat(component string) (string, error)
 
 	// Power inhibitors
 	SetInhibitor(id, inhibitType, why string) error
@@ -37,17 +41,23 @@ type MessagingClient interface {
 	// Settings
 	GetHashField(hash, field string) (string, error)
 
+	// usb0 gate decision (system hash), read by the boot failsafe timer
+	SetUsb0Gate(open bool) error
+
+	// RecordDbcLink stores the link state observed when the DBC was last
+	// powered off, in the system hash: the transport that carried the route
+	// (an interface name, or "none"), and whether each link had a route at all.
+	RecordDbcLink(transport string, usbUp, pppUp bool, at time.Time) error
+
 	// Auto-standby
 	PublishAutoStandbyDeadline(deadline time.Time) error
 	ClearAutoStandbyDeadline() error
-
-	// Hop-on / hop-off
-	SetHopOnActive(active bool) error
 
 	// Sensors and switches
 	SetBrakeState(side string, pressed bool) error
 	SetKickstandState(deployed bool) error
 	SetHandlebarLockState(locked bool) error
+	SetHandlebarLockLatched(locked bool) error
 	SetHandlebarPosition(isOnPlace bool) error
 	SetSeatboxLockState(locked bool) error
 	SetBlinkerSwitch(state string) error
@@ -61,6 +71,10 @@ type MessagingClient interface {
 	PublishButtonEvent(event string) error
 	PublishInputEvent(event string) error
 	PublishSeatboxOpened() error
+
+	// Faults
+	RaiseFault(code int, description string) error
+	ClearFault(code int) error
 
 	// Commands
 	SendCommand(channel, command string) error
@@ -86,8 +100,16 @@ type HardwareIO interface {
 	PlayPwmFade(ch int, idx int) error
 
 	// DBC boot LED
-	SetDbcLed(color string) error
+	SetDbcLed(color string, brightness uint8) error
 
 	// Network link (usb0 to DBC)
 	SetUsb0Enabled(enabled bool) error
+
+	// DbcLinks reports both service routes to the DBC and which transport the
+	// kernel selects, from the routing table.
+	DbcLinks() (hardware.DbcLinks, error)
+
+	// PPP link over UART to DBC (ppp-link.service); slaved to dashboard
+	// power so pppd never holds the UART open against an unpowered DBC
+	SetPppLinkEnabled(enabled bool) error
 }

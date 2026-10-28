@@ -1,121 +1,81 @@
-# LibreScoot Vehicle Service
+# Librescoot Vehicle Service
 
-[![CC BY-NC-SA 4.0][cc-by-nc-sa-shield]][cc-by-nc-sa]
+Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
-The LibreScoot Vehicle Service is a core component of the LibreScoot platform, responsible for managing and controlling electric scooter hardware systems. This service handles real-time vehicle operations, safety features, and communication with the dashboard system.
+`vehicle-service` is the vehicle-control process for Librescoot. It combines a
+vehicle state machine with Linux GPIO and LED control, and exposes vehicle
+state and commands through Redis.
 
-## Features
+## Capabilities
 
-- Real-time vehicle state management
-- Hardware I/O control (GPIO)
-- LED control system
-- Handlebar locking mechanism
-- Blinker control system
-- Seat box locking mechanism
-- Horn control
-- Redis-based messaging system for component communication
-- Safety state transitions
-- Dashboard communication interface
+- Manages vehicle state transitions and associated hardware actions.
+- Controls vehicle GPIO for power, braking, locks, horn, seatbox, and inputs.
+- Drives the PWM LED channels used for lighting and indicators.
+- Processes handlebar, brake, seatbox, kickstand, and button input events.
+- Publishes vehicle state, input events, and faults for other vehicle services.
 
-## Dependencies
+## Operation and Redis interface
 
-- `github.com/redis/go-redis/v9` - Redis client for Go
-- `github.com/warthog618/go-gpiocdev` - GPIO device interface
-- `golang.org/x/sys` - System calls and primitives
+Redis is fixed at `127.0.0.1:6379`. The service publishes the `vehicle` hash,
+including the vehicle state and hardware/input fields such as brake, blinker,
+seatbox, kickstand, handlebar, power, and update state. It publishes UI input
+edges on `buttons` and synthesized gestures on `input-events`.
 
-## System Architecture
+Commands are consumed from these Redis lists:
 
-The service is built around a core `VehicleSystem` that manages:
-- System state transitions
-- Hardware I/O operations
-- Real-time communication with the dashboard
-- Safety features and interlocks
-- User input processing
+- `scooter:seatbox`, `scooter:horn`, `scooter:blinker`, and `scooter:state`
+- `scooter:led:cue` and `scooter:led:fade`
+- `scooter:update`, `scooter:dbc-hold`, `scooter:hardware`, and `scooter:hop-on`
 
-### Key Components
+`scooter:state lock-hibernate` submits one manual request to PM. PM admits explicit sleep from `parked` or `stand-by`; from `parked` it sends internal `prepare-hibernate:<request-id>`. Vehicle-service validates that ID against `power-manager[hibernate-request-id]` inside the parked-state FSM transition, then performs graceful dashboard and vehicle shutdown without submitting a second power request. Obsolete preparation cannot initiate locking. Rejection reports `hibernate-preparation-failed:<request-id>` on `scooter:power`.
 
-- **Core System**: Manages the overall vehicle state and coordinates between components
-- **Hardware IO**: Interfaces with physical GPIO pins for input/output operations
-- **Messaging**: Handles Redis-based communication between vehicle components
-- **LED Control**: Manages vehicle lighting systems
-- **State Management**: Ensures safe state transitions and vehicle operation
+Confirmed physical brake hibernation submits its manual power request only after publishing `stand-by`. Unlocking during hibernation preparation cancels the pending power intent. Dashboard installation inhibitors belong to their installer and are not removed by hibernation.
 
-## Building and Running
+The service also watches `dashboard`, `keycard`, `settings`, `ota`,
+`power-manager`, and `ble` hashes. It uses the hash-and-notification convention:
+a channel message identifies the changed field, while the current value remains
+in the corresponding hash.
 
-To build the service:
-
-```bash
-make build
-```
-
-To run the service:
-
-```bash
-./vehicle-service
-```
+Active faults are recorded in `vehicle:fault`, changes are published on the
+`vehicle` channel as `fault`, and fault events are appended to `events:faults`.
 
 ## Configuration
 
-### Command Line Options
+Configuration is intentionally limited. The only command-line controls are
+logging and version output; run `bin/vehicle-service-host -help` after
+`make build-host` for the generated help. Redis connection settings and GPIO
+mapping are compiled into the service.
 
-- `--version`: Print version and exit
-- `--log`: Service log level (0=NONE, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, default: 3)
+Several `settings` hash fields alter supported vehicle behavior at runtime,
+including the `scooter.*` settings for braking, standby, locking, horn,
+indicator LEDs, and USB policy. Treat writes to `settings` and the command
+queues as privileged: they can cause physical vehicle actions.
 
-### Redis Configuration
+## Build and test
 
-The service connects to Redis at `127.0.0.1:6379` (hardcoded).
+```bash
+make build        # Linux ARMv7 binary: bin/vehicle-service
+make build-host   # local-development binary: bin/vehicle-service-host
+make test
+make lint         # requires golangci-lint
+```
 
-### LED Channel Mapping
+`make fmt`, `make deps`, and `make clean` are also available.
 
-The vehicle service controls 8 PWM LED channels with the following mappings:
+## Deployment and operations
 
-| Index | LED Name              | Description                    |
-|-------|-----------------------|--------------------------------|
-| 0     | Headlight            | Main front illumination       |
-| 1     | Front ring           | Front accent lighting          |
-| 2     | Brake light          | Rear brake indicator           |
-| 3     | Blinker front left   | Left front turn signal        |
-| 4     | Blinker front right  | Right front turn signal       |
-| 5     | Number plates        | License plate illumination    |
-| 6     | Blinker rear left    | Left rear turn signal         |
-| 7     | Blinker rear right   | Right rear turn signal        |
+The Yocto layer ships `librescoot-vehicle.service`, which requires Valkey.
+The target system must provide the datastore on the loopback address and grant
+the process access to the GPIO, input, and LED devices used by the vehicle
+hardware. A development binary does not exercise that hardware without an
+appropriate target environment.
 
-Channels 3, 4, 6, and 7 are configured as blinker channels and do not use adaptive mode.
-
-#### LED Channel Modes
-
-The PWM LED system supports two operational modes for each channel:
-
-- **Adaptive Mode**: When enabled, causes the channel to adapt fade playback by finding the first duty-cycle value in the fade that is nearest to the current duty-cycle, then starting the fade from that point. This prevents abrupt jumps in brightness when transitioning between different LED states. Non-blinker channels (0, 1, 2, 5) use adaptive mode for smooth transitions.
-
-- **Active/Inactive Mode**: Controls whether fade values are actually output to the LED. When active, fade values are set as the channel's duty-cycle normally. When inactive, the output is forced to 0% regardless of the fade being played. Blinker channels (3, 4, 6, 7) rely on precise active/inactive control for their flashing patterns.
-
-For more detailed information about these modes, see the [i.MX PWM LED kernel module documentation](https://github.com/unumotors/kernel-module-imx-pwm-led/blob/master/README.md).
-
-## Safety Features
-
-The service implements several safety features:
-- Handlebar position monitoring
-- State-based operation restrictions
-- Key card authentication
-- Safe state transitions
-- Emergency shutdown capabilities
+The process handles `SIGINT` and `SIGTERM` and runs its shutdown path before
+exiting. Vehicle state and fault data are operational interfaces; consumers
+should not infer a safe physical condition from Redis alone.
 
 ## License
 
-This work is licensed under a
-[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License][cc-by-nc-sa].
+This project is licensed under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](LICENSE).
 
-[![CC BY-NC-SA 4.0][cc-by-nc-sa-image]][cc-by-nc-sa]
-
-[cc-by-nc-sa]: http://creativecommons.org/licenses/by-nc-sa/4.0/
-[cc-by-nc-sa-image]: https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png
-[cc-by-nc-sa-shield]: https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
----
-
-Made with ❤️ by the LibreScoot community
+Made with ❤️ by the Librescoot community

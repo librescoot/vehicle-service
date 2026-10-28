@@ -1,7 +1,6 @@
 package core
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/librescoot/librefsm"
@@ -37,9 +36,13 @@ func (v *VehicleSystem) cancelHandlebarUnlock() {
 	v.mu.Unlock()
 }
 
-// unlockHandlebarIfNeeded checks if the handlebar needs unlocking and unlocks it
-// Also cancels any ongoing handlebar locking attempt
-func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
+// unlockHandlebarIfNeeded checks if the handlebar needs unlocking and unlocks it.
+// Also cancels any ongoing handlebar locking attempt.
+//
+// It reports nothing: the one thing that can fail here is the sensor read, which
+// it logs and works around. Having no error return is what keeps callers from
+// growing a check that can never fire.
+func (v *VehicleSystem) unlockHandlebarIfNeeded() {
 	v.cancelHandlebarLock()
 
 	// Read the actual lock sensor state from hardware to avoid acting on
@@ -60,13 +63,16 @@ func (v *VehicleSystem) unlockHandlebarIfNeeded() error {
 	if !unlocked {
 		v.unlockHandlebar()
 	}
-	return nil
 }
 
-// lockHandlebar initiates handlebar locking with a 10-second window for positioning.
-// The done channel is set up before the goroutine starts so cancelHandlebarLock()
-// can cancel both the immediate-lock path and the timer-wait path.
-func (v *VehicleSystem) lockHandlebar() {
+// lockHandlebar initiates handlebar locking with a handlebarLockWindow
+// positioning window. If the handlebar is already in lock-position it locks
+// immediately; otherwise it waits for the user to move it into position within
+// the window. The done channel is set up before the goroutine starts so
+// cancelHandlebarLock() can cancel both the immediate-lock path and the
+// timer-wait path. onLocked, if non-nil, runs once the lock is sensor-confirmed
+// engaged (hop-on uses it to record that it owns the lock for release on exit).
+func (v *VehicleSystem) lockHandlebar(onLocked func()) {
 	done := make(chan struct{})
 	v.mu.Lock()
 	if v.handlebarDone != nil {
@@ -91,7 +97,7 @@ func (v *VehicleSystem) lockHandlebar() {
 
 		if handlebarPos {
 			// Handlebar is in position, lock it with retry + sensor verification
-			v.lockHandlebarWithRetry(done)
+			v.lockHandlebarWithRetry(done, onLocked)
 			// Clear done reference
 			v.mu.Lock()
 			if v.handlebarDone == done {
@@ -145,7 +151,7 @@ func (v *VehicleSystem) lockHandlebar() {
 
 			timer.Stop()
 
-			v.lockHandlebarWithRetry(done)
+			v.lockHandlebarWithRetry(done, onLocked)
 			cleanup()
 			return nil
 		})
@@ -153,10 +159,19 @@ func (v *VehicleSystem) lockHandlebar() {
 		v.logger.Debugf("Started 60 second window for handlebar lock")
 
 		v.mu.RLock()
-		timerC := v.handlebarTimer.C
+		timer := v.handlebarTimer
 		v.mu.RUnlock()
+		if timer == nil {
+			// cancelHandlebarLock, or this window's own cleanup running from
+			// the position callback, cleared the timer between the line that
+			// set it and here. The window is already closed, so there is
+			// nothing left to wait on. The position callback above reads the
+			// same field and has always guarded it this way.
+			v.logger.Debugf("Handlebar lock window closed before the wait began")
+			return
+		}
 		select {
-		case <-timerC:
+		case <-timer.C:
 			cleanup()
 			v.logger.Debugf("Handlebar lock window expired")
 		case <-done:
@@ -167,7 +182,8 @@ func (v *VehicleSystem) lockHandlebar() {
 
 // lockHandlebarWithRetry pulses the lock closed and verifies via the lock sensor.
 // Retries up to handlebarLockRetries times if the sensor doesn't confirm engagement.
-func (v *VehicleSystem) lockHandlebarWithRetry(done chan struct{}) {
+// onLocked, if non-nil, runs once the lock is sensor-confirmed engaged.
+func (v *VehicleSystem) lockHandlebarWithRetry(done chan struct{}, onLocked func()) {
 	for attempt := 1; attempt <= handlebarLockRetries; attempt++ {
 		// Check for cancellation
 		select {
@@ -208,7 +224,11 @@ func (v *VehicleSystem) lockHandlebarWithRetry(done chan struct{}) {
 		v.mu.Unlock()
 
 		if locked {
+			v.setHandlebarLatch(true)
 			v.logger.Infof("Handlebar locked successfully (attempt %d/%d)", attempt, handlebarLockRetries)
+			if onLocked != nil {
+				onLocked()
+			}
 			return
 		}
 
@@ -275,6 +295,7 @@ func (v *VehicleSystem) unlockHandlebar() {
 			v.mu.Unlock()
 
 			if unlocked {
+				v.setHandlebarLatch(false)
 				v.logger.Infof("Handlebar unlocked successfully (attempt %d)", attempt)
 				return
 			}
@@ -330,40 +351,6 @@ func (v *VehicleSystem) handleHandlebarPosition(channel string, value bool) erro
 
 	if !unlocked {
 		v.unlockHandlebar()
-	}
-
-	return nil
-}
-
-// updateEngineBrake updates only the engine brake based on current state
-// Used when brake lever state changes but vehicle state hasn't
-func (v *VehicleSystem) updateEngineBrake() error {
-	v.mu.RLock()
-	currentState := v.state
-	v.mu.RUnlock()
-
-	// Read current brake states
-	brakeLeft, err := v.io.ReadDigitalInput("brake_left")
-	if err != nil {
-		return fmt.Errorf("failed to read brake_left: %w", err)
-	}
-	brakeRight, err := v.io.ReadDigitalInput("brake_right")
-	if err != nil {
-		return fmt.Errorf("failed to read brake_right: %w", err)
-	}
-
-	// Engine brake logic:
-	// - In READY_TO_DRIVE: follows brake levers (engaged when either pressed)
-	// - In all other states: always engaged (motor disabled)
-	var engineBrakeEngaged bool
-	if currentState == types.StateReadyToDrive {
-		engineBrakeEngaged = brakeLeft || brakeRight
-	} else {
-		engineBrakeEngaged = true
-	}
-
-	if err := v.io.WriteDigitalOutput("engine_brake", engineBrakeEngaged); err != nil {
-		return fmt.Errorf("failed to set engine brake: %w", err)
 	}
 
 	return nil

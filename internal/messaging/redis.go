@@ -3,7 +3,9 @@ package messaging
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"vehicle-service/internal/types"
 
 	ipc "github.com/librescoot/redis-ipc"
+	"github.com/redis/go-redis/v9"
 )
 
 type Callbacks struct {
@@ -24,13 +27,15 @@ type Callbacks struct {
 	ForceLockCallback      func() error       // New callback for force-lock
 	LedCueCallback         func(int) error
 	LedFadeCallback        func(int, int) error
-	UpdateCallback         func(string) error // "start", "complete"
-	HardwareCallback       func(string) error // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
-	SettingsCallback       func(string) error // setting key that was updated (e.g., "scooter.brake-hibernation")
-	OtaDbcActivityCallback func() error       // Called on any OTA hash field change for DBC component
-	HopOnCallback          func(string) error // "engage", "release"
-	PowerStateCallback     func(string) error // power-manager state: "running", "suspend-pending", ...
-	MenuOpenCallback       func(bool) error   // scootui-qt menu open/closed
+	UpdateCallback         func(string) error       // "start", "complete"
+	DbcHoldCallback        func(string) error       // "map-download", "release"
+	HardwareCallback       func(string) error       // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
+	SettingsCallback       func(string) error       // setting key that was updated (e.g., "scooter.brake-hibernation")
+	OtaDbcActivityCallback func(field string) error // Called on any OTA hash field change for DBC component
+	HopOnCallback          func(string) error       // "engage", "release"
+	PowerStateCallback     func(string) error       // power-manager state: "running", "suspend-pending", ...
+	MenuOpenCallback       func(bool) error         // scootui-qt menu open/closed
+	BleCallback            func(string) error       // ble hash 'status' field: "connected" / "disconnected"
 }
 
 type RedisClient struct {
@@ -46,19 +51,17 @@ type RedisClient struct {
 	systemPub    *ipc.HashPublisher
 	otaPub       *ipc.HashPublisher
 	dashboardPub *ipc.HashPublisher
-	buttonsPub   *ipc.HashPublisher
 
 	// Watchers
-	vehicleWatcher      *ipc.HashWatcher
 	dashboardWatcher    *ipc.HashWatcher
 	keycardWatcher      *ipc.HashWatcher
 	settingsWatcher     *ipc.HashWatcher
 	otaWatcher          *ipc.HashWatcher
 	powerManagerWatcher *ipc.HashWatcher
+	bleWatcher          *ipc.HashWatcher
 
 	// Fault handling
-	faultSet    *ipc.FaultSet
-	faultStream *ipc.StreamPublisher
+	faults *ipc.FaultReporter
 }
 
 func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks) (*RedisClient, error) {
@@ -68,7 +71,7 @@ func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks
 		ipc.WithAddress(host),
 		ipc.WithPort(port),
 		ipc.WithCodec(ipc.StringCodec{}),
-		ipc.WithPoolSize(12), // 8 queue handlers + 4 for other operations
+		ipc.WithPoolSize(4), // redis-ipc >= v0.15.0 serves every queue from one shared BRPOP
 		ipc.WithOnConnect(func() { l.Infof("Redis connected") }),
 		ipc.WithOnDisconnect(func(err error) { l.Warnf("Redis disconnected: %v", err) }),
 	)
@@ -90,11 +93,12 @@ func NewRedisClient(host string, port int, l *logger.Logger, callbacks Callbacks
 	r.systemPub = client.NewHashPublisher("system")
 	r.otaPub = client.NewHashPublisher("ota")
 	r.dashboardPub = client.NewHashPublisher("dashboard")
-	r.buttonsPub = client.NewHashPublisher("buttons")
 
-	// Initialize fault handling
-	r.faultSet = client.NewFaultSet("vehicle:fault", "vehicle", "fault")
-	r.faultStream = client.NewStreamPublisher("events:faults", ipc.WithMaxLen(1000))
+	// Initialize fault handling. No options: the defaults already produce the
+	// keys consumers read (vehicle:fault, channel vehicle, payload fault,
+	// events:faults). Restating them would create a second place for the naming
+	// to drift.
+	r.faults = client.NewFaultReporter("vehicle")
 
 	return r, nil
 }
@@ -106,9 +110,10 @@ func (r *RedisClient) SetCallbacks(callbacks Callbacks) {
 func (r *RedisClient) Connect() error {
 	r.logger.Infof("Attempting to connect to Redis")
 
-	// Check initial dashboard state
+	// Check initial dashboard state. redis.Nil means scootui-qt hasn't
+	// published its readiness flag yet — expected on cold boot.
 	ready, err := r.client.HGet("dashboard", "ready")
-	if err != nil {
+	if err != nil && !errors.Is(err, redis.Nil) {
 		r.logger.Infof("Failed to get initial dashboard state: %v", err)
 	} else if ready != "" {
 		r.logger.Infof("Initial dashboard ready state: %v", ready == "true")
@@ -125,6 +130,16 @@ func (r *RedisClient) Connect() error {
 		if r.callbacks.MenuOpenCallback != nil {
 			if err := r.callbacks.MenuOpenCallback(menuOpen == "true"); err != nil {
 				r.logger.Infof("Failed to handle initial menu-open state: %v", err)
+			}
+		}
+	}
+
+	// Seed the current BLE status so the edge detector has a baseline and does
+	// not treat a startup "disconnected" as a fresh disconnect.
+	if bleStatus, err := r.client.HGet("ble", "status"); err == nil && bleStatus != "" {
+		if r.callbacks.BleCallback != nil {
+			if err := r.callbacks.BleCallback(bleStatus); err != nil {
+				r.logger.Infof("Failed to handle initial BLE status: %v", err)
 			}
 		}
 	}
@@ -148,34 +163,47 @@ func (r *RedisClient) StartListening() error {
 		}
 		return nil
 	})
-	r.dashboardWatcher.Start()
+	if err := r.dashboardWatcher.Start(); err != nil {
+		return fmt.Errorf("failed to start dashboard watcher: %w", err)
+	}
 
 	r.keycardWatcher = r.client.NewHashWatcher("keycard")
 	r.keycardWatcher.OnField("authentication", func(value string) error {
 		r.logger.Infof("Processing keycard authentication")
 		return r.callbacks.KeycardCallback()
 	})
-	r.keycardWatcher.Start()
+	if err := r.keycardWatcher.Start(); err != nil {
+		return fmt.Errorf("failed to start keycard watcher: %w", err)
+	}
 
 	r.settingsWatcher = r.client.NewHashWatcher("settings")
 	r.settingsWatcher.OnAny(func(field, value string) error {
 		if r.callbacks.SettingsCallback != nil {
-			r.logger.Infof("Processing settings update: %s", field)
+			r.logger.Debugf("Processing settings update: %s", field)
 			return r.callbacks.SettingsCallback(field)
 		}
 		return nil
 	})
-	r.settingsWatcher.Start()
+	// Redis is not persisted; settings-service reseeds the hash at every boot
+	// and publishes one notification per field. StartWithSync (subscribe →
+	// HGETALL → handlers → buffered messages) picks the seed up regardless of
+	// whether it lands before or after this point — plain Start() would
+	// silently miss any field seeded between the startup reads and here.
+	if err := r.settingsWatcher.StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start settings watcher: %w", err)
+	}
 
 	// Watch OTA hash for DBC update activity (feeds the watchdog timer)
 	r.otaWatcher = r.client.NewHashWatcher("ota")
 	r.otaWatcher.OnAny(func(field, value string) error {
 		if strings.HasSuffix(field, ":dbc") && r.callbacks.OtaDbcActivityCallback != nil {
-			return r.callbacks.OtaDbcActivityCallback()
+			return r.callbacks.OtaDbcActivityCallback(field)
 		}
 		return nil
 	})
-	r.otaWatcher.Start()
+	if err := r.otaWatcher.Start(); err != nil {
+		return fmt.Errorf("failed to start ota watcher: %w", err)
+	}
 
 	// Watch power-manager state so we can re-read GPIO inputs after resume
 	// from suspend (the kernel may mask edges that occurred while asleep).
@@ -186,7 +214,21 @@ func (r *RedisClient) StartListening() error {
 		}
 		return nil
 	})
-	r.powerManagerWatcher.Start()
+	if err := r.powerManagerWatcher.Start(); err != nil {
+		return fmt.Errorf("failed to start power-manager watcher: %w", err)
+	}
+
+	// Watch BLE link status so vehicle-service can lock on phone disconnect.
+	r.bleWatcher = r.client.NewHashWatcher("ble")
+	r.bleWatcher.OnField("status", func(value string) error {
+		if r.callbacks.BleCallback != nil {
+			return r.callbacks.BleCallback(value)
+		}
+		return nil
+	})
+	if err := r.bleWatcher.Start(); err != nil {
+		return fmt.Errorf("failed to start ble watcher: %w", err)
+	}
 
 	// Start queue command listeners
 	ipc.HandleRequests(r.client, "scooter:seatbox", r.handleSeatboxCommand)
@@ -196,6 +238,7 @@ func (r *RedisClient) StartListening() error {
 	ipc.HandleRequests(r.client, "scooter:led:cue", r.handleLedCueCommand)
 	ipc.HandleRequests(r.client, "scooter:led:fade", r.handleLedFadeCommand)
 	ipc.HandleRequests(r.client, "scooter:update", r.handleUpdateCommand)
+	ipc.HandleRequests(r.client, "scooter:dbc-hold", r.handleDbcHoldCommand)
 	ipc.HandleRequests(r.client, "scooter:hardware", r.handleHardwareCommand)
 	ipc.HandleRequests(r.client, "scooter:hop-on", r.handleHopOnCommand)
 
@@ -245,6 +288,9 @@ func (r *RedisClient) handleBlinkerCommand(value string) error {
 func (r *RedisClient) handleStateCommand(value string) error {
 	if r.callbacks.StateCallback == nil && r.callbacks.ForceLockCallback == nil {
 		return nil
+	}
+	if strings.HasPrefix(value, "prepare-hibernate:") && r.callbacks.StateCallback != nil {
+		return r.callbacks.StateCallback(value)
 	}
 	switch value {
 	case "unlock", "lock", "lock-hibernate":
@@ -302,6 +348,13 @@ func (r *RedisClient) handleUpdateCommand(value string) error {
 	}
 }
 
+func (r *RedisClient) handleDbcHoldCommand(value string) error {
+	if r.callbacks.DbcHoldCallback == nil {
+		return nil
+	}
+	return r.callbacks.DbcHoldCallback(value)
+}
+
 // handleHardwareCommand processes hardware power control commands
 func (r *RedisClient) handleHardwareCommand(value string) error {
 	if r.callbacks.HardwareCallback == nil {
@@ -316,23 +369,18 @@ func (r *RedisClient) handleHardwareCommand(value string) error {
 // handleHopOnCommand processes hop-on / hop-off mode commands.
 // Accepts:
 //
-//	"engage"        — enter hop-on mode with the user-facing side-effects
-//	                  (LED cue, opportunistic steering lock, hop-on-active
-//	                  flag published). Sent by the dashboard's "Activate
-//	                  now" menu action.
-//	"engage-silent" — enter hop-on mode quietly: no LED cue, no steering
-//	                  lock, no hop-on-active flag. Used by the combo
-//	                  learning UI so vehicle-service still suppresses
-//	                  input side-effects (horn, blinker, brake LED, seatbox
-//	                  open, hibernation hold) but the user doesn't see the
-//	                  scooter "power down" while configuring a combo.
-//	"release"       — leave hop-on mode regardless of how it was entered.
+//	"engage"          — enter the locked StateHopOn (lock screen, LED
+//	                    cue, opportunistic steering lock).
+//	"engage-learning" — enter StateHopOnLearning quietly (no LED cue,
+//	                    no steering lock) so the dashboard can record a
+//	                    combo without the scooter visibly reacting.
+//	"release"         — leave whichever hop-on sub-state is active.
 func (r *RedisClient) handleHopOnCommand(value string) error {
 	if r.callbacks.HopOnCallback == nil {
 		return nil
 	}
 	switch value {
-	case "engage", "engage-silent", "release":
+	case "engage", "engage-learning", "release":
 		r.logger.Infof("Processing hop-on command: %s", value)
 		return r.callbacks.HopOnCallback(value)
 	default:
@@ -346,7 +394,7 @@ func (r *RedisClient) PublishVehicleState(state types.SystemState) error {
 	stateStr := string(state)
 
 	// Set both state and timestamp fields using SetWithTimestamp
-	if err := r.vehiclePub.SetWithTimestamp("state", stateStr); err != nil {
+	if err := r.vehiclePub.SetWithTimestamp("state", stateStr, ipc.Sync()); err != nil {
 		r.logger.Warnf("Failed to publish vehicle state: %v", err)
 		return err
 	}
@@ -420,16 +468,20 @@ func (r *RedisClient) SetBlinkerState(state string, startNanos int64) error {
 	return nil
 }
 
+// GetVehicleState reads the persisted vehicle state from Redis. Returns ""
+// (and a nil error) when no state has been persisted yet — fresh boot or
+// post-hibernation cold start where Redis came up empty. Callers treat the
+// empty result as "leave the FSM in its initial Standby state".
 func (r *RedisClient) GetVehicleState() (types.SystemState, error) {
 	r.logger.Infof("Getting vehicle state from Redis")
 	stateStr, err := r.client.HGet("vehicle", "state")
+	if errors.Is(err, redis.Nil) || (err == nil && stateStr == "") {
+		r.logger.Infof("No vehicle state found in Redis")
+		return "", nil
+	}
 	if err != nil {
 		r.logger.Infof("Failed to get vehicle state: %v", err)
-		return types.StateInit, err
-	}
-	if stateStr == "" {
-		r.logger.Infof("No vehicle state found in Redis")
-		return types.StateInit, nil
+		return "", err
 	}
 	r.logger.Infof("Successfully retrieved vehicle state: %s", stateStr)
 	return types.SystemState(stateStr), nil
@@ -485,9 +537,9 @@ func (r *RedisClient) SetHornButton(isPressed bool) error {
 		state = "on"
 	}
 
-	// Note: Using vehiclePub here but it publishes to "buttons" channel for these button events
-	// We need a separate publisher for the buttons hash
-	if err := r.buttonsPub.Set(fmt.Sprintf("horn:%s", state), "1"); err != nil {
+	// The edge event on the "buttons" channel is published by
+	// PublishButtonEvent; this only owns the level field in the vehicle hash.
+	if err := r.vehiclePub.Set("horn:button", state); err != nil {
 		r.logger.Warnf("Failed to set horn button state: %v", err)
 		return err
 	}
@@ -502,8 +554,9 @@ func (r *RedisClient) SetSeatboxButton(isPressed bool) error {
 		state = "on"
 	}
 
-	// Note: Using buttonsPub here for button event publishing
-	if err := r.buttonsPub.Set(fmt.Sprintf("seatbox:%s", state), "1"); err != nil {
+	// The edge event on the "buttons" channel is published by
+	// PublishButtonEvent; this only owns the level field in the vehicle hash.
+	if err := r.vehiclePub.Set("seatbox:button", state); err != nil {
 		r.logger.Warnf("Failed to set seatbox button state: %v", err)
 		return err
 	}
@@ -558,8 +611,7 @@ func (r *RedisClient) SetHandlebarPosition(isOnPlace bool) error {
 		state = "on-place"
 	}
 
-	err := r.client.HSet("vehicle", "handlebar:position", state)
-	if err != nil {
+	if err := r.vehiclePub.Set("handlebar:position", state); err != nil {
 		r.logger.Warnf("Failed to set handlebar position: %v", err)
 		return err
 	}
@@ -582,6 +634,21 @@ func (r *RedisClient) SetHandlebarLockState(isLocked bool) error {
 	return nil
 }
 
+// SetHandlebarLockLatched publishes the latched (commanded/confirmed) lock state.
+// Updated only on confirmed actuations and on Standby entry; immune to spurious
+// edges of the raw lock sensor while in active states.
+func (r *RedisClient) SetHandlebarLockLatched(isLocked bool) error {
+	state := "unlocked"
+	if isLocked {
+		state = "locked"
+	}
+	if err := r.vehiclePub.Set("handlebar:lock-state", state); err != nil {
+		r.logger.Warnf("Failed to set handlebar latched lock state: %v", err)
+		return err
+	}
+	return nil
+}
+
 // SetDbcUpdating sets the DBC updating state in Redis
 func (r *RedisClient) SetDbcUpdating(updating bool) error {
 	r.logger.Debugf("Setting DBC updating state: %v", updating)
@@ -601,11 +668,11 @@ func (r *RedisClient) SetDbcUpdating(updating bool) error {
 // GetDbcUpdating gets the DBC updating state from Redis
 func (r *RedisClient) GetDbcUpdating() (bool, error) {
 	value, err := r.client.HGet("vehicle", "dbc-updating")
+	if errors.Is(err, redis.Nil) || (err == nil && value == "") {
+		return false, nil // Field doesn't exist, default to false
+	}
 	if err != nil {
 		return false, err
-	}
-	if value == "" {
-		return false, nil // Field doesn't exist, default to false
 	}
 	return value == "true", nil
 }
@@ -629,29 +696,13 @@ func (r *RedisClient) SetDashboardPower(enabled bool) error {
 // GetDashboardPower gets the dashboard power state from Redis
 func (r *RedisClient) GetDashboardPower() (bool, error) {
 	value, err := r.client.HGet("vehicle", "dashboard:power")
+	if errors.Is(err, redis.Nil) || (err == nil && value == "") {
+		return false, nil // Field doesn't exist, default to false/off
+	}
 	if err != nil {
 		return false, err
 	}
-	if value == "" {
-		return false, nil // Field doesn't exist, default to false/off
-	}
 	return value == "on", nil
-}
-
-// SetHopOnActive publishes the hop-on / hop-off mode flag to the vehicle hash.
-// While true, the FSM blocks Parked->ReadyToDrive transitions so the scooter
-// stays powered up but cannot be ridden away.
-func (r *RedisClient) SetHopOnActive(active bool) error {
-	value := "false"
-	if active {
-		value = "true"
-	}
-	if err := r.vehiclePub.Set("hop-on-active", value); err != nil {
-		r.logger.Warnf("Failed to set hop-on-active: %v", err)
-		return err
-	}
-	r.logger.Infof("Set hop-on-active=%s", value)
-	return nil
 }
 
 // PublishUpdateStatus publishes the update status to Redis
@@ -725,6 +776,56 @@ func (r *RedisClient) PublishGovernorChange(governor string) error {
 	return nil
 }
 
+// SetUsb0Gate records this boot's usb0 gate decision in the system hash.
+//
+// The field exists for the boot failsafe timer, which raises usb0 itself when
+// the field is still absent at its deadline: that is the only signal that
+// separates "vehicle-service decided to keep usb0 down" from "vehicle-service
+// never got far enough to decide". It is deliberately never written for an
+// unresolved gate.
+func (r *RedisClient) SetUsb0Gate(open bool) error {
+	state := "closed"
+	if open {
+		state = "open"
+	}
+	if err := r.systemPub.Set("usb0-gate", state); err != nil {
+		r.logger.Warnf("Failed to set usb0-gate: %v", err)
+		return err
+	}
+	return nil
+}
+
+// RecordDbcLink records the link state observed when the DBC was last powered
+// off, in the system hash. transport is an interface name, or "none" when there
+// was no route; usbUp and pppUp say whether each link had a route at all.
+//
+// The record answers a question the live routing table cannot during support:
+// once the installer has taken the DBC's place on the USB port, traffic to the
+// DBC no longer describes normal operation, but the last powered session still
+// does. Recording the two links separately, not just the one that carried
+// traffic, is what lets a reader judge whether the PPP fallback was ever usable.
+func (r *RedisClient) RecordDbcLink(transport string, usbUp, pppUp bool, at time.Time) error {
+	bit := func(up bool) string {
+		if up {
+			return "up"
+		}
+		return "down"
+	}
+	fields := map[string]string{
+		"dbc-link":    transport,
+		"dbc-usb":     bit(usbUp),
+		"dbc-ppp":     bit(pppUp),
+		"dbc-link-at": strconv.FormatInt(at.Unix(), 10),
+	}
+	for field, value := range fields {
+		if err := r.systemPub.Set(field, value); err != nil {
+			r.logger.Warnf("Failed to set %s: %v", field, err)
+			return err
+		}
+	}
+	return nil
+}
+
 // SetBacklightEnabled sets the dashboard backlight-enabled flag in Redis
 func (r *RedisClient) SetBacklightEnabled(enabled bool) error {
 	value := "false"
@@ -749,18 +850,70 @@ func (r *RedisClient) DeleteDashboardReadyFlag() error {
 	return nil
 }
 
+// restoreAttemptKey holds the state a boot restore is currently attempting.
+// A dedicated top-level key, not a field in the vehicle hash: the hash is a
+// published surface that the dashboard, uplink and lsc all read, and this is
+// process bookkeeping nobody else has any business acting on. vehicle:fault is
+// the precedent for vehicle-prefixed side keys.
+const restoreAttemptKey = "vehicle:restore-attempt"
+
+// SetRestoreAttempt records the state a restore is about to enter, so a restart
+// can tell "we died trying this" from "we have not tried yet". The TTL is the
+// whole safety net: the marker has to outlive a systemd restart and must never
+// cost a legitimate restore hours later.
+func (r *RedisClient) SetRestoreAttempt(state string, ttl time.Duration) error {
+	return r.client.Set(restoreAttemptKey, state, ttl)
+}
+
+// GetRestoreAttempt returns the state of an interrupted restore, or "" when
+// there is none.
+func (r *RedisClient) GetRestoreAttempt() (string, error) {
+	value, err := r.client.Get(restoreAttemptKey)
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to read %s: %w", restoreAttemptKey, err)
+	}
+	return value, nil
+}
+
+// ClearRestoreAttempt drops the marker once a restore has run to a conclusion.
+func (r *RedisClient) ClearRestoreAttempt() error {
+	if _, err := r.client.Del(restoreAttemptKey); err != nil {
+		return fmt.Errorf("failed to delete %s: %w", restoreAttemptKey, err)
+	}
+	return nil
+}
+
 // GetOtaStatus gets the OTA status for a specific component from Redis
 func (r *RedisClient) GetOtaStatus(component string) (string, error) {
 	statusKey := fmt.Sprintf("status:%s", component)
 	status, err := r.client.HGet("ota", statusKey)
+	if errors.Is(err, redis.Nil) || (err == nil && status == "") {
+		// Status field doesn't exist (no OTA in progress), return idle
+		return "", nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to get OTA status for component %s: %w", component, err)
 	}
-	if status == "" {
-		// Status field doesn't exist, return empty string (idle)
+	return status, nil
+}
+
+// GetOtaHeartbeat returns the last heartbeat marker a component published, or
+// an empty string if it has never published one. Used on startup to decide
+// whether the short DBC watchdog is safe to apply.
+func (r *RedisClient) GetOtaHeartbeat(component string) (string, error) {
+	heartbeatKey := fmt.Sprintf("heartbeat:%s", component)
+	heartbeat, err := r.client.HGet("ota", heartbeatKey)
+	if errors.Is(err, redis.Nil) || (err == nil && heartbeat == "") {
+		// Heartbeat field doesn't exist (no OTA in progress), return empty
 		return "", nil
 	}
-	return status, nil
+	if err != nil {
+		return "", fmt.Errorf("failed to get OTA heartbeat for component %s: %w", component, err)
+	}
+	return heartbeat, nil
 }
 
 // SendCommand sends a command to a Redis list (for communication with other services)
@@ -785,68 +938,39 @@ func (r *RedisClient) PublishMessage(channel, message string) error {
 	return nil
 }
 
-// ReportFaultPresent reports a fault as present to Redis
-func (r *RedisClient) ReportFaultPresent(code int, description string, timestamp int64, info string) error {
-	r.logger.Infof("Reporting fault present: code=%d, description=%s", code, description)
-
-	// Add fault code to active faults set
-	if err := r.faultSet.Add(code); err != nil {
-		r.logger.Infof("Failed to add fault to set: %v", err)
+// RaiseFault marks a fault code active. The description reaches the
+// events:faults stream and is the entire fault UI, so it should name the
+// specific failure and carry the underlying error. Raising a fault that is
+// already active is a no-op server side and emits no stream entry, which also
+// means the first description wins: every one has to stand on its own.
+func (r *RedisClient) RaiseFault(code int, description string) error {
+	if err := r.faults.Raise(code, description); err != nil {
+		r.logger.Errorf("Failed to raise fault %d: %v", code, err)
 		return err
 	}
-
-	// Add fault event to global event stream with metadata
-	eventData := map[string]any{
-		"group":       "vehicle",
-		"code":        fmt.Sprint(code),
-		"description": description,
-		"ts":          fmt.Sprint(timestamp),
-	}
-	if info != "" {
-		eventData["info"] = info
-	}
-	if _, err := r.faultStream.Add(eventData); err != nil {
-		r.logger.Infof("Failed to add fault to stream: %v", err)
-		return err
-	}
-
-	r.logger.Infof("Successfully reported fault %d as present", code)
 	return nil
 }
 
-// ReportFaultAbsent reports a fault as absent (cleared) to Redis
-func (r *RedisClient) ReportFaultAbsent(code int) error {
-	r.logger.Infof("Reporting fault absent: code=%d", code)
-
-	// Remove fault code from active faults set
-	if err := r.faultSet.Remove(code); err != nil {
-		r.logger.Infof("Failed to remove fault from set: %v", err)
+// ClearFault marks a fault code inactive. Clearing a fault that is not active
+// is a no-op.
+func (r *RedisClient) ClearFault(code int) error {
+	if err := r.faults.Clear(code); err != nil {
+		r.logger.Errorf("Failed to clear fault %d: %v", code, err)
 		return err
 	}
-
-	// Add clear event to global event stream (negative code indicates cleared)
-	eventData := map[string]any{
-		"group": "vehicle",
-		"code":  fmt.Sprint(-code), // Negative code indicates fault cleared
-	}
-	if _, err := r.faultStream.Add(eventData); err != nil {
-		r.logger.Infof("Failed to add fault clear to stream: %v", err)
-		return err
-	}
-
-	r.logger.Infof("Successfully reported fault %d as absent", code)
 	return nil
 }
 
-// GetHashField reads a field from a Redis hash using HGET
+// GetHashField reads a field from a Redis hash using HGET. A missing
+// hash/field returns ("", nil) — callers distinguish "unset" from
+// "real error" by checking err.
 func (r *RedisClient) GetHashField(hash, field string) (string, error) {
 	value, err := r.client.HGet(hash, field)
+	if errors.Is(err, redis.Nil) || (err == nil && value == "") {
+		return "", nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to get hash field %s from %s: %w", field, hash, err)
-	}
-	if value == "" {
-		// Field doesn't exist, return empty string
-		return "", nil
 	}
 	return value, nil
 }
