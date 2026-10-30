@@ -18,7 +18,6 @@ import (
 )
 
 type Callbacks struct {
-	DriveMotionCallback    func(string)
 	DashboardCallback      func(bool) error
 	KeycardCallback        func() error
 	SeatboxCallback        func(bool) error   // true for "on", false for "off"
@@ -243,8 +242,6 @@ func (r *RedisClient) StartListening() error {
 	ipc.HandleRequests(r.client, "scooter:hardware", r.handleHardwareCommand)
 	ipc.HandleRequests(r.client, "scooter:hop-on", r.handleHopOnCommand)
 
-	r.wg.Add(1)
-	go r.runDriveMotionSubscriber()
 	r.logger.Infof("Successfully started all Redis listeners")
 	return nil
 }

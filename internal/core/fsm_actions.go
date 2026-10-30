@@ -420,12 +420,8 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 		return nil
 	}
 
-	// Recheck after power/handlebar work: a lost supply or newer throttle
-	// report must not release the interlock after the transition guard passed.
+	// The battery may become inactive while power/handlebar work runs.
 	if c.Event != nil && (!v.IsKickstandUp(c) || !v.HasDriveSupply(c)) {
-		v.driveStart.mu.Lock()
-		v.driveStart.entryRejected = true
-		v.driveStart.mu.Unlock()
 		brakeErr, brakeReport := v.writeOutputDeferredFault("engine_brake", true)
 		powerEffects := []func(){engineReport, engineFinish, dashboardReport, dashboardFinish, brakeReport}
 		if brakeErr != nil {
@@ -439,7 +435,7 @@ func (v *VehicleSystem) EnterReadyToDrive(c *librefsm.Context) error {
 			}
 		}
 		startEffects(powerEffects...)
-		v.logger.Warnf("Drive start evidence changed before motor release; returning to parked")
+		v.logger.Warnf("Drive start battery or kickstand condition changed before motor release; returning to parked")
 		c.Send(librefsm.Event{ID: fsm.EvDashboardNotReady})
 		return nil
 	}

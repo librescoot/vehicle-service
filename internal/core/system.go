@@ -181,7 +181,6 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 	// Set up Redis callbacks so they are available as soon as the system object
 	// exists, even before Start() is called (enables unit tests to verify wiring).
 	vs.redis.SetCallbacks(messaging.Callbacks{
-		DriveMotionCallback:    vs.receiveDriveMotion,
 		DashboardCallback:      vs.handleDashboardReady,
 		KeycardCallback:        vs.keycardAuthPassed,
 		SeatboxCallback:        vs.handleSeatboxRequest,
@@ -1140,7 +1139,6 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 			v.mu.Unlock()
 			return v.redis.SetHandlebarLockState(isLocked)
 		case "48v_detect":
-			v.noteDriveMainPower(value)
 			return v.redis.SetMainPower(value)
 		}
 		return nil
@@ -1354,7 +1352,6 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 		v.mu.Unlock()
 
 	case "48v_detect":
-		v.noteDriveMainPower(value)
 		if err := v.redis.SetMainPower(value); err != nil {
 			return fmt.Errorf("failed to set main-power in Redis: %w", err)
 		}
@@ -1839,9 +1836,6 @@ func (v *VehicleSystem) setPowerOutput(component string, enabled bool) (func(), 
 	}
 
 	err, report := v.writeOutputDeferredFault(component, enabled)
-	if component == "engine_power" {
-		v.noteDriveEnginePower(enabled && err == nil)
-	}
 	if err != nil {
 		action := "enable"
 		if !enabled {

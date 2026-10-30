@@ -2,37 +2,21 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/librescoot/librefsm"
 	"vehicle-service/internal/fsm"
 	"vehicle-service/internal/types"
 )
 
-func driveMotionPayload(now time.Time, seq uint64, throttle bool, rpm uint16) string {
-	valid, speed := true, uint8(0)
-	b, _ := json.Marshal(driveMotion{Version: 1, Source: "00112233445566778899aabbccddeeff", Sequence: seq,
-		ObservedAt: &now, Valid: &valid, RPM: &rpm, RawSpeed: &speed, ThrottleOn: &throttle})
-	return string(b)
-}
-
 func supplyDriveStart(t *testing.T, v *VehicleSystem) {
 	t.Helper()
-	io := v.io.(*mockHardwareIO)
-	io.setDigitalInput("48v_detect", true)
+	v.io.(*mockHardwareIO).setDigitalInput("48v_detect", true)
 	r := v.redis.(*mockMessagingClient)
 	r.mu.Lock()
-	r.driveInputs = types.DriveStartInputs{ActiveBattery: true, ECUHealthy: true}
+	r.driveInputs = types.DriveStartInputs{ActiveBattery: true}
 	r.mu.Unlock()
-	now := time.Now()
-	v.driveStart.mu.Lock()
-	v.driveStart.inputs, v.driveStart.inputsAt = r.driveInputs, now
-	v.driveStart.engineOnAt, v.driveStart.railOnAt = now.Add(-2*time.Second), now.Add(-2*time.Second)
-	v.driveStart.mu.Unlock()
-	v.receiveDriveMotionAt(driveMotionPayload(now, 1, false, 0), now)
 }
 
 func rideStartSystem(t *testing.T) (*VehicleSystem, *mockHardwareIO, *mockMessagingClient) {
@@ -46,8 +30,7 @@ func rideStartSystem(t *testing.T) (*VehicleSystem, *mockHardwareIO, *mockMessag
 }
 
 func driveStartTick(v *VehicleSystem) string {
-	status := v.checkDriveStart(context.Background(), time.Now())
-	// Drain the asynchronous retry event before inspecting state/outputs.
+	status := v.checkDriveStart(context.Background())
 	_ = v.machine.SendSync(librefsm.Event{ID: "test-barrier"})
 	return status
 }
@@ -81,131 +64,76 @@ func TestRideStartContinuesAfterBatteryActivation(t *testing.T) {
 	if got := driveStartTick(v); got != "waiting-battery" {
 		t.Fatal(got)
 	}
-	r.driveInputs = types.DriveStartInputs{ActiveBattery: true, ECUHealthy: true}
-	if got := driveStartTick(v); got != "waiting-power" {
-		t.Fatal(got)
-	}
-	io.setDigitalInput("48v_detect", true)
-	if got := driveStartTick(v); got != "waiting-ecu" {
-		t.Fatal(got)
-	}
-	if v.machine.CurrentState() != fsm.StateParked || !io.getDigitalOutput("engine_brake") {
-		t.Fatal("enabled drive before power and live ECU evidence were ready")
-	}
-	supplyDriveStart(t, v)
+	r.mu.Lock()
+	r.driveInputs.ActiveBattery = true
+	r.mu.Unlock()
+	// No 48V input, ECU health, motion frame or power-settling delay is supplied.
 	if got := driveStartTick(v); got != "" {
 		t.Fatal(got)
 	}
 	if v.machine.CurrentState() != fsm.StateReadyToDrive || io.getDigitalOutput("engine_brake") {
-		t.Fatal("did not finish pending start after activation")
+		t.Fatal("active battery did not finish the pending start")
 	}
 }
 
-func TestRideStartRequiresFreshReleasedThrottle(t *testing.T) {
-	v, io, _ := rideStartSystem(t)
-	supplyDriveStart(t, v)
-	now := time.Now()
-	v.receiveDriveMotionAt(driveMotionPayload(now, 2, true, 0), now)
-	if got := driveStartTick(v); got != "release-throttle" {
-		t.Fatal(got)
-	}
-	if v.machine.CurrentState() != fsm.StateParked || !io.getDigitalOutput("engine_brake") {
-		t.Fatal("held throttle released the motor interlock")
-	}
-	now = time.Now()
-	v.receiveDriveMotionAt(driveMotionPayload(now, 3, false, 0), now)
-	driveStartTick(v)
-	if v.machine.CurrentState() != fsm.StateReadyToDrive {
-		t.Fatal("fresh released throttle did not finish pending start")
-	}
-}
-
-func TestRideStartRejectsUnusableEvidence(t *testing.T) {
-	cases := map[string]func(*VehicleSystem, *mockHardwareIO, *mockMessagingClient){
-		"48V absent": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			io.setDigitalInput("48v_detect", false)
-		},
-		"48V read error": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
+func TestRideStartOnlyAddsBatteryCondition(t *testing.T) {
+	for name, mutate := range map[string]func(*mockHardwareIO){
+		"48V absent": func(io *mockHardwareIO) { io.setDigitalInput("48v_detect", false) },
+		"48V read error": func(io *mockHardwareIO) {
 			io.inputErrs = map[string]error{"48v_detect": errors.New("read")}
 		},
-		"seatbox open": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			io.setDigitalInput("seatbox_lock_sensor", false)
-		},
-		"no active pack": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			v.driveStart.inputs.ActiveBattery = false
-		},
-		"ECU fault": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			v.driveStart.inputs.ECUHealthy = false
-		},
-		"expired battery read": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			v.driveStart.inputsAt = time.Now().Add(-time.Second)
-		},
-		"missing motion":   func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) { v.receiveDriveMotion("") },
-		"malformed motion": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) { v.receiveDriveMotion("{bad") },
-		"omitted zero fields": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			v.receiveDriveMotion(`{"version":1,"source":"00112233445566778899aabbccddeeff","sequence":2,"valid":true}`)
-		},
-		"old motion": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			v.receiveDriveMotion(driveMotionPayload(time.Now().Add(-time.Second), 2, false, 0))
-		},
-		"future motion": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			v.receiveDriveMotion(driveMotionPayload(time.Now().Add(time.Second), 2, false, 0))
-		},
-		"replayed motion": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			v.receiveDriveMotion(driveMotionPayload(time.Now(), 1, false, 0))
-		},
-		"moving wheel": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			v.receiveDriveMotion(driveMotionPayload(time.Now(), 2, false, 100))
-		},
-		"power still settling": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			v.driveStart.engineOnAt = time.Now()
-		},
-		"brief rail loss": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			v.noteDriveMainPower(false)
-			v.noteDriveMainPower(true)
-		},
-		"brief engine power loss": func(v *VehicleSystem, io *mockHardwareIO, r *mockMessagingClient) {
-			v.noteDriveEnginePower(false)
-			v.noteDriveEnginePower(true)
-		},
-	}
-	for name, mutate := range cases {
+		"seatbox open": func(io *mockHardwareIO) { io.setDigitalInput("seatbox_lock_sensor", false) },
+	} {
 		t.Run(name, func(t *testing.T) {
-			v, io, r := rideStartSystem(t)
+			v, io, _ := rideStartSystem(t)
 			supplyDriveStart(t, v)
-			if !v.HasDriveSupply(nil) {
-				t.Fatal("invalid fixture")
+			mutate(io)
+			if !v.CanEnterReadyToDrive(nil) {
+				t.Fatal("additional condition blocked an active battery")
 			}
-			mutate(v, io, r)
-			if v.HasDriveSupply(nil) {
-				t.Fatal("unsafe evidence admitted drive")
+			driveStartTick(v)
+			if v.machine.CurrentState() != fsm.StateReadyToDrive {
+				t.Fatal("did not enter drive")
 			}
 		})
 	}
 }
 
-func TestRideStartTimeoutRequiresKickstandCycle(t *testing.T) {
-	v, io, _ := rideStartSystem(t)
-	v.driveStart.requestedAt = time.Now().Add(-driveStartTimeout)
-	if got := driveStartTick(v); got != "timeout" {
-		t.Fatal(got)
+func TestRideStartPreservesNormalConditions(t *testing.T) {
+	for _, condition := range []string{"kickstand down", "dashboard not ready", "handlebar locked"} {
+		t.Run(condition, func(t *testing.T) {
+			v, io, _ := rideStartSystem(t)
+			supplyDriveStart(t, v)
+			switch condition {
+			case "kickstand down":
+				io.setDigitalInput("kickstand", true)
+			case "dashboard not ready":
+				v.dashboardReady = false
+			case "handlebar locked":
+				v.handlebarUnlocked = false
+			}
+			if v.CanEnterReadyToDrive(nil) {
+				t.Fatal("battery condition bypassed a normal drive condition")
+			}
+			driveStartTick(v)
+			if v.machine.CurrentState() != fsm.StateParked {
+				t.Fatal("pending start bypassed a normal drive condition")
+			}
+		})
 	}
+}
+
+func TestRideStartReadFailureWaitsForBattery(t *testing.T) {
+	v, _, r := rideStartSystem(t)
 	supplyDriveStart(t, v)
-	if got := driveStartTick(v); got != "timeout" {
-		t.Fatal(got)
+	r.driveInputsErr = errors.New("Redis unavailable")
+	if v.HasDriveSupply(nil) || driveStartTick(v) != "waiting-battery" {
+		t.Fatal("failed read admitted driving")
 	}
-	if v.machine.CurrentState() != fsm.StateParked {
-		t.Fatal("late activation bypassed timeout")
-	}
-	io.setDigitalInput("kickstand", true)
-	if err := v.handleInputChange("kickstand", true); err != nil {
-		t.Fatal(err)
-	}
-	driveStartTick(v)
-	io.setDigitalInput("kickstand", false)
+	r.driveInputsErr = nil
 	driveStartTick(v)
 	if v.machine.CurrentState() != fsm.StateReadyToDrive {
-		t.Fatal("new start request was not admitted")
+		t.Fatal("recovered battery read did not resume start")
 	}
 }
 
@@ -243,14 +171,16 @@ func (io *changingDriveStartIO) WriteDigitalOutput(channel string, value bool) e
 	return io.mockHardwareIO.WriteDigitalOutput(channel, value)
 }
 
-func TestRideStartRechecksBeforeReleasingMotor(t *testing.T) {
+func TestRideStartRechecksBatteryBeforeReleasingMotor(t *testing.T) {
 	for _, brakeFails := range []bool{false, true} {
-		t.Run(map[bool]string{false: "new throttle input", true: "interlock write failure"}[brakeFails], func(t *testing.T) {
-			v, io, _ := rideStartSystem(t)
+		t.Run(map[bool]string{false: "battery became inactive", true: "interlock write failure"}[brakeFails], func(t *testing.T) {
+			v, io, r := rideStartSystem(t)
 			supplyDriveStart(t, v)
 			changing := &changingDriveStartIO{mockHardwareIO: io}
 			changing.change = func() {
-				v.receiveDriveMotion(driveMotionPayload(time.Now(), 2, true, 0))
+				r.mu.Lock()
+				r.driveInputs.ActiveBattery = false
+				r.mu.Unlock()
 				if brakeFails {
 					io.mu.Lock()
 					io.outputErrs = map[string]error{"engine_brake": errors.New("write")}
@@ -267,13 +197,22 @@ func TestRideStartRechecksBeforeReleasingMotor(t *testing.T) {
 			released := changing.released
 			io.mu.Unlock()
 			if released {
-				t.Fatal("released motor despite newer throttle input")
+				t.Fatal("released motor without an active battery")
 			}
 			if brakeFails && io.getDigitalOutput("engine_power") {
 				t.Fatal("failed interlock left engine powered")
 			}
-			if got := driveStartTick(v); got != "timeout" {
+			if got := driveStartTick(v); got != "waiting-battery" {
 				t.Fatal(got)
+			}
+			if !brakeFails {
+				r.mu.Lock()
+				r.driveInputs.ActiveBattery = true
+				r.mu.Unlock()
+				driveStartTick(v)
+				if v.machine.CurrentState() != fsm.StateReadyToDrive {
+					t.Fatal("battery recovery required an extra rider request")
+				}
 			}
 		})
 	}
@@ -286,7 +225,7 @@ func TestRideStartHibernationCancellationWaitsForSupply(t *testing.T) {
 	}
 	sendLockEvent(t, v, fsm.EvKickstandUp)
 	if v.machine.CurrentState() != fsm.StateParked {
-		t.Fatal("hibernation cancellation bypassed power gate")
+		t.Fatal("hibernation cancellation bypassed battery gate")
 	}
 }
 
@@ -310,12 +249,12 @@ func TestRideStartManualOverrideKeepsPowerGate(t *testing.T) {
 	io.setDigitalInput("brake_right", true)
 	_ = v.machine.SendSync(librefsm.Event{ID: fsm.EvSeatboxButton})
 	if v.machine.CurrentState() != fsm.StateParked {
-		t.Fatal("override bypassed missing supply")
+		t.Fatal("override bypassed missing battery")
 	}
 	supplyDriveStart(t, v)
 	sendLockEvent(t, v, fsm.EvSeatboxButton)
 	if v.machine.CurrentState() != fsm.StateReadyToDrive || !io.getDigitalOutput("engine_brake") {
-		t.Fatal("powered manual override did not preserve held brakes")
+		t.Fatal("manual override did not preserve held brakes")
 	}
 }
 
