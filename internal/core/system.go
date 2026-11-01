@@ -89,6 +89,9 @@ type VehicleSystem struct {
 	io                       HardwareIO
 	redis                    MessagingClient
 	mu                       sync.RWMutex
+	blinkerMu                sync.Mutex   // serializes the complete stop/start transaction across command and GPIO handlers
+	blinkerClosed            bool         // guarded by blinkerMu; shutdown rejects late callbacks
+	blinkerLastCueAt         time.Time    // written by the worker; read only after joining it
 	blinkerState             atomic.Int32 // BlinkerState; written from IO callbacks and the Redis blinker handler
 	blinkerStopChan          chan struct{}
 	blinkerExited            chan struct{}     // closed by runBlinker when it returns; stopBlinker waits on it
@@ -1367,6 +1370,12 @@ func (v *VehicleSystem) handleInputChange(channel string, value bool) error {
 // the wait, rapid switch flicks (left→off→right) can leave Redis with a
 // stale direction while the hardware blinks correctly.
 func (v *VehicleSystem) stopBlinker() {
+	v.blinkerMu.Lock()
+	defer v.blinkerMu.Unlock()
+	v.stopBlinkerLocked()
+}
+
+func (v *VehicleSystem) stopBlinkerLocked() {
 	v.mu.Lock()
 	stopChan := v.blinkerStopChan
 	exited := v.blinkerExited
@@ -1394,12 +1403,21 @@ func (v *VehicleSystem) setBlinkerState(s BlinkerState) {
 }
 
 func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
+	if channel != "blinker_left" && channel != "blinker_right" {
+		return fmt.Errorf("unexpected blinker channel: %q", channel)
+	}
+	v.blinkerMu.Lock()
+	defer v.blinkerMu.Unlock()
+	if v.blinkerClosed {
+		return fmt.Errorf("blinker controller is shut down")
+	}
+
 	// Capture blinker state before stopping so the peer-read fallback below
 	// uses the pre-stop value regardless of what stopBlinker does internally.
 	prevBlinkerState := v.getBlinkerState()
 
 	// Stop any existing blinker routine
-	v.stopBlinker()
+	v.stopBlinkerLocked()
 
 	// Determine the combined state of both blinker switches. io.go updates
 	// activeKeys for each event before firing the callback, so by the time
@@ -1458,6 +1476,9 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	}
 
 	if switchState == "off" {
+		v.blinkerStartNanos.Store(0)
+		v.blinkerCueIndex.Store(-1)
+		v.blinkerLastCueAt = time.Time{}
 		if err := v.io.PlayPwmCue(cue); err != nil {
 			return err
 		}
@@ -1504,11 +1525,12 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 		v.setBlinkerState(BlinkerLeft)
 	}
 
-	// Start blinker routine. runBlinker captures blinker:start_nanos itself
-	// immediately before the first PlayPwmCue ioctl, so the published anchor
-	// reflects when the hardware fade actually begins rather than when we
-	// queued the goroutine. It also publishes blinker:state from inside the
-	// goroutine for the same reason.
+	return v.startBlinkerLocked(cue, switchState)
+}
+
+// The worker owns the timestamp and publishes it once. Wait for that write so
+// callers receive Redis errors without racing a second state publication.
+func (v *VehicleSystem) startBlinkerLocked(cue int, state string) error {
 	v.blinkerCueIndex.Store(int32(cue))
 	stopChan := make(chan struct{})
 	exited := make(chan struct{})
@@ -1516,22 +1538,13 @@ func (v *VehicleSystem) handleBlinkerChange(channel string, value bool) error {
 	v.blinkerStopChan = stopChan
 	v.blinkerExited = exited
 	v.mu.Unlock()
-	go v.runBlinker(cue, switchState, stopChan, exited)
-	return nil
+	started := make(chan error)
+	go v.runBlinker(cue, state, stopChan, exited, started)
+	return <-started
 }
 
-func (v *VehicleSystem) runBlinker(cue int, state string, stopChan, exited chan struct{}) {
+func (v *VehicleSystem) runBlinker(cue int, state string, stopChan, exited chan struct{}, started chan<- error) {
 	defer close(exited)
-
-	// Bail before any side effects if cancellation already arrived. With
-	// rapid switch flicks the cancel can fire before this goroutine first
-	// gets CPU; without this gate we'd still write blinker:state and run
-	// the initial PlayPwmCue, racing the next handler's writes.
-	select {
-	case <-stopChan:
-		return
-	default:
-	}
 
 	v.mu.RLock()
 	dbcLed := v.dbcBlinkerLed
@@ -1569,22 +1582,35 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan, exited chan 
 		}
 	}
 
-	// Anchor the cycle schedule right before the first ioctl so
-	// blinker:start_nanos matches when the hardware fade actually begins.
-	startNanos := time.Now().UnixNano()
+	phaseStart := time.Now()
+	startNanos := phaseStart.UnixNano()
 	v.blinkerStartNanos.Store(startNanos)
-	if err := v.redis.SetBlinkerState(state, startNanos); err != nil {
+	err := v.redis.SetBlinkerState(state, startNanos)
+	if err != nil {
 		v.logger.Warnf("Failed to publish blinker state: %v", err)
 	}
+	started <- err
 
-	// Fire the first cue immediately; subsequent cues are scheduled on the
-	// absolute grid (startNanos + N*blinkerInterval) so phase doesn't drift
-	// regardless of sample-loop jitter.
-	if err := v.io.PlayPwmCue(cue); err != nil {
-		v.logger.Warnf("Error playing blinker cue: %v", err)
+	playCue := func() {
+		v.blinkerLastCueAt = time.Now()
+		if err := v.io.PlayPwmCue(cue); err != nil {
+			v.logger.Warnf("Error playing blinker cue: %v", err)
+		}
 	}
-	nextCueAt := startNanos + int64(blinkerInterval)
+	playCue()
 
+	// Timers and time.Since retain Go's monotonic clock. Unix timestamps are
+	// only for other processes, never for scheduling after an RTC/NTP step.
+	// Keep the shared phase grid during normal operation, but discard missed
+	// cycles rather than restarting the fade repeatedly to catch up.
+	nextCueAt := phaseStart.Add(blinkerInterval)
+	reanchor := false
+	if !nextCueAt.After(time.Now()) {
+		nextCueAt = time.Now().Add(blinkerInterval)
+		reanchor = true
+	}
+	cueTimer := time.NewTimer(time.Until(nextCueAt))
+	defer cueTimer.Stop()
 	ticker := time.NewTicker(dbcLedSampleInterval)
 	defer ticker.Stop()
 
@@ -1601,16 +1627,7 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan, exited chan 
 		default:
 		}
 
-		now := time.Now().UnixNano()
-
-		if now >= nextCueAt {
-			if err := v.io.PlayPwmCue(cue); err != nil {
-				v.logger.Warnf("Error playing blinker cue: %v", err)
-			}
-			nextCueAt += int64(blinkerInterval)
-		}
-
-		cyclePos := time.Duration((now - startNanos) % int64(blinkerInterval))
+		cyclePos := time.Since(v.blinkerLastCueAt)
 		var brightness uint8
 		if fade != nil {
 			// Square the normalised duty: the LP5562 is a lot brighter than
@@ -1632,6 +1649,37 @@ func (v *VehicleSystem) runBlinker(cue int, state string, stopChan, exited chan 
 		case <-stopChan:
 			setDbcBrightness(0)
 			return
+		case <-cueTimer.C:
+			select {
+			case <-stopChan:
+				setDbcBrightness(0)
+				return
+			default:
+			}
+			now := time.Now()
+			if reanchor || now.Sub(nextCueAt) > dbcLedSampleInterval {
+				nextCueAt = now
+				phaseStart = now
+				reanchor = true
+			}
+			// Translate the monotonic phase into the current wall clock for
+			// dashboard consumers without changing the physical blink cadence.
+			phaseNanos := now.Add(-now.Sub(phaseStart)).UnixNano()
+			wallShift := time.Duration(phaseNanos - v.blinkerStartNanos.Load())
+			if reanchor || wallShift > dbcLedSampleInterval || wallShift < -dbcLedSampleInterval {
+				v.blinkerStartNanos.Store(phaseNanos)
+				if err := v.redis.SetBlinkerState(state, phaseNanos); err != nil {
+					v.logger.Warnf("Failed to publish blinker phase: %v", err)
+				}
+			}
+			reanchor = false
+			playCue()
+			nextCueAt = nextCueAt.Add(blinkerInterval)
+			if !nextCueAt.After(time.Now()) {
+				nextCueAt = time.Now().Add(blinkerInterval)
+				reanchor = true
+			}
+			cueTimer.Reset(time.Until(nextCueAt))
 		case <-ticker.C:
 		}
 	}
@@ -2161,8 +2209,11 @@ func (v *VehicleSystem) stopDbcWatchdog() {
 
 func (v *VehicleSystem) Shutdown() {
 	v.stopDriveStartMonitor()
-	// Stop blinker if running
-	v.stopBlinker()
+	// Reject late Redis/GPIO callbacks before releasing the hardware.
+	v.blinkerMu.Lock()
+	v.blinkerClosed = true
+	v.stopBlinkerLocked()
+	v.blinkerMu.Unlock()
 
 	// Release a usb0 gate resolver still waiting on the keycard counts
 	v.stopUsb0GateResolver()

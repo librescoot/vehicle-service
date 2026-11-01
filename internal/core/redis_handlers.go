@@ -40,19 +40,24 @@ func (v *VehicleSystem) handleHornRequest(on bool) error {
 // handleBlinkerRequest handles blinker state requests from Redis
 func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 	v.logger.Debugf("Handling blinker request: %s", state)
+	if state != "off" && state != "left" && state != "right" && state != "both" {
+		return fmt.Errorf("invalid blinker state: %s", state)
+	}
+	v.blinkerMu.Lock()
+	defer v.blinkerMu.Unlock()
+	if v.blinkerClosed {
+		return fmt.Errorf("blinker controller is shut down")
+	}
 
 	// 1. FIRST stop the goroutine (prevents new cues from being played)
-	v.stopBlinker()
+	v.stopBlinkerLocked()
 
 	// 2. For "off", wait for in-progress fade to reach zero point
 	if state == "off" {
-		startNanos := v.blinkerStartNanos.Load()
 		cueIdx := v.blinkerCueIndex.Load()
 
-		if startNanos > 0 && cueIdx >= 0 && v.ledCurves != nil {
-			totalElapsed := time.Duration(time.Now().UnixNano() - startNanos)
-			cyclePos := totalElapsed % blinkerInterval
-			waitTime := v.ledCurves.WaitForCueZeroOrEnd(int(cueIdx), cyclePos)
+		if !v.blinkerLastCueAt.IsZero() && cueIdx >= 0 && v.ledCurves != nil {
+			waitTime := v.ledCurves.WaitForCueZeroOrEnd(int(cueIdx), time.Since(v.blinkerLastCueAt))
 			if waitTime > 0 {
 				v.logger.Debugf("Waiting %v for blinker fade zero point", waitTime)
 				time.Sleep(waitTime)
@@ -61,6 +66,7 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 
 		v.blinkerStartNanos.Store(0)
 		v.blinkerCueIndex.Store(-1)
+		v.blinkerLastCueAt = time.Time{}
 	}
 
 	// 3. Determine and play the target cue
@@ -83,22 +89,13 @@ func (v *VehicleSystem) handleBlinkerRequest(state string) error {
 	}
 
 	if state != "off" {
-		v.blinkerCueIndex.Store(int32(cue))
-		v.blinkerStartNanos.Store(time.Now().UnixNano())
-		stopChan := make(chan struct{})
-		exited := make(chan struct{})
-		v.mu.Lock()
-		v.blinkerStopChan = stopChan
-		v.blinkerExited = exited
-		v.mu.Unlock()
-		go v.runBlinker(cue, state, stopChan, exited)
-	} else {
-		if err := v.io.PlayPwmCue(cue); err != nil {
-			return err
-		}
+		return v.startBlinkerLocked(cue, state)
+	}
+	if err := v.io.PlayPwmCue(cue); err != nil {
+		return err
 	}
 
-	return v.redis.SetBlinkerState(state, v.blinkerStartNanos.Load())
+	return v.redis.SetBlinkerState(state, 0)
 }
 
 // handleStateRequest handles vehicle state change requests from Redis

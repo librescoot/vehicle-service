@@ -39,6 +39,19 @@ in the corresponding hash.
 Active faults are recorded in `vehicle:fault`, changes are published on the
 `vehicle` channel as `fault`, and fault events are appended to `events:faults`.
 
+## Indicators
+
+GPIO and Redis blinker requests share one serialized stop/start path. Replacing
+an active pattern waits for its worker to exit before starting another. Invalid
+requests leave the active pattern unchanged; shutdown rejects late callbacks.
+
+Blink cycles use a monotonic 800 ms schedule. Clock corrections do not change
+the hardware cadence, and delayed cycles are skipped rather than replayed.
+`vehicle[blinker:start_nanos]` remains a Unix timestamp for dashboard phase
+synchronization and is refreshed when the wall clock or phase changes. An
+`off` command waits for the current fade's next zero point before clearing the
+blinker channels. Physical switch-off clears them immediately.
+
 ## Starting a ride
 
 Raising the kickstand requests driving. The vehicle stays `parked`, with the

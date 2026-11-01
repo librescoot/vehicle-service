@@ -556,6 +556,7 @@ func TestHandleBlinkerRequestOff(t *testing.T) {
 
 func TestHandleBlinkerRequestLeft(t *testing.T) {
 	system, _, _ := newTestVehicleSystem()
+	defer system.stopBlinker()
 
 	err := system.handleBlinkerRequest("left")
 	if err != nil {
@@ -571,6 +572,7 @@ func TestHandleBlinkerRequestLeft(t *testing.T) {
 
 func TestHandleBlinkerRequestRight(t *testing.T) {
 	system, _, _ := newTestVehicleSystem()
+	defer system.stopBlinker()
 
 	err := system.handleBlinkerRequest("right")
 	if err != nil {
@@ -583,6 +585,7 @@ func TestHandleBlinkerRequestRight(t *testing.T) {
 
 func TestHandleBlinkerRequestBoth(t *testing.T) {
 	system, _, _ := newTestVehicleSystem()
+	defer system.stopBlinker()
 
 	err := system.handleBlinkerRequest("both")
 	if err != nil {
@@ -604,6 +607,7 @@ func TestHandleBlinkerRequestInvalid(t *testing.T) {
 
 func TestHandleBlinkerRequestStopsPrevious(t *testing.T) {
 	system, _, _ := newTestVehicleSystem()
+	defer system.stopBlinker()
 
 	_ = system.handleBlinkerRequest("left")
 	firstChan := system.blinkerStopChan
