@@ -720,7 +720,8 @@ func (v *VehicleSystem) handleDbcHoldRequest(action string) error {
 		}
 		// A shutdown may already be counting down the short cap. Restart it
 		// with the install cap so the rebuild is not cut off a few minutes in.
-		if extend && v.mapHoldTimer != nil {
+		// Every later map-install is a heartbeat and restarts the cap again.
+		if installing && v.mapHoldTimer != nil {
 			v.startMapHoldTimer()
 		}
 		holdMax := v.mapHoldMax()

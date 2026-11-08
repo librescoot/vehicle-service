@@ -3523,6 +3523,46 @@ func TestMapInstallHold_UsesLongerCap(t *testing.T) {
 	system.stopMapHoldTimer()
 }
 
+// The dashboard repeats map-install while it works. Each request must push the
+// deadline out, or a long rebuild would still be cut off at the first cap.
+func TestMapInstallHold_HeartbeatRestartsTheCap(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+
+	if err := system.handleDbcHoldRequest("map-install"); err != nil {
+		t.Fatalf("map-install: %v", err)
+	}
+	system.mu.Lock()
+	system.startMapHoldTimer() // the shutdown that began while installing
+	genBefore := system.mapHoldGeneration
+	system.mu.Unlock()
+
+	if err := system.handleDbcHoldRequest("map-install"); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	system.mu.Lock()
+	defer system.mu.Unlock()
+	if system.mapHoldGeneration == genBefore {
+		t.Fatal("a repeated map-install did not restart the running cap")
+	}
+	system.stopMapHoldTimer()
+}
+
+// A request outside a shutdown has no timer to restart and must not start one:
+// the cap only runs once a power-off is actually being deferred.
+func TestMapInstallHold_HeartbeatWithoutShutdownStartsNoTimer(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+	for i := 0; i < 3; i++ {
+		if err := system.handleDbcHoldRequest("map-install"); err != nil {
+			t.Fatalf("map-install: %v", err)
+		}
+	}
+	system.mu.Lock()
+	defer system.mu.Unlock()
+	if system.mapHoldTimer != nil {
+		t.Fatal("heartbeats must not start the shutdown cap by themselves")
+	}
+}
+
 func TestMapInstallHold_ReleaseRestoresShortCap(t *testing.T) {
 	system, _, _ := newTestVehicleSystem()
 	initTestFSM(t, system)

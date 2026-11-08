@@ -69,11 +69,15 @@ const (
 
 	// Map and routing deltas are applied on the DBC after the download: the
 	// installed file is serialised, patched and rebuilt, which keeps both CPU
-	// cores busy for minutes on an i.MX6. Cutting power then throws the whole
-	// rebuild away (the installed map stays intact, the work restarts), and a
-	// scooter that is parked and locked repeatedly would never finish. The
-	// dashboard asks for this longer window only while it is installing.
-	dbcMapInstallHoldMax = 15 * time.Minute
+	// cores busy for minutes on an i.MX6 (about five for Berlin/Brandenburg,
+	// roughly three times that for the largest regions). Cutting power then
+	// throws the whole rebuild away: the installed map stays intact but the work
+	// restarts, and a scooter that is parked and locked repeatedly would never
+	// finish. So the dashboard asks for this longer window while it installs and
+	// repeats the request about once a minute; every request restarts the cap.
+	// A region that takes an hour is therefore fine, while a dashboard that
+	// hangs stops asking and loses power this long after its last request.
+	dbcMapInstallHoldMax = 10 * time.Minute
 
 	// Lifetime of the boot restore marker. Comfortably longer than a systemd
 	// restart (RestartSec defaults to 100ms) and short enough that a marker
