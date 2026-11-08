@@ -67,6 +67,14 @@ const (
 	// so a dashboard that never releases cannot drain the battery.
 	dbcMapDownloadHoldMax = 3 * time.Minute
 
+	// Map and routing deltas are applied on the DBC after the download: the
+	// installed file is serialised, patched and rebuilt, which keeps both CPU
+	// cores busy for minutes on an i.MX6. Cutting power then throws the whole
+	// rebuild away (the installed map stays intact, the work restarts), and a
+	// scooter that is parked and locked repeatedly would never finish. The
+	// dashboard asks for this longer window only while it is installing.
+	dbcMapInstallHoldMax = 15 * time.Minute
+
 	// Lifetime of the boot restore marker. Comfortably longer than a systemd
 	// restart (RestartSec defaults to 100ms) and short enough that a marker
 	// left behind by something unrelated cannot cost a legitimate restore
@@ -122,6 +130,7 @@ type VehicleSystem struct {
 	dbcUpdating                bool              // Track if DBC update is in progress
 	dbcHeartbeatSeen           bool              // DBC has published an ota heartbeat this update
 	mapDownloading             bool              // Dashboard is mid map/tile download
+	mapInstalling              bool              // ...and has moved on to applying it (longer hold)
 	mapHoldTimer               *time.Timer       // Caps how long that defers DBC power off
 	mapHoldGeneration          uint64            // Generation counter to invalidate stale callbacks
 	dbcWatchdogTimer           *time.Timer       // Watchdog timer for DBC updates, reset on OTA activity
@@ -2169,6 +2178,14 @@ func (v *VehicleSystem) startDbcWatchdog() {
 	})
 }
 
+// mapHoldMax is the current cap on a map hold. Must be called with v.mu held.
+func (v *VehicleSystem) mapHoldMax() time.Duration {
+	if v.mapInstalling {
+		return dbcMapInstallHoldMax
+	}
+	return dbcMapDownloadHoldMax
+}
+
 // startMapHoldTimer caps how long a map download may keep DBC power up past a
 // shutdown request. Must be called with v.mu held.
 func (v *VehicleSystem) startMapHoldTimer() {
@@ -2177,14 +2194,15 @@ func (v *VehicleSystem) startMapHoldTimer() {
 	}
 	v.mapHoldGeneration++
 	gen := v.mapHoldGeneration
-	v.mapHoldTimer = time.AfterFunc(dbcMapDownloadHoldMax, func() {
+	holdMax := v.mapHoldMax()
+	v.mapHoldTimer = time.AfterFunc(holdMax, func() {
 		v.mu.RLock()
 		currentGen := v.mapHoldGeneration
 		v.mu.RUnlock()
 		if currentGen != gen {
 			return
 		}
-		v.releaseMapDownloadHold(fmt.Sprintf("hold expired after %v", dbcMapDownloadHoldMax))
+		v.releaseMapDownloadHold(fmt.Sprintf("hold expired after %v", holdMax))
 	})
 }
 

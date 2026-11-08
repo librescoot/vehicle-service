@@ -3485,6 +3485,74 @@ func TestReleaseMapDownloadHold_DeferredOff_PowersDown(t *testing.T) {
 	}
 }
 
+// Applying a map delta keeps the DBC busy for minutes, far past the short
+// courtesy window a plain download gets. The dashboard asks for the longer cap
+// when it starts installing, and that must also rescue a shutdown that has
+// already started counting down the short one.
+func TestMapInstallHold_UsesLongerCap(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+
+	system.mu.Lock()
+	if got := system.mapHoldMax(); got != dbcMapDownloadHoldMax {
+		t.Fatalf("download hold cap = %v, want %v", got, dbcMapDownloadHoldMax)
+	}
+	system.mu.Unlock()
+
+	if err := system.handleDbcHoldRequest("map-download"); err != nil {
+		t.Fatalf("map-download: %v", err)
+	}
+	system.mu.Lock()
+	system.startMapHoldTimer() // shutdown began while only downloading
+	genBefore := system.mapHoldGeneration
+	system.mu.Unlock()
+
+	if err := system.handleDbcHoldRequest("map-install"); err != nil {
+		t.Fatalf("map-install: %v", err)
+	}
+	system.mu.Lock()
+	defer system.mu.Unlock()
+	if !system.mapInstalling || !system.mapDownloading {
+		t.Fatalf("install hold not recorded: downloading=%v installing=%v", system.mapDownloading, system.mapInstalling)
+	}
+	if got := system.mapHoldMax(); got != dbcMapInstallHoldMax {
+		t.Fatalf("install hold cap = %v, want %v", got, dbcMapInstallHoldMax)
+	}
+	if system.mapHoldGeneration == genBefore {
+		t.Fatal("a running short timer was not restarted with the install cap")
+	}
+	system.stopMapHoldTimer()
+}
+
+func TestMapInstallHold_ReleaseRestoresShortCap(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+	initTestFSM(t, system)
+	if err := system.machine.SetState(fsm.StateStandby); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	system.initialized = true
+
+	if err := system.handleDbcHoldRequest("map-install"); err != nil {
+		t.Fatalf("map-install: %v", err)
+	}
+	system.releaseMapDownloadHold("test: install finished")
+
+	system.mu.Lock()
+	defer system.mu.Unlock()
+	if system.mapDownloading || system.mapInstalling {
+		t.Fatalf("hold not cleared: downloading=%v installing=%v", system.mapDownloading, system.mapInstalling)
+	}
+	if got := system.mapHoldMax(); got != dbcMapDownloadHoldMax {
+		t.Fatalf("cap after release = %v, want %v", got, dbcMapDownloadHoldMax)
+	}
+}
+
+func TestDbcHoldRequest_RejectsUnknownAction(t *testing.T) {
+	system, _, _ := newTestVehicleSystem()
+	if err := system.handleDbcHoldRequest("map-bogus"); err == nil {
+		t.Fatal("expected an error for an unknown hold action")
+	}
+}
+
 // ===== Brake-light suppression while the scootui-qt menu is open =====
 //
 // Menu navigation taps skip the on-cue, but a lever held when the menu opened

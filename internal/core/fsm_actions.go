@@ -646,7 +646,7 @@ func (v *VehicleSystem) EnterStandby(c *librefsm.Context) error {
 		if v.dbcUpdating {
 			v.logger.Debugf("DBC update in progress, deferring dashboard power OFF until update completes")
 		} else {
-			v.logger.Debugf("Map download in progress, deferring dashboard power OFF for up to %v", dbcMapDownloadHoldMax)
+			v.logger.Debugf("Map download in progress, deferring dashboard power OFF for up to %v", v.mapHoldMax())
 		}
 		powerOff := false
 		v.deferredDashboardPower = &powerOff
@@ -766,11 +766,13 @@ func (v *VehicleSystem) EnterShuttingDown(c *librefsm.Context) error {
 		v.startMapHoldTimer()
 	} else if v.mapDownloading {
 		v.mapDownloading = false
+		v.mapInstalling = false
 		v.stopMapHoldTimer()
 	}
+	holdMax := v.mapHoldMax()
 	v.mu.Unlock()
 	if mapHolding {
-		v.logger.Infof("Deferring DBC poweroff, map download in progress (up to %v)", dbcMapDownloadHoldMax)
+		v.logger.Infof("Deferring DBC poweroff, map download in progress (up to %v)", holdMax)
 	}
 	if updating && hibernating {
 		install, err := v.redis.GetHashField("power:inhibits", "install:dbc")

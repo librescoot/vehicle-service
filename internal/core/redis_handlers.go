@@ -707,13 +707,26 @@ func (v *VehicleSystem) handleSettingsUpdate(settingKey string) error {
 // blocking shutdown outright.
 func (v *VehicleSystem) handleDbcHoldRequest(action string) error {
 	switch action {
-	case "map-download":
+	case "map-download", "map-install":
+		installing := action == "map-install"
 		v.mu.Lock()
 		already := v.mapDownloading
 		v.mapDownloading = true
+		// A hold that has moved on to installing keeps the longer cap even if a
+		// late map-download request arrives; only release clears it.
+		extend := installing && !v.mapInstalling
+		if installing {
+			v.mapInstalling = true
+		}
+		// A shutdown may already be counting down the short cap. Restart it
+		// with the install cap so the rebuild is not cut off a few minutes in.
+		if extend && v.mapHoldTimer != nil {
+			v.startMapHoldTimer()
+		}
+		holdMax := v.mapHoldMax()
 		v.mu.Unlock()
 		if !already {
-			v.logger.Infof("Dashboard is downloading maps, DBC power off deferred up to %v", dbcMapDownloadHoldMax)
+			v.logger.Infof("Dashboard is downloading maps, DBC power off deferred up to %v", holdMax)
 			// Deferring the DBC power cut alone buys nothing: pm-service starts
 			// suspending the MDB 60s into standby, which takes the modem the
 			// download runs over with it. Keep the MDB awake for the same
@@ -721,6 +734,8 @@ func (v *VehicleSystem) handleDbcHoldRequest(action string) error {
 			if err := v.redis.SetInhibitor("map-download", "suspend-only", "map download in progress"); err != nil {
 				v.logger.Warnf("Failed to set map download inhibitor: %v", err)
 			}
+		} else if extend {
+			v.logger.Infof("Dashboard is installing maps, DBC power off deferred up to %v", holdMax)
 		}
 		return nil
 
@@ -742,6 +757,7 @@ func (v *VehicleSystem) releaseMapDownloadHold(reason string) {
 		return
 	}
 	v.mapDownloading = false
+	v.mapInstalling = false
 	v.stopMapHoldTimer()
 	updating := v.dbcUpdating
 	deferredPower := v.deferredDashboardPower

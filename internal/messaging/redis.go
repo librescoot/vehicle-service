@@ -28,7 +28,7 @@ type Callbacks struct {
 	LedCueCallback         func(int) error
 	LedFadeCallback        func(int, int) error
 	UpdateCallback         func(string) error       // "start", "complete"
-	DbcHoldCallback        func(string) error       // "map-download", "release"
+	DbcHoldCallback        func(string) error       // "map-download", "map-install", "release"
 	HardwareCallback       func(string) error       // "dashboard:on", "dashboard:off", "engine:on", "engine:off", "handlebar:lock", "handlebar:unlock"
 	SettingsCallback       func(string) error       // setting key that was updated (e.g., "scooter.brake-hibernation")
 	OtaDbcActivityCallback func(field string) error // Called on any OTA hash field change for DBC component
