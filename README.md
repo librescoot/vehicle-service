@@ -39,6 +39,17 @@ in the corresponding hash.
 Active faults are recorded in `vehicle:fault`, changes are published on the
 `vehicle` channel as `fault`, and fault events are appended to `events:faults`.
 
+## Bounded completion chirp
+
+After startup, `vehicle[horn:chirp-capability]` publishes `v1:<boot-id>`.
+A client may enqueue `chirp:<boot-id>:<expires-unix-seconds>` on `scooter:horn`.
+The expiry must be in the next five seconds. Requests from another boot or
+expired queues are rejected. An accepted request produces two 50 ms horn pulses
+separated by a 75 ms gap. Timing and the off action belong to vehicle-service,
+not the requesting client.
+The vehicle must be in `stand-by` and `scooter.enable-horn` must be `true`.
+The command does not unlock the vehicle or change its power state.
+
 ## Indicators
 
 GPIO and Redis blinker requests share one serialized stop/start path. Replacing

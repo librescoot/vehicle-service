@@ -20,8 +20,9 @@ import (
 type Callbacks struct {
 	DashboardCallback      func(bool) error
 	KeycardCallback        func() error
-	SeatboxCallback        func(bool) error   // true for "on", false for "off"
-	HornCallback           func(bool) error   // true for "on", false for "off"
+	SeatboxCallback        func(bool) error // true for "on", false for "off"
+	HornCallback           func(bool) error // true for "on", false for "off"
+	HornChirpCallback      func(context.Context) error
 	BlinkerCallback        func(string) error // "off", "left", "right", "both"
 	StateCallback          func(string) error // "unlock", "lock", "lock-hibernate"
 	ForceLockCallback      func() error       // New callback for force-lock
@@ -39,12 +40,13 @@ type Callbacks struct {
 }
 
 type RedisClient struct {
-	client    *ipc.Client
-	callbacks Callbacks
-	logger    *logger.Logger
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	client      *ipc.Client
+	callbacks   Callbacks
+	logger      *logger.Logger
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	chirpBootID string
 
 	// Publishers
 	vehiclePub   *ipc.HashPublisher
@@ -230,6 +232,10 @@ func (r *RedisClient) StartListening() error {
 		return fmt.Errorf("failed to start ble watcher: %w", err)
 	}
 
+	if err := r.advertiseHornChirp(); err != nil {
+		r.logger.Warnf("Bounded horn chirp unavailable: %v", err)
+	}
+
 	// Start queue command listeners
 	ipc.HandleRequests(r.client, "scooter:seatbox", r.handleSeatboxCommand)
 	ipc.HandleRequests(r.client, "scooter:horn", r.handleHornCommand)
@@ -260,6 +266,18 @@ func (r *RedisClient) handleSeatboxCommand(value string) error {
 }
 
 func (r *RedisClient) handleHornCommand(value string) error {
+	if strings.HasPrefix(value, "chirp:") {
+		if err := validateHornChirp(value, r.chirpBootID, time.Now()); err != nil {
+			return err
+		}
+		if r.callbacks.HornChirpCallback == nil {
+			return fmt.Errorf("bounded horn chirp is unsupported")
+		}
+		expires, _ := strconv.ParseInt(strings.Split(value, ":")[2], 10, 64)
+		ctx, cancel := context.WithDeadline(r.ctx, time.Unix(expires, 0))
+		defer cancel()
+		return r.callbacks.HornChirpCallback(ctx)
+	}
 	if r.callbacks.HornCallback == nil {
 		return nil
 	}

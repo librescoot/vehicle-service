@@ -101,6 +101,8 @@ type VehicleSystem struct {
 	io                       HardwareIO
 	redis                    MessagingClient
 	mu                       sync.RWMutex
+	hornMu                   sync.Mutex
+	hornClosed               bool
 	blinkerMu                sync.Mutex   // serializes the complete stop/start transaction across command and GPIO handlers
 	blinkerClosed            bool         // guarded by blinkerMu; shutdown rejects late callbacks
 	blinkerLastCueAt         time.Time    // written by the worker; read only after joining it
@@ -201,6 +203,7 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		KeycardCallback:        vs.keycardAuthPassed,
 		SeatboxCallback:        vs.handleSeatboxRequest,
 		HornCallback:           vs.handleHornRequest,
+		HornChirpCallback:      vs.handleHornChirp,
 		BlinkerCallback:        vs.handleBlinkerRequest,
 		StateCallback:          vs.handleStateRequest,
 		ForceLockCallback:      vs.handleForceLockRequest,
@@ -2230,6 +2233,9 @@ func (v *VehicleSystem) stopDbcWatchdog() {
 }
 
 func (v *VehicleSystem) Shutdown() {
+	v.hornMu.Lock()
+	v.hornClosed = true
+	v.hornMu.Unlock()
 	v.stopDriveStartMonitor()
 	// Reject late Redis/GPIO callbacks before releasing the hardware.
 	v.blinkerMu.Lock()

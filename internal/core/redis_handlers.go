@@ -24,6 +24,11 @@ func (v *VehicleSystem) handleSeatboxRequest(on bool) error {
 // handleHornRequest handles horn activation requests from Redis
 func (v *VehicleSystem) handleHornRequest(on bool) error {
 	v.logger.Debugf("Handling horn request: %v", on)
+	v.hornMu.Lock()
+	defer v.hornMu.Unlock()
+	if v.hornClosed {
+		return fmt.Errorf("horn controller is shut down")
+	}
 
 	// Check if horn is allowed before activating
 	if on && !v.isHornAllowed() {
