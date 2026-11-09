@@ -123,6 +123,13 @@ func (v *VehicleSystem) handleStateRequest(state string) error {
 
 	switch state {
 	case "unlock":
+		// A halt started from standby leaves the DBC on its way out; the unlock
+		// is replayed once the dashboard power has been cut.
+		if currentState == types.StateStandby && v.dbcPoweroffSent.Load() {
+			v.pendingUnlock.Store(true)
+			v.logger.Infof("Unlock deferred: DBC halting in standby, will replay after power-off")
+			return nil
+		}
 		if currentState == types.StateShuttingDown && v.dbcPoweroffSent.Load() {
 			v.cancelHibernationRequest()
 		}
@@ -244,13 +251,12 @@ func (v *VehicleSystem) handleUpdateRequest(action string) error {
 			return nil
 		}
 
-		// If in standby, transition to shutting-down to give DBC time to poweroff cleanly
-		// The shutdown timeout will transition back to standby, which turns off dashboard power
+		// In standby the dashboard is still powered after the update: halt the
+		// DBC through its dispatcher and cut the GPIO afterwards. The vehicle
+		// stays in standby, so nothing else reacts to a state change.
 		if currentState == types.StateStandby {
-			v.logger.Infof("DBC update complete in standby - transitioning to shutting-down for clean DBC shutdown")
-			if err := v.machine.SendSync(librefsm.Event{ID: fsm.EvDbcUpdateComplete}); err != nil {
-				v.logger.Warnf("Failed to send DBC update complete event: %v", err)
-			}
+			v.logger.Infof("DBC update complete in standby - halting the DBC, then cutting dashboard power")
+			v.haltDashboardInStandby()
 		} else {
 			v.logger.Debugf("DBC update complete but not in standby (state=%s) - leaving dashboard power on", currentState)
 		}

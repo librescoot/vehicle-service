@@ -161,6 +161,10 @@ type VehicleSystem struct {
 	// synchronously.
 	background func(func())
 
+	// afterFunc schedules the dashboard power cut that follows a DBC halt in
+	// standby; tests replace it to run the cut deterministically.
+	afterFunc func(time.Duration, func())
+
 	// Hop-on bookkeeping: only the steering-lock latch survives across
 	// the EnterHopOn / ExitHopOn pair so we know whether to release on exit.
 	hopOnLockedHandlebar bool
@@ -188,6 +192,7 @@ func NewVehicleSystem(io HardwareIO, redis MessagingClient, l *logger.Logger) *V
 		seatboxClosed:           true,   // Safe default until first sensor read (closed = no suppression)
 		usb0Policy:              "auto", // Default: bring usb0 down in standby; setPower tracks dashboard_power
 		background:              func(f func()) { go f() },
+		afterFunc:               func(d time.Duration, f func()) { time.AfterFunc(d, f) },
 	}
 	vs.blinkerCueIndex.Store(-1)
 	vs.gestures = newGestureDetector(func(event string) {
@@ -1749,6 +1754,12 @@ func (v *VehicleSystem) keycardAuthPassed() error {
 	if sendForceLock {
 		v.logger.Infof("Sending EvForceLock")
 		return v.machine.SendSync(librefsm.Event{ID: fsm.EvForceLock})
+	}
+
+	if v.getCurrentState() == types.StateStandby && v.dbcPoweroffSent.Load() {
+		v.pendingUnlock.Store(true)
+		v.logger.Infof("Keycard unlock deferred: DBC halting in standby, will replay after power-off")
+		return nil
 	}
 
 	v.logger.Infof("Sending EvKeycardAuth")

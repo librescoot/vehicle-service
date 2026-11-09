@@ -1857,8 +1857,9 @@ func TestRegression_UnlockInParkedIsNotQueued(t *testing.T) {
 	}
 }
 
-// An unlock arriving in Standby is forwarded as a normal wake — not queued,
-// even if dbcPoweroffSent happened to be stale.
+// An unlock arriving in Standby is forwarded as a normal wake — not queued —
+// unless a DBC halt started from standby is still in its window (see
+// TestUnlockDuringStandbyHaltIsReplayedAfterThePowerCut).
 func TestRegression_UnlockInStandbyIsNotQueued(t *testing.T) {
 	system, mockIO, _ := newTestVehicleSystem()
 
@@ -1873,10 +1874,8 @@ func TestRegression_UnlockInStandbyIsNotQueued(t *testing.T) {
 	}
 	system.initialized = true
 
-	// Should never be true in Standby (EnterStandby clears it), but assert
-	// defensively that the handler's condition requires BOTH state ==
-	// ShuttingDown AND the flag.
-	system.dbcPoweroffSent.Store(true)
+	// No halt in progress: the flag is clear in Standby.
+	system.dbcPoweroffSent.Store(false)
 
 	if err := system.handleStateRequest("unlock"); err != nil {
 		t.Fatalf("unlock: %v", err)

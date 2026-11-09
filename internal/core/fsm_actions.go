@@ -1152,3 +1152,40 @@ func (v *VehicleSystem) OnSeatboxButton(c *librefsm.Context) error {
 	v.openSeatbox()
 	return nil
 }
+
+// haltDashboardInStandby asks the DBC to power off through its dispatcher and
+// cuts the dashboard GPIO after the same window the shutting-down state uses.
+// The vehicle stays in standby: no synthetic state is needed for the DBC to
+// get its clean shutdown. An unlock arriving in the window is queued and
+// replayed once the GPIO is cut, as it is for a halt from shutting-down.
+func (v *VehicleSystem) haltDashboardInStandby() {
+	if err := v.redis.PublishMessage("dbc:command", "poweroff"); err != nil {
+		v.logger.Warnf("Failed to send DBC poweroff: %v", err)
+	} else {
+		v.dbcPoweroffSent.Store(true)
+	}
+	v.afterFunc(fsm.ShutdownTimeout, v.finishDashboardHalt)
+}
+
+func (v *VehicleSystem) finishDashboardHalt() {
+	if v.getCurrentState() != types.StateStandby {
+		// Another path took over (for example hibernation); it owns the flag.
+		return
+	}
+	v.mu.Lock()
+	holding := v.dbcUpdating || v.mapDownloading
+	v.mu.Unlock()
+	if holding {
+		// A new update or map download started meanwhile and holds the power.
+		v.dbcPoweroffSent.Store(false)
+		return
+	}
+	if err := v.setPower("dashboard_power", false); err != nil {
+		v.logger.Errorf("%v after DBC halt", err)
+	}
+	v.dbcPoweroffSent.Store(false)
+	if v.pendingUnlock.CompareAndSwap(true, false) {
+		v.logger.Infof("Replaying deferred unlock after DBC halt")
+		go v.machine.Send(librefsm.Event{ID: fsm.EvUnlock})
+	}
+}

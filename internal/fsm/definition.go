@@ -125,7 +125,6 @@ func NewDefinition(actions Actions) *librefsm.Definition {
 		Transition(StateStandby, EvKeycardAuth, StateParked,
 			librefsm.WithAction(actions.OnUnlock),
 		).
-		Transition(StateStandby, EvDbcUpdateComplete, StateShuttingDown). // DBC update complete, give DBC time to poweroff
 
 		// === StateAtRest parent: family-wide transitions ===
 		// These apply uniformly to Parked, HopOn, and HopOnLearning.
