@@ -3,6 +3,7 @@ module vehicle-service
 go 1.24.0
 
 require (
+	github.com/godbus/dbus/v5 v5.2.2
 	github.com/librescoot/librefsm v0.6.1
 	github.com/librescoot/redis-ipc v0.15.3
 	github.com/redis/go-redis/v9 v9.18.0

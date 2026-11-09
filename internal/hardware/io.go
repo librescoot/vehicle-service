@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
@@ -130,6 +129,7 @@ type LinuxHardwareIO struct {
 	debounceGen       map[string]uint64        // Generation counter per debounced channel
 	lastReported      map[string]bool          // Last value delivered to a callback
 	lastReportedSet   map[string]bool          // Whether lastReported has been seeded
+	systemd           unitSwitcher             // systemd units that own a link
 }
 
 func NewLinuxHardwareIO(l *logger.Logger) *LinuxHardwareIO {
@@ -148,6 +148,7 @@ func NewLinuxHardwareIO(l *logger.Logger) *LinuxHardwareIO {
 		debounceGen:       make(map[string]uint64),
 		lastReported:      make(map[string]bool),
 		lastReportedSet:   make(map[string]bool),
+		systemd:           &systemdClient{},
 	}
 }
 
@@ -629,17 +630,20 @@ func (io *LinuxHardwareIO) PlayPwmFade(ch int, idx int) error {
 	return io.pwmLed.PlayFade(ch, idx)
 }
 
+// SetUsb0Enabled brings the DBC link up or down.
+//
+// The link unit owns usb0's admin state, so this is a unit switch rather than
+// an ip call: the unit's teardown is what removes usb0's routes, and the route
+// monitor is PartOf it, so it runs exactly while the link is supposed to be up.
 func (io *LinuxHardwareIO) SetUsb0Enabled(enabled bool) error {
 	action := "down"
 	if enabled {
 		action = "up"
 	}
-	cmd := exec.Command("ip", "link", "set", "usb0", action)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ip link set usb0 %s: %w (%s)", action, err, string(out))
+	if err := io.systemd.SetUnitActive(DbcLinkUnit, enabled); err != nil {
+		return err
 	}
-	io.logger.Debugf("usb0 link set %s", action)
+	io.logger.Debugf("DBC link %s requested", action)
 	return nil
 }
 
@@ -710,11 +714,8 @@ func (io *LinuxHardwareIO) SetPppLinkEnabled(enabled bool) error {
 	if enabled {
 		action = "start"
 	}
-	// --no-block: don't hold the FSM transition hostage to unit startup
-	cmd := exec.Command("systemctl", "--no-block", action, "ppp-link.service")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("systemctl %s ppp-link: %w (%s)", action, err, string(out))
+	if err := io.systemd.SetUnitActive(PppLinkUnit, enabled); err != nil {
+		return err
 	}
 	io.logger.Debugf("ppp-link %s requested", action)
 	return nil
@@ -729,6 +730,10 @@ func (io *LinuxHardwareIO) SetDbcLed(color string, brightness uint8) error {
 
 func (io *LinuxHardwareIO) Cleanup() {
 	close(io.stopChan)
+
+	if io.systemd != nil {
+		io.systemd.Close()
+	}
 
 	// First close the input file descriptor to interrupt any blocked Read() calls
 	if io.inputFile != nil {
