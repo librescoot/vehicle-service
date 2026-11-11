@@ -18,6 +18,8 @@ github.com/librescoot/redis-ipc v0.15.3 h1:TziMMjcb9Erm3zfBODWit9RU2BXFrUtz8mTCz
 github.com/librescoot/redis-ipc v0.15.3/go.mod h1:uvlJaUd1WzRMjZy7dYCHJ6qphCDeYD5orGK9CLudv1Q=
 github.com/librescoot/redis-ipc v0.15.4 h1:Ls1s+QnqWKDOPVP0RR3h/fQDfLa30hT5ChwBQst9E44=
 github.com/librescoot/redis-ipc v0.15.4/go.mod h1:uvlJaUd1WzRMjZy7dYCHJ6qphCDeYD5orGK9CLudv1Q=
+github.com/librescoot/redis-ipc v0.15.5-0.20261111175103-0bca8184dc69 h1:rSqDRuBHJV3pb8pFpPV8vKfmwllgaeWCR5srFuK7ibA=
+github.com/librescoot/redis-ipc v0.15.5-0.20261111175103-0bca8184dc69/go.mod h1:uvlJaUd1WzRMjZy7dYCHJ6qphCDeYD5orGK9CLudv1Q=
 github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
 github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
